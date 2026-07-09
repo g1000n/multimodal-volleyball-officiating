@@ -1,0 +1,14 @@
+.parent {
+    border: 4px solid red;
+    padding: 20px;
+}
+
+.child {
+    width: 50%;
+    padding: 20px;
+    border: 4px solid green;
+
+    /* Center the element horizontally */
+    margin-left: auto;
+    margin-right: auto;
+}

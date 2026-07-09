@@ -1,0 +1,11 @@
+data/raw_clips/
+data/keypoints/
+data/dataset_manifest.csv
+models/
+*.npy
+*.mov
+*.mp4
+sample_frame.png
+.venv/
+__pycache__/
+*.pyc
