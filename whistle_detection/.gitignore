@@ -1,0 +1,22 @@
+# Raw data (download separately -- see README)
+raw_data/volleylitics/*.wav
+raw_data/volleylitics/*.json
+raw_data/iphone_recordings/*
+
+# Keep the folder structure but ignore contents
+!raw_data/volleylitics/.gitkeep
+!raw_data/iphone_recordings/.gitkeep
+
+# Generated/processed data (reproducible by re-running scripts)
+processed/
+models/*.pkl
+
+# Python
+whistle_env/
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
