@@ -1,39 +1,28 @@
 """
 extract_keypoints.py (v5 — Pose + wrist-cropped Hands + finger extension)
-[+ multiprocessing, timing, and completion alarm added]
-
-WHY THIS CHANGED FROM v4:
-Diagnostic testing showed 0.0% hand detection across an entire class,
-regardless of .mov vs .mp4 (ruling out codec issues). Visual inspection
-of a sample frame showed the actual person occupies only a narrow
-strip of a pillarboxed 1920x1080 frame, and the raised hand was
-blurred from motion. MediaPipe Hands needs a reasonably large, sharp
-view of a hand to detect it reliably — a small, blurry hand in a
-mostly-empty wide frame is close to a worst case for it.
-
-THE FIX: instead of running Hands on the entire frame, we now:
-  1. Run Pose on the full frame (unchanged) to find wrist positions.
-  2. For each detected wrist, crop a small region directly around it
-     (sized relative to shoulder width, so it adapts to how close/far
-     the person is from the camera).
-  3. Run Hands only on that small cropped region — the hand now
-     occupies a much larger portion of what Hands actually looks at.
-  4. Convert the resulting hand landmark coordinates back into the
-     original frame's coordinate system, so everything downstream
-     (normalization in train.py, finger-extension math) is unaffected
-     and works exactly as before.
+[OPTIMIZED: multiprocessing + auto warm-up fix + timer + alarm]
 
 Feature layout: 122 features per frame (24 pose + 84 hand coords +
 2 hand-detected flags + 10 finger-extension + 2 elbow angles).
 
-SPEED-UP NOTES (new):
-- Clips are now processed in parallel across CPU cores via
-  multiprocessing.Pool, instead of one at a time.
-- Pose model_complexity lowered from 1 to 0 (faster, small accuracy
-  tradeoff — check the hand/pose detection rate printout at the end;
-  if it drops noticeably from your last run, bump it back to 1).
-- Total wall-clock time is printed at the end.
-- 3 beeps play when extraction finishes (Windows only, via winsound).
+SAFE ON FRESH DEVICES (the actual fix):
+Multiple worker processes starting at once can each try to download
+MediaPipe's model file simultaneously, corrupting it ("Model provided
+must have at least 7 bytes...", "should be 'TFL3'" errors). This
+version runs ONE sequential warm-up (single Pose + Hands init) BEFORE
+spinning up any parallel workers, guaranteeing the model file is
+already fully downloaded and valid by the time workers start. This
+has hit multiple team members' machines before -- this fix makes it a
+non-issue going forward, on any device, first run or not.
+
+SPEED:
+- Clips processed in parallel across CPU cores via multiprocessing.Pool.
+- Pose model_complexity lowered from 1 -> 0 (faster, small accuracy
+  tradeoff -- check the hand/pose detection rate printout at the end;
+  if it drops noticeably vs. a previous run, raise it back to 1 in
+  _init_worker() below).
+- Wall-clock time printed at the end.
+- 3 beeps (Windows only) when extraction finishes.
 """
 
 import os
@@ -73,8 +62,8 @@ FINGER_JOINTS = {
 }
 EXTENSION_MARGIN = 1.1
 
-CROP_MARGIN_MULTIPLIER = 1.4  # crop half-size = shoulder width (in pixels) * this
-MIN_VISIBILITY_FOR_CROP = 0.3  # don't bother cropping if Pose barely saw this wrist
+CROP_MARGIN_MULTIPLIER = 1.4
+MIN_VISIBILITY_FOR_CROP = 0.3
 
 
 def extract_pose_features(pose_results):
@@ -106,12 +95,8 @@ def compute_finger_extension(hand_landmarks):
 
 
 def compute_elbow_angles(pose_landmarks):
-    """
-    Returns [left_elbow_angle, right_elbow_angle], each normalized 0.0-1.0
-    (0.0 = fully bent/folded, 1.0 = fully straight arm).
-    """
     if pose_landmarks is None:
-        return np.array([0.5, 0.5])  # neutral fallback, no information
+        return np.array([0.5, 0.5])
 
     def angle_for_arm(shoulder_id, elbow_id, wrist_id):
         shoulder = pose_landmarks[shoulder_id]
@@ -119,7 +104,7 @@ def compute_elbow_angles(pose_landmarks):
         wrist = pose_landmarks[wrist_id]
 
         if elbow.visibility < 0.3:
-            return 0.5  # not confidently visible, neutral fallback
+            return 0.5
 
         v1 = np.array([shoulder.x - elbow.x, shoulder.y - elbow.y])
         v2 = np.array([wrist.x - elbow.x, wrist.y - elbow.y])
@@ -129,8 +114,8 @@ def compute_elbow_angles(pose_landmarks):
             return 0.5
 
         cos_angle = np.clip(np.dot(v1, v2) / (norm1 * norm2), -1.0, 1.0)
-        angle_radians = np.arccos(cos_angle)  # 0 (fully bent) to pi (straight)
-        return angle_radians / np.pi  # normalize to 0.0-1.0
+        angle_radians = np.arccos(cos_angle)
+        return angle_radians / np.pi
 
     left_angle = angle_for_arm(
         mp_pose.PoseLandmark.LEFT_SHOULDER, mp_pose.PoseLandmark.LEFT_ELBOW, mp_pose.PoseLandmark.LEFT_WRIST
@@ -142,7 +127,6 @@ def compute_elbow_angles(pose_landmarks):
 
 
 def get_wrist_crop_box(wrist_landmark, shoulder_width_px, frame_width, frame_height):
-    """Returns (x1, y1, x2, y2) pixel box around the wrist, or None if not usable."""
     if wrist_landmark.visibility < MIN_VISIBILITY_FOR_CROP:
         return None
 
@@ -161,8 +145,6 @@ def get_wrist_crop_box(wrist_landmark, shoulder_width_px, frame_width, frame_hei
 
 
 def detect_hand_in_crop(frame_rgb, crop_box, hands_model):
-    """Runs Hands on a cropped region, returns landmarks converted back to
-    full-frame normalized coordinates, or None if no hand found."""
     x1, y1, x2, y2 = crop_box
     crop = frame_rgb[y1:y2, x1:x2]
 
@@ -281,12 +263,28 @@ def extract_keypoints_from_video(video_path, pose_model, hands_model):
 
 
 # ---------------------------------------------------------------------
+# THE FIX: sequential warm-up before any parallel workers start
+# ---------------------------------------------------------------------
+
+def warm_up_mediapipe():
+    """
+    Runs ONE sequential Pose + Hands initialization before any worker
+    processes are spawned. This forces MediaPipe to fully download and
+    validate its model file in a single process, so that when the
+    Pool's workers start afterward, they all read an already-good file
+    instead of racing to download it simultaneously (which corrupts it).
+    """
+    print("Warming up MediaPipe (one-time, sequential, ensures model file is valid)...")
+    pose = mp_pose.Pose(static_image_mode=False, model_complexity=0)
+    hands = mp_hands.Hands(static_image_mode=True, max_num_hands=1)
+    pose.close()
+    hands.close()
+    print("Warm-up complete.\n")
+
+
+# ---------------------------------------------------------------------
 # Multiprocessing worker setup
 # ---------------------------------------------------------------------
-# Each worker process needs its OWN Pose/Hands model instances (mediapipe
-# model objects can't be pickled/shared across processes). _init_worker()
-# runs once per worker when the Pool starts, creating that worker's models
-# as module-level globals which _process_one_clip() then reuses.
 
 _worker_pose_model = None
 _worker_hands_model = None
@@ -296,7 +294,7 @@ def _init_worker():
     global _worker_pose_model, _worker_hands_model
     _worker_pose_model = mp_pose.Pose(
         static_image_mode=False,
-        model_complexity=0,   # lowered from 1 -> 0 for speed
+        model_complexity=0,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
@@ -309,7 +307,6 @@ def _init_worker():
 
 
 def _process_one_clip(row):
-    """Runs inside a worker process. Returns (updated_row, diagnostic_or_None)."""
     clip_path = row["clip_path"]
     gesture_label = row["gesture_label"]
 
@@ -351,7 +348,10 @@ def process_manifest():
     with open(MANIFEST_PATH, "r") as f:
         rows = list(csv.DictReader(f))
 
-    num_workers = max(1, cpu_count() - 1)  # leave 1 core free for the OS
+    # THE FIX: warm up sequentially BEFORE spinning up the parallel pool
+    warm_up_mediapipe()
+
+    num_workers = max(1, cpu_count() - 1)
     print(f"Starting extraction on {len(rows)} clips using {num_workers} worker processes...")
 
     updated_rows = []
@@ -403,13 +403,12 @@ def process_manifest():
         right_rates = [p[1] for p in rate_pairs]
         print(f"  {gesture_label:<30} {np.mean(left_rates):>11.1%} {np.mean(right_rates):>12.1%}")
 
-    # 3 beeps to signal completion (Windows only)
     try:
         for _ in range(3):
             winsound.Beep(1000, 400)
             time.sleep(0.15)
     except RuntimeError:
-        pass  # non-Windows environment, skip silently
+        pass
 
 
 if __name__ == "__main__":
