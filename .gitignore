@@ -9,3 +9,4 @@ sample_frame.png
 .venv/
 __pycache__/
 *.pyc
+venv/
