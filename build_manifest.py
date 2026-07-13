@@ -19,6 +19,7 @@ from scratch based on whatever is currently in raw_clips/.
 import os
 import re
 import csv
+from collections import defaultdict
 
 RAW_CLIPS_DIR = "data/raw_clips"
 OUTPUT_CSV = "data/dataset_manifest.csv"
@@ -80,6 +81,17 @@ def build_manifest():
     print("\nClips per participant:")
     for person, count in sorted(person_counts.items()):
         print(f"  {person}: {count}")
+
+    gesture_person_counts = defaultdict(lambda: defaultdict(int))
+
+    for row in rows:
+        gesture_person_counts[row["gesture_label"]][row["person_id"]] += 1
+
+    print("\nClips per gesture per participant:")
+    for gesture in sorted(gesture_person_counts):
+        print(f"\n{gesture}:")
+        for person in sorted(gesture_person_counts[gesture]):
+            print(f"  {person}: {gesture_person_counts[gesture][person]}")
 
     if skipped:
         print(f"\nWARNING: {len(skipped)} files did not match the naming convention and were skipped:")

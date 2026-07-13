@@ -1,22 +1,38 @@
 from pathlib import Path
-import re
 
-folder = Path(r"C:\Users\notgi\Downloads\holfer")
+TEMP_BIN = Path(r"C:\Users\notgi\Downloads\temp bin")
 
-person_code = "p03"   # Charlene
-gesture_name = "service_to_authorization_left"
+LEFT_FOLDER = TEMP_BIN / "amare service left"
+RIGHT_FOLDER = TEMP_BIN / "amare service right"
 
-def get_number(file):
-    numbers = re.findall(r"\d+", file.stem)
-    return int(numbers[-1]) if numbers else 0
 
-files = sorted(
-    folder.glob("*.mp4"),
-    key=get_number
+def rename_prefix(folder, old_prefix, new_prefix):
+    count = 0
+
+    for file in folder.iterdir():
+        if not file.is_file():
+            continue
+
+        if file.name.startswith(old_prefix):
+            new_name = file.name.replace(old_prefix, new_prefix, 1)
+            file.rename(folder / new_name)
+            count += 1
+
+    print(f"{folder.name}: Renamed {count} files.")
+
+
+# Files currently in the RIGHT folder are incorrectly named "...left..."
+rename_prefix(
+    RIGHT_FOLDER,
+    "authorization_to_serve_left",
+    "authorization_to_serve_right",
 )
 
-for i, file in enumerate(files, start=1):
-    new_name = f"{gesture_name}_{person_code}_{i}{file.suffix}"
-    file.rename(folder / new_name)
+# Files currently in the LEFT folder are incorrectly named "...right..."
+rename_prefix(
+    LEFT_FOLDER,
+    "authorization_to_serve_right",
+    "authorization_to_serve_left",
+)
 
-print(f"Renamed {len(files)} files.")
+print("\nDone!")
