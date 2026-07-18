@@ -1,118 +1,82 @@
 # Whistle Detection Pipeline
 
-Whistle detection component (MFCC + SVM) for the multimodal volleyball
-officiating system thesis project.
+Audio whistle-detection module for the Multimodal Real-Time Officiating System
+(gesture recognition + whistle detection + automated scoring). This README covers
+setup and the current run order after recent fixes.
 
-## ⚠️ Before you run anything: download the data
+## Getting the latest code (for groupmates)
 
-The raw audio and annotation files are **not included in this repository**
-because they're too large for GitHub (the full match dataset is ~3.29 GB,
-well over GitHub's file size limits). You need to download them separately
-before running any script.
+```powershell
+git pull origin main
+```
+If you get conflicts on scripts you haven't touched locally, just accept the incoming
+version (`git checkout --theirs scripts/<file>.py`) and re-run `git pull`.
 
-### 1. Download the match audio + annotations
+## Environment setup (one-time)
 
-Source: [GYdevy/volleyball-whistles](https://huggingface.co/datasets/GYdevy/volleyball-whistles) on Hugging Face.
+Use **Python 3.12** specifically — Python 3.14 has known DLL compatibility issues with
+numba/librosa on Windows.
 
-Install the Hugging Face CLI/library:
-```bash
-pip install -U huggingface_hub
+```powershell
+py -3.12 -m venv whistle_env
+whistle_env\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-Then download the dataset:
-```bash
+Every new terminal session needs `whistle_env\Scripts\activate` run again before any
+`python`/`pip` command.
+
+## Data setup (one-time)
+
+```powershell
+python -m pip install -U huggingface_hub
 hf download GYdevy/volleyball-whistles --repo-type dataset --local-dir raw_data/volleylitics
 ```
 
-(Alternative, if `hf` isn't available in your version:)
-```bash
-python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='GYdevy/volleyball-whistles', repo_type='dataset', local_dir='raw_data/volleylitics')"
-```
+For iPhone recordings: drop `.m4a`/`.wav` files into `raw_data/iphone_recordings/`.
+**Keep whistle-containing recordings and pure-negative recordings as separate files**
+(see Data Notes below) — do not mix whistles and negatives in the same file.
 
-**Note:** the dataset's `whistles_all_reanchored.json` only contains
-annotations for 10 of the 14 matches (`match1, 2, 3, 4, 7, 8, 9, 11, 13,
-14`). The other four (`match5, match6, match10, match12`) have no whistle
-labels and are not used by this pipeline — you can safely delete them after
-downloading to save disk space:
+## Full pipeline (run in order)
 
-```bash
-cd raw_data/volleylitics
-rm match5.wav match6.wav match10.wav match12.wav   # macOS/Linux
-```
 ```powershell
-cd raw_data\volleylitics
-Remove-Item match5.wav, match6.wav, match10.wav, match12.wav   # Windows PowerShell
+python scripts/01_audit_json.py
+python scripts/09_sample_calibration_timestamps.py   # manual QC listening pass, see notes below
+python scripts/02_extract_whistle_clips.py            # Volleylitics whistle clips
+python scripts/03_extract_match_negatives.py          # Volleylitics negative clips
+
+# iPhone data (only once recordings are ready):
+python scripts/04a_detect_iphone_whistle_candidates.py  # auto-detect candidates, then confirm y/n in the CSV
+python scripts/04b_extract_iphone_whistles.py           # extract confirmed whistle clips
+python scripts/04_process_iphone_negatives.py           # run on NEGATIVE-ONLY recordings
+
+python scripts/05_extract_features.py                   # combines all sources -> features.csv
+python scripts/06_train_model.py                        # edit TEST_MATCHES first, see below
+python scripts/07_evaluate.py                            # run once, don't re-tune on this result
+
+python scripts/08_realtime_test.py live                  # live mic test
 ```
 
-### 2. Add your own iPhone recordings (optional, for supplementary negatives)
+## Important settings to check before training
 
-Place your recorded voice memo files (`.m4a` or `.wav`) into:
-```
-raw_data/iphone_recordings/
-```
-These aren't hosted anywhere online — they're your own recordings, so just
-copy them in directly. They're excluded from git for the same size/privacy
-reasons (see `.gitignore`).
+- **`scripts/06_train_model.py` → `TEST_MATCHES`**: must list match_ids that actually
+  exist in your data. Once iPhone data is included, add at least one
+  `iphone_<filename>` group here too — otherwise the reported accuracy only reflects
+  Volleylitics-style audio, not real device conditions.
+- **`scripts/02_extract_whistle_clips.py` → `PRE`/`POST`/`TARGET_LEN`**: currently
+  `0.3s` / `1.2s` / `1.5s`, set from a manual listening QC pass (see
+  `processed/calibration_sample.csv`). If you re-run QC and find different patterns,
+  update these three values consistently — `04b_extract_iphone_whistles.py` and
+  `08_realtime_test.py`'s `WINDOW_SEC` must match `TARGET_LEN` exactly, or you'll get
+  train/inference mismatch (this caused erratic real-time detection before it was fixed).
 
-### Expected folder structure after setup
+## Data notes
 
-```
-whistle_detection/
-  raw_data/
-    volleylitics/
-      match1.wav ... match14.wav  (only 10 will have annotations)
-      whistles_all.json
-      whistles_all_anchored.json
-      whistles_all_reanchored.json   <- the one the scripts use
-    iphone_recordings/
-      *.m4a or *.wav                 <- your own recordings, added manually
-  processed/                          <- generated by the scripts, not committed
-  scripts/
-    01_audit_json.py ... 08_realtime_test.py
-  models/                             <- generated by training, not committed
-```
-
-## Setup
-
-```bash
-python3 -m venv whistle_env
-source whistle_env/bin/activate        # Windows: whistle_env\Scripts\activate
-pip install -r requirements.txt
-```
-
-You'll also need `ffmpeg` installed as a system binary (not just the Python
-wrapper) if you're processing `.m4a` iPhone recordings:
-- Windows: download the "essentials" build from gyan.dev, add `bin/` to PATH
-- macOS: `brew install ffmpeg`
-- Linux: `sudo apt install ffmpeg`
-
-## Running the pipeline
-
-Run scripts in order from the project root:
-
-```bash
-python scripts/01_audit_json.py               # inspect annotations, no audio touched
-python scripts/02_extract_whistle_clips.py     # positive whistle clips from match audio
-python scripts/03_extract_match_negatives.py   # hard negatives from the same match audio
-python scripts/04_process_iphone_negatives.py  # optional: supplementary negatives from iPhone recordings
-python scripts/05_extract_features.py          # MFCC feature extraction
-python scripts/06_train_model.py               # match-based split, GroupKFold-tuned SVM
-python scripts/07_evaluate.py                  # one-time evaluation on held-out matches
-python scripts/08_realtime_test.py offline path/to/file.wav   # or: live
-```
-
-Step 4 is optional and can be skipped on a first pass — steps 5-7 will run
-fine on match-audio data alone if `iphone_negative_index.csv` doesn't exist
-yet.
-
-## Why the data isn't in the repo
-
-- The 10 annotated match recordings total several hundred MB to multiple GB
-- GitHub blocks files over 100MB by default and strongly discourages repos
-  over ~1GB
-- iPhone recordings are personal data collected by the research team and
-  aren't meant to be redistributed publicly
-
-Everything generated from the raw data (`processed/`, `models/`) is also
-excluded from git since it's fully reproducible by re-running the scripts
-against the downloaded data.
+- Audio loading uses `soundfile` + `scipy` resampling, not `librosa`, to avoid
+  Windows DLL import failures (numba/soxr). Don't reintroduce `librosa.load` calls.
+- iPhone data is a **co-primary** source alongside Volleylitics, not merely
+  supplementary — see the thesis Methods chapter for the current framing.
+- Whistle-containing and negative-only iPhone recordings must stay in separate files,
+  since `04_process_iphone_negatives.py` has no whistle-location awareness and would
+  mislabel whistle audio as negative if they're mixed.
