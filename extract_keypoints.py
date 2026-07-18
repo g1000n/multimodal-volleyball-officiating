@@ -62,8 +62,8 @@ FINGER_JOINTS = {
 }
 EXTENSION_MARGIN = 1.1
 
-CROP_MARGIN_MULTIPLIER = 1.4
-MIN_VISIBILITY_FOR_CROP = 0.3
+CROP_MARGIN_MULTIPLIER = 1.9
+MIN_VISIBILITY_FOR_CROP = 0.18
 
 
 def extract_pose_features(pose_results):
@@ -301,8 +301,8 @@ def _init_worker():
     _worker_hands_model = mp_hands.Hands(
         static_image_mode=True,
         max_num_hands=1,
-        min_detection_confidence=0.4,
-        min_tracking_confidence=0.4,
+        min_detection_confidence=0.28,
+        min_tracking_confidence=0.28,
     )
 
 

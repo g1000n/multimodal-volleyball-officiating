@@ -47,7 +47,7 @@ from model import GestureCNNLSTM
 
 MODEL_PATH = "models/final_model.pt"
 LABEL_MAP_PATH = "models/label_map.json"
-CAMERA_INDEX = 0  # change if using an external/iPhone camera source
+CAMERA_INDEX = 1  # change if using an external/iPhone camera source .. changed to index 1 (iphone 14's index)
 
 COUNTDOWN_SECONDS = 3       # time to get into neutral position before recording starts
 RECORD_DURATION_SECONDS = 7  # how long it records after the countdown

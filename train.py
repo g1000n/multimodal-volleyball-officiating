@@ -139,10 +139,46 @@ def resample_sequence(seq, target_len):
     return resampled
 
 
+def augment_sequence(seq):
+    """
+    Applies small random perturbations to a normalized keypoint sequence
+    to make the model more tolerant of real-world variation: different
+    distances/scales, slightly different body proportions, gesture speed
+    differences, and minor camera-angle differences. Only applied to
+    TRAINING clips — never to val/test, which must stay unmodified to
+    give an honest accuracy reading.
+    """
+    seq = seq.copy()
+
+    # 1. Random spatial scaling (simulates different camera distances)
+    scale_factor = np.random.uniform(0.9, 1.1)
+    seq[:, :] *= scale_factor
+
+    # 2. Small random spatial jitter/noise (simulates body proportion
+    #    differences and minor detection noise)
+    noise = np.random.normal(0, 0.01, seq.shape)
+    seq = seq + noise
+
+    # 3. Random time-warping (simulates different gesture speeds/rhythms)
+    #    Stretches or compresses the sequence slightly before it gets
+    #    resampled back to SEQUENCE_LENGTH.
+    warp_factor = np.random.uniform(0.85, 1.15)
+    orig_len = seq.shape[0]
+    warped_len = max(2, int(orig_len * warp_factor))
+    orig_idx = np.linspace(0, 1, orig_len)
+    warped_idx = np.linspace(0, 1, warped_len)
+    warped = np.zeros((warped_len, seq.shape[1]))
+    for feature_i in range(seq.shape[1]):
+        warped[:, feature_i] = np.interp(warped_idx, orig_idx, seq[:, feature_i])
+
+    return warped
+
+
 class GestureDataset(Dataset):
-    def __init__(self, rows, label_to_idx):
+    def __init__(self, rows, label_to_idx, augment=False):
         self.rows = rows
         self.label_to_idx = label_to_idx
+        self.augment = augment  # only True for the training set
 
     def __len__(self):
         return len(self.rows)
@@ -151,6 +187,10 @@ class GestureDataset(Dataset):
         row = self.rows[i]
         raw = np.load(row["keypoint_path"])
         normalized = normalize_sequence(raw)
+
+        if self.augment:
+            normalized = augment_sequence(normalized)
+
         resampled = resample_sequence(normalized, SEQUENCE_LENGTH)
 
         x = torch.tensor(resampled, dtype=torch.float32)
@@ -225,9 +265,9 @@ def train():
     print(f"Train clips: {len(train_rows)} | Val clips: {len(val_rows)} | Test clips: {len(test_rows)}")
     print(f"Classes: {all_labels}")
 
-    train_ds = GestureDataset(train_rows, label_to_idx)
-    val_ds = GestureDataset(val_rows, label_to_idx)
-    test_ds = GestureDataset(test_rows, label_to_idx)
+    train_ds = GestureDataset(train_rows, label_to_idx, augment=True)
+    val_ds = GestureDataset(val_rows, label_to_idx, augment=False)
+    test_ds = GestureDataset(test_rows, label_to_idx, augment=False)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
