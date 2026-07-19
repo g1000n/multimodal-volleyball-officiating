@@ -35,7 +35,7 @@ import cv2
 import numpy as np
 import mediapipe as mp
 
-from extract_keypoints import extract_pose_features, extract_hand_features
+from extract_keypoints import extract_pose_features, extract_hand_features, debug_get_crop_info
 
 MANIFEST_PATH = "data/dataset_manifest.csv"
 PROGRESS_PATH = "data/clip_review_progress.json"
@@ -94,6 +94,15 @@ def draw_skeleton_frame(frame_bgr, pose_model, hands_model):
             px, py = int(x * frame_width), int(y * frame_height)
             cv2.circle(skeleton_frame, (px, py), 3, (255, 0, 255), -1)
 
+    # DEBUG: draw the actual crop box(es) used and which strategy was chosen
+    mode, boxes = debug_get_crop_info(pose_landmarks, frame_width, frame_height)
+    box_color = (0, 165, 255) if mode == "combined" else (255, 100, 0)
+    for box in boxes:
+        x1, y1, x2, y2 = box
+        cv2.rectangle(skeleton_frame, (x1, y1), (x2, y2), box_color, 2)
+    cv2.putText(skeleton_frame, f"crop mode: {mode}", (10, frame_height - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+
     return skeleton_frame
 
 
@@ -107,21 +116,29 @@ def choose_gesture_filter(rows):
     labels = sorted(set(r["gesture_label"] for r in rows))
     counts = {label: sum(1 for r in rows if r["gesture_label"] == label) for label in labels}
 
+    menu_options = labels + ["all"]
+
     print("Available gesture classes:")
-    for label in labels:
-        print(f"  {label}  ({counts[label]} clips)")
-    print("  all  (review everything)")
+    for i, label in enumerate(menu_options, start=1):
+        if label == "all":
+            print(f"  {i}. all  (review everything)")
+        else:
+            print(f"  {i}. {label}  ({counts[label]} clips)")
 
-    choice = input("\nWhich gesture do you want to review? (type exact name, or 'all'): ").strip()
+    choice = input(f"\nEnter a number (1-{len(menu_options)}): ").strip()
 
-    if choice == "all":
+    try:
+        choice_num = int(choice)
+        selected = menu_options[choice_num - 1]
+    except (ValueError, IndexError):
+        print(f"'{choice}' not a valid option, defaulting to 'all'.")
+        selected = "all"
+
+    if selected == "all":
         return rows, "ALL"
-    if choice not in labels:
-        print(f"'{choice}' not recognized, defaulting to 'all'.")
-        return rows, "ALL"
 
-    filtered = [r for r in rows if r["gesture_label"] == choice]
-    return filtered, choice
+    filtered = [r for r in rows if r["gesture_label"] == selected]
+    return filtered, selected
 
 
 def main():

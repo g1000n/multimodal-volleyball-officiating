@@ -2,6 +2,7 @@ data/raw_clips/
 data/keypoints/
 data/raw_clips.zip
 data/dataset_manifest.csv
+data/clip_review_progress.json
 models/
 *.npy
 *.mov

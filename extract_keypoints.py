@@ -1,9 +1,27 @@
 """
-extract_keypoints.py (v5 — Pose + wrist-cropped Hands + finger extension)
+extract_keypoints.py (v6 — Pose + COMBINED-CROP two-hand detection + finger extension)
 [OPTIMIZED: multiprocessing + auto warm-up fix + timer + alarm]
 
 Feature layout: 122 features per frame (24 pose + 84 hand coords +
 2 hand-detected flags + 10 finger-extension + 2 elbow angles).
+
+v6 CHANGE — combined-crop, two-hand detection with nearest-wrist assignment:
+Previously (v5), each wrist got its OWN independent crop, and each crop
+searched for exactly one hand. When the referee's hands came close
+together (e.g. during ball_out or double_contact), both crops could
+overlap the SAME physical hand — so that one hand would get detected
+twice (once labeled left, once labeled right), while the other hand
+went undetected. This showed up during manual clip review as the
+cyan/magenta hand overlays landing on top of each other, and one hand's
+skeleton being missing for sustained stretches even though the video
+itself looked fine.
+
+The fix: take ONE combined crop that covers both wrists, ask MediaPipe
+for up to 2 hands in that single region (letting MediaPipe's own
+multi-hand detection logic tell them apart), then assign each detected
+hand to whichever wrist it's physically closest to. This structurally
+prevents the "two independent searches grab the same hand" failure
+mode, instead of trying to patch around it after the fact.
 
 SAFE ON FRESH DEVICES (the actual fix):
 Multiple worker processes starting at once can each try to download
@@ -62,8 +80,20 @@ FINGER_JOINTS = {
 }
 EXTENSION_MARGIN = 1.1
 
-CROP_MARGIN_MULTIPLIER = 1.9
+CROP_MARGIN_MULTIPLIER = 1.0
+# Single-wrist crops use a SMALLER margin than the combined crop — they
+# only need to comfortably contain one hand, not account for spanning
+# both wrists. Using the same large margin as the combined crop for
+# both was the bug: it made single crops so big that the overlap check
+# almost always concluded "would overlap," silently forcing the
+# combined (lower-resolution) branch even for widely spread arms.
+SINGLE_CROP_MARGIN_MULTIPLIER = 0.9
 MIN_VISIBILITY_FOR_CROP = 0.18
+# If the wrists are farther apart than this (relative to shoulder width),
+# use two separate high-resolution crops instead of one wide combined
+# crop. Close together = combined crop (avoids double-detecting the same
+# hand). Far apart = separate crops (avoids resolution loss on wide poses).
+WRIST_DISTANCE_COMBINED_THRESHOLD = 1.3  # in units of shoulder width
 
 
 def extract_pose_features(pose_results):
@@ -126,13 +156,50 @@ def compute_elbow_angles(pose_landmarks):
     return np.array([left_angle, right_angle])
 
 
-def get_wrist_crop_box(wrist_landmark, shoulder_width_px, frame_width, frame_height):
+def get_combined_hand_crop_box(left_wrist, right_wrist, shoulder_width_px, frame_width, frame_height):
+    """
+    ONE crop covering both wrists. Only appropriate when the wrists are
+    close together — otherwise the crop has to stretch wide, lowering
+    effective resolution per hand once MediaPipe resizes it internally,
+    which can cause a clearly-visible hand to go undetected.
+    """
+    margin = shoulder_width_px * CROP_MARGIN_MULTIPLIER
+
+    xs, ys = [], []
+    if left_wrist.visibility >= MIN_VISIBILITY_FOR_CROP:
+        xs.append(left_wrist.x * frame_width)
+        ys.append(left_wrist.y * frame_height)
+    if right_wrist.visibility >= MIN_VISIBILITY_FOR_CROP:
+        xs.append(right_wrist.x * frame_width)
+        ys.append(right_wrist.y * frame_height)
+
+    if not xs:
+        return None
+
+    x1 = int(max(0, min(xs) - margin))
+    x2 = int(min(frame_width, max(xs) + margin))
+    y1 = int(max(0, min(ys) - margin))
+    y2 = int(min(frame_height, max(ys) + margin))
+
+    if x2 - x1 < 20 or y2 - y1 < 20:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def get_single_wrist_crop_box(wrist_landmark, shoulder_width_px, frame_width, frame_height):
+    """
+    A tight crop around ONE wrist only — higher effective resolution
+    for that hand than a combined crop would give. Only used when this
+    is guaranteed NOT to overlap the other wrist's crop (checked by the
+    caller via crops_would_overlap()) — so both crops searching
+    independently can never land on the same physical hand.
+    """
     if wrist_landmark.visibility < MIN_VISIBILITY_FOR_CROP:
         return None
 
     cx = wrist_landmark.x * frame_width
     cy = wrist_landmark.y * frame_height
-    half_size = max(shoulder_width_px * CROP_MARGIN_MULTIPLIER, 40)
+    half_size = max(shoulder_width_px * SINGLE_CROP_MARGIN_MULTIPLIER, 35)
 
     x1 = int(max(0, cx - half_size))
     x2 = int(min(frame_width, cx + half_size))
@@ -144,30 +211,91 @@ def get_wrist_crop_box(wrist_landmark, shoulder_width_px, frame_width, frame_hei
     return (x1, y1, x2, y2)
 
 
-def detect_hand_in_crop(frame_rgb, crop_box, hands_model):
+def detect_hands_in_combined_crop(frame_rgb, crop_box, hands_model):
+    """Returns a list of (hand_landmarks, full_frame_coords) — 0, 1, or 2 hands."""
     x1, y1, x2, y2 = crop_box
     crop = frame_rgb[y1:y2, x1:x2]
 
     results = hands_model.process(crop)
     if not results.multi_hand_landmarks:
-        return None
+        return []
 
-    hand_landmarks = results.multi_hand_landmarks[0]
-
-    crop_width = x2 - x1
-    crop_height = y2 - y1
+    crop_width, crop_height = x2 - x1, y2 - y1
     frame_height, frame_width = frame_rgb.shape[:2]
 
-    converted_coords = []
-    for lm in hand_landmarks.landmark:
-        full_x = (lm.x * crop_width + x1) / frame_width
-        full_y = (lm.y * crop_height + y1) / frame_height
-        converted_coords.append((full_x, full_y))
+    detected = []
+    for hand_landmarks in results.multi_hand_landmarks:
+        converted_coords = []
+        for lm in hand_landmarks.landmark:
+            full_x = (lm.x * crop_width + x1) / frame_width
+            full_y = (lm.y * crop_height + y1) / frame_height
+            converted_coords.append((full_x, full_y))
+        detected.append((hand_landmarks, converted_coords))
 
-    return hand_landmarks, converted_coords
+    return detected
+
+
+def debug_get_crop_info(pose_landmarks, frame_width, frame_height):
+    """
+    DEBUG ONLY — replicates extract_hand_features()'s crop decision so
+    review tools can visualize exactly which strategy was chosen and
+    where the crop box(es) landed, without touching the real extraction
+    function's signature or behavior. Returns:
+        (mode, boxes) where mode is "combined" or "separate" or "none",
+        and boxes is a list of (x1,y1,x2,y2) tuples (1 or 2 boxes).
+    """
+    if pose_landmarks is None:
+        return "none", []
+
+    left_shoulder = pose_landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
+    right_shoulder = pose_landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+    shoulder_width_px = abs(left_shoulder.x - right_shoulder.x) * frame_width
+    if shoulder_width_px < 1:
+        shoulder_width_px = frame_width * 0.15
+
+    left_wrist_lm = pose_landmarks[mp_pose.PoseLandmark.LEFT_WRIST]
+    right_wrist_lm = pose_landmarks[mp_pose.PoseLandmark.RIGHT_WRIST]
+
+    both_wrists_visible = (
+        left_wrist_lm.visibility >= MIN_VISIBILITY_FOR_CROP
+        and right_wrist_lm.visibility >= MIN_VISIBILITY_FOR_CROP
+    )
+
+    use_combined_crop = True
+    if both_wrists_visible:
+        dx = (left_wrist_lm.x - right_wrist_lm.x) * frame_width
+        dy = (left_wrist_lm.y - right_wrist_lm.y) * frame_height
+        wrist_dist_px = np.sqrt(dx * dx + dy * dy)
+        single_crop_half_size = max(shoulder_width_px * SINGLE_CROP_MARGIN_MULTIPLIER, 35)
+        use_combined_crop = wrist_dist_px < (2 * single_crop_half_size)
+
+    if use_combined_crop:
+        box = get_combined_hand_crop_box(left_wrist_lm, right_wrist_lm, shoulder_width_px, frame_width, frame_height)
+        return "combined", ([box] if box else [])
+    else:
+        boxes = []
+        lb = get_single_wrist_crop_box(left_wrist_lm, shoulder_width_px, frame_width, frame_height)
+        rb = get_single_wrist_crop_box(right_wrist_lm, shoulder_width_px, frame_width, frame_height)
+        if lb:
+            boxes.append(lb)
+        if rb:
+            boxes.append(rb)
+        return "separate", boxes
 
 
 def extract_hand_features(frame_rgb, pose_landmarks, hands_model):
+    """
+    v7: ADAPTIVE crop strategy.
+      - Wrists CLOSE together (e.g. ball_out, double_contact holds):
+        one combined crop, up to 2 hands detected in it, assigned to
+        the nearest wrist. Prevents the same physical hand being
+        double-detected by two overlapping independent crops.
+      - Wrists FAR apart (e.g. both arms raised wide, service
+        authorization poses): two separate, tight, high-resolution
+        crops, one per wrist. Prevents a clearly-visible hand going
+        undetected because a wide combined crop lowered its effective
+        resolution after MediaPipe resizes it internally.
+    """
     left_hand = np.zeros(NUM_HAND_LANDMARKS * 2)
     right_hand = np.zeros(NUM_HAND_LANDMARKS * 2)
     left_detected = 0.0
@@ -189,23 +317,94 @@ def extract_hand_features(frame_rgb, pose_landmarks, hands_model):
     left_wrist_lm = pose_landmarks[mp_pose.PoseLandmark.LEFT_WRIST]
     right_wrist_lm = pose_landmarks[mp_pose.PoseLandmark.RIGHT_WRIST]
 
-    left_crop_box = get_wrist_crop_box(left_wrist_lm, shoulder_width_px, frame_width, frame_height)
-    if left_crop_box is not None:
-        result = detect_hand_in_crop(frame_rgb, left_crop_box, hands_model)
-        if result is not None:
-            hand_landmarks, converted_coords = result
+    # Decide which strategy to use based on whether two independent
+    # single-wrist crops would actually overlap each other, given their
+    # real size — NOT an arbitrary distance guess. This makes the two
+    # branches mutually exclusive by construction: if separate crops
+    # would overlap, we MUST use the combined (multi-hand) branch,
+    # otherwise two independent searches can land on the same hand.
+    both_wrists_visible = (
+        left_wrist_lm.visibility >= MIN_VISIBILITY_FOR_CROP
+        and right_wrist_lm.visibility >= MIN_VISIBILITY_FOR_CROP
+    )
+
+    use_combined_crop = True
+    if both_wrists_visible:
+        # Pixel-space distance, correctly scaling x and y by their own
+        # frame dimensions (previous version incorrectly scaled both
+        # by frame_width only, distorting the distance on non-square
+        # frames).
+        dx = (left_wrist_lm.x - right_wrist_lm.x) * frame_width
+        dy = (left_wrist_lm.y - right_wrist_lm.y) * frame_height
+        wrist_dist_px = np.sqrt(dx * dx + dy * dy)
+
+        single_crop_half_size = max(shoulder_width_px * SINGLE_CROP_MARGIN_MULTIPLIER, 35)
+        # Two crops of this half-size, centered on each wrist, would
+        # touch/overlap once the wrists are closer than 2x half-size.
+        crops_would_overlap = wrist_dist_px < (2 * single_crop_half_size)
+
+        use_combined_crop = crops_would_overlap
+
+    if use_combined_crop:
+        crop_box = get_combined_hand_crop_box(left_wrist_lm, right_wrist_lm, shoulder_width_px, frame_width, frame_height)
+        if crop_box is None:
+            return np.concatenate([left_hand, right_hand]), left_detected, right_detected, left_fingers, right_fingers
+
+        detected_hands = detect_hands_in_combined_crop(frame_rgb, crop_box, hands_model)
+        if not detected_hands:
+            return np.concatenate([left_hand, right_hand]), left_detected, right_detected, left_fingers, right_fingers
+
+        left_wrist_full = np.array([left_wrist_lm.x, left_wrist_lm.y])
+        right_wrist_full = np.array([right_wrist_lm.x, right_wrist_lm.y])
+        hand_centroids = [np.array(coords).mean(axis=0) for _, coords in detected_hands]
+
+        assignments = {}
+        remaining_hand_indices = list(range(len(detected_hands)))
+        remaining_wrists = {"left": left_wrist_full, "right": right_wrist_full}
+
+        while remaining_hand_indices and remaining_wrists:
+            best = None
+            for hand_idx in remaining_hand_indices:
+                for wrist_key, wrist_pos in remaining_wrists.items():
+                    dist = np.linalg.norm(hand_centroids[hand_idx] - wrist_pos)
+                    if best is None or dist < best[0]:
+                        best = (dist, hand_idx, wrist_key)
+            _, hand_idx, wrist_key = best
+            assignments[wrist_key] = hand_idx
+            remaining_hand_indices.remove(hand_idx)
+            del remaining_wrists[wrist_key]
+
+        if "left" in assignments:
+            hand_landmarks, converted_coords = detected_hands[assignments["left"]]
             left_hand = np.array(converted_coords).flatten()
             left_detected = 1.0
             left_fingers = compute_finger_extension(hand_landmarks)
 
-    right_crop_box = get_wrist_crop_box(right_wrist_lm, shoulder_width_px, frame_width, frame_height)
-    if right_crop_box is not None:
-        result = detect_hand_in_crop(frame_rgb, right_crop_box, hands_model)
-        if result is not None:
-            hand_landmarks, converted_coords = result
+        if "right" in assignments:
+            hand_landmarks, converted_coords = detected_hands[assignments["right"]]
             right_hand = np.array(converted_coords).flatten()
             right_detected = 1.0
             right_fingers = compute_finger_extension(hand_landmarks)
+
+    else:
+        # Wrists far apart — use two separate, tighter, higher-resolution crops
+        left_crop_box = get_single_wrist_crop_box(left_wrist_lm, shoulder_width_px, frame_width, frame_height)
+        if left_crop_box is not None:
+            results = detect_hands_in_combined_crop(frame_rgb, left_crop_box, hands_model)
+            if results:
+                hand_landmarks, converted_coords = results[0]
+                left_hand = np.array(converted_coords).flatten()
+                left_detected = 1.0
+                left_fingers = compute_finger_extension(hand_landmarks)
+
+        right_crop_box = get_single_wrist_crop_box(right_wrist_lm, shoulder_width_px, frame_width, frame_height)
+        if right_crop_box is not None:
+            results = detect_hands_in_combined_crop(frame_rgb, right_crop_box, hands_model)
+            if results:
+                hand_landmarks, converted_coords = results[0]
+                right_hand = np.array(converted_coords).flatten()
+                right_detected = 1.0
+                right_fingers = compute_finger_extension(hand_landmarks)
 
     hand_coords = np.concatenate([left_hand, right_hand])
     return hand_coords, left_detected, right_detected, left_fingers, right_fingers
@@ -276,7 +475,7 @@ def warm_up_mediapipe():
     """
     print("Warming up MediaPipe (one-time, sequential, ensures model file is valid)...")
     pose = mp_pose.Pose(static_image_mode=False, model_complexity=0)
-    hands = mp_hands.Hands(static_image_mode=True, max_num_hands=1)
+    hands = mp_hands.Hands(static_image_mode=True, max_num_hands=2)
     pose.close()
     hands.close()
     print("Warm-up complete.\n")
@@ -300,8 +499,8 @@ def _init_worker():
     )
     _worker_hands_model = mp_hands.Hands(
         static_image_mode=True,
-        max_num_hands=1,
-        min_detection_confidence=0.28,
+        max_num_hands=2,
+        min_detection_confidence=0.1,
         min_tracking_confidence=0.28,
     )
 
