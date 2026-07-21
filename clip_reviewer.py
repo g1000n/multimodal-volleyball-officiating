@@ -40,6 +40,7 @@ from extract_keypoints import extract_pose_features, extract_hand_features, debu
 MANIFEST_PATH = "data/dataset_manifest.csv"
 PROGRESS_PATH = "data/clip_review_progress.json"
 DISPLAY_HEIGHT = 480  # each side panel resized to this height for consistent display
+WINDOW_NAME = "Clip Reviewer"
 
 mp_pose = mp.solutions.pose
 mp_hands = mp.solutions.hands
@@ -141,13 +142,49 @@ def choose_gesture_filter(rows):
     return filtered, selected
 
 
+def choose_person_filter(rows):
+    persons = sorted(set(r["person_id"] for r in rows))
+    counts = {p: sum(1 for r in rows if r["person_id"] == p) for p in persons}
+
+    menu_options = persons + ["all"]
+
+    print("\nAvailable people (within your gesture selection):")
+    for i, person in enumerate(menu_options, start=1):
+        if person == "all":
+            print(f"  {i}. all  (review everyone)")
+        else:
+            print(f"  {i}. {person}  ({counts[person]} clips)")
+
+    choice = input(f"\nEnter a number (1-{len(menu_options)}): ").strip()
+
+    try:
+        choice_num = int(choice)
+        selected = menu_options[choice_num - 1]
+    except (ValueError, IndexError):
+        print(f"'{choice}' not a valid option, defaulting to 'all'.")
+        selected = "all"
+
+    if selected == "all":
+        return rows, "ALL"
+
+    filtered = [r for r in rows if r["person_id"] == selected]
+    return filtered, selected
+
+
 def main():
     rows = load_clip_list()
     if not rows:
         print("Manifest is empty or missing. Run build_manifest.py first.")
         return
 
-    rows, filter_key = choose_gesture_filter(rows)
+    rows, gesture_key = choose_gesture_filter(rows)
+    rows, person_key = choose_person_filter(rows)
+
+    if not rows:
+        print(f"No clips found for {gesture_key} + {person_key}. Nothing to review.")
+        return
+
+    filter_key = f"{gesture_key}__{person_key}"
 
     progress = load_progress()
     if "last_index_by_filter" not in progress:
@@ -161,12 +198,18 @@ def main():
         min_detection_confidence=0.5, min_tracking_confidence=0.5,
     )
     hands_model = mp_hands.Hands(
-        static_image_mode=True, max_num_hands=1,
-        min_detection_confidence=0.28, min_tracking_confidence=0.28,
+        static_image_mode=True, max_num_hands=2,
+        min_detection_confidence=0.1, min_tracking_confidence=0.28,
     )
 
     print(f"Resuming at clip {index + 1}/{len(rows)}.")
     print("SPACE=pause/resume  D=flag for removal  K=keep  N=skip  B=back  R=restart  Q=quit\n")
+
+    # Resizable window — lets you drag the corners/edges to make it bigger
+    # or smaller, and OpenCV will scale the displayed image to fit instead
+    # of cropping or locking to a fixed size.
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, 1400, 700)
 
     while 0 <= index < len(rows):
         row = rows[index]
@@ -228,7 +271,7 @@ def main():
                     cv2.putText(combined, line, (10, 85 + i * 22),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-                cv2.imshow("Clip Reviewer", combined)
+                cv2.imshow(WINDOW_NAME, combined)
 
             key = cv2.waitKey(delay_ms if not paused else 30) & 0xFF
 
