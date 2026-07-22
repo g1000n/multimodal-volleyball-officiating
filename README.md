@@ -1,20 +1,22 @@
 # Whistle Detection Pipeline
 
 Audio whistle-detection module for the Multimodal Real-Time Officiating System
-(gesture recognition + whistle detection + automated scoring). This README covers
-setup and the current run order after recent fixes.
+(gesture recognition + whistle detection + automated scoring).
+
+**Scope note:** whistle detection is binary (Whistle / No Whistle) only. It does
+NOT classify blast duration or call type -- that distinction is not reliable from
+audio alone and isn't needed, since the gesture recognition module determines what
+the call means. The whistle's only job is to trigger/validate that a call happened.
 
 ## Getting the latest code (for groupmates)
 
 ```powershell
-git pull origin main
+git pull origin audio
 ```
-If you get conflicts on scripts you haven't touched locally, just accept the incoming
-version (`git checkout --theirs scripts/<file>.py`) and re-run `git pull`.
 
 ## Environment setup (one-time)
 
-Use **Python 3.12** specifically — Python 3.14 has known DLL compatibility issues with
+Use **Python 3.12** -- Python 3.14 has known DLL compatibility issues with
 numba/librosa on Windows.
 
 ```powershell
@@ -24,59 +26,82 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Every new terminal session needs `whistle_env\Scripts\activate` run again before any
-`python`/`pip` command.
+Every new terminal session needs `whistle_env\Scripts\activate` run again first.
 
 ## Data setup (one-time)
 
+**Volleylitics (public match audio):**
 ```powershell
 python -m pip install -U huggingface_hub
 hf download GYdevy/volleyball-whistles --repo-type dataset --local-dir raw_data/volleylitics
 ```
 
-For iPhone recordings: drop `.m4a`/`.wav` files into `raw_data/iphone_recordings/`.
-**Keep whistle-containing recordings and pure-negative recordings as separate files**
-(see Data Notes below) — do not mix whistles and negatives in the same file.
+**iPhone recordings (co-primary source):** organize recordings into these exact subfolders:
+```
+raw_data/iphone_recordings/
+├── positive_audio/            <- clean whistle-only session(s)
+├── positive_negative_audio/   <- noisy session(s), whistles + background noise mixed in
+└── negative_audio/            <- pure ambient noise, NO whistles at all
+```
+Do not mix whistle-containing and whistle-free audio in the same file --
+`04_process_iphone_negatives.py` has no whistle-location awareness and would
+mislabel whistle audio as negative if they're combined.
 
 ## Full pipeline (run in order)
 
 ```powershell
 python scripts/01_audit_json.py
-python scripts/09_sample_calibration_timestamps.py   # manual QC listening pass, see notes below
-python scripts/02_extract_whistle_clips.py            # Volleylitics whistle clips
-python scripts/03_extract_match_negatives.py          # Volleylitics negative clips
+python scripts/09_sample_calibration_timestamps.py     # manual QC listening pass
+python scripts/02_extract_whistle_clips.py              # Volleylitics whistle clips
+python scripts/03_extract_match_negatives.py            # Volleylitics negative clips
 
-# iPhone data (only once recordings are ready):
-python scripts/04a_detect_iphone_whistle_candidates.py  # auto-detect candidates, then confirm y/n in the CSV
-python scripts/04b_extract_iphone_whistles.py           # extract confirmed whistle clips
-python scripts/04_process_iphone_negatives.py           # run on NEGATIVE-ONLY recordings
+# iPhone data:
+python scripts/04a_detect_iphone_whistle_candidates.py    # auto-detect candidates in positive_audio/ + positive_negative_audio/
+#  -> open processed/iphone_whistle_candidates.csv, confirm each row y/n in VLC (Ctrl+T to jump to vlc_jump_time), save
+python scripts/04b_extract_iphone_whistles.py             # extracts confirmed whistle clips -> iphone_whistle_index.csv
+python scripts/04_process_iphone_negatives.py             # only reads negative_audio/ -> iphone_negative_index.csv
 
-python scripts/05_extract_features.py                   # combines all sources -> features.csv
-python scripts/06_train_model.py                        # edit TEST_MATCHES first, see below
-python scripts/07_evaluate.py                            # run once, don't re-tune on this result
+python scripts/05_extract_features.py                     # combines ALL sources -> features.csv
+python scripts/06_train_model.py                          # edit TEST_MATCHES first, see below
+python scripts/07_evaluate.py                              # run once, don't re-tune on this result
 
-python scripts/08_realtime_test.py live                  # live mic test
+python scripts/08_realtime_test.py live                    # live mic test, binary whistle trigger only
 ```
 
 ## Important settings to check before training
 
-- **`scripts/06_train_model.py` → `TEST_MATCHES`**: must list match_ids that actually
-  exist in your data. Once iPhone data is included, add at least one
-  `iphone_<filename>` group here too — otherwise the reported accuracy only reflects
-  Volleylitics-style audio, not real device conditions.
-- **`scripts/02_extract_whistle_clips.py` → `PRE`/`POST`/`TARGET_LEN`**: currently
-  `0.3s` / `1.2s` / `1.5s`, set from a manual listening QC pass (see
-  `processed/calibration_sample.csv`). If you re-run QC and find different patterns,
-  update these three values consistently — `04b_extract_iphone_whistles.py` and
-  `08_realtime_test.py`'s `WINDOW_SEC` must match `TARGET_LEN` exactly, or you'll get
-  train/inference mismatch (this caused erratic real-time detection before it was fixed).
+- **`TEST_MATCHES` appears in BOTH `05_extract_features.py` and `06_train_model.py`
+  and must match in both files.** `05` uses it to decide which clips get skipped
+  from data augmentation (time-shift/noise variants); `06` uses it to hold out the
+  actual test split. If they don't match, augmented copies of your "held-out" data
+  leak into training, quietly inflating your reported accuracy.
+  Current setting (once iPhone data is included):
+  ```python
+  TEST_MATCHES = ["match9", "match7", "match13", "iphone_positive_audio"]
+  ```
+  Check `processed/features.csv` `match_id` counts to confirm exact group names
+  before setting this -- they must match exactly (e.g. `iphone_positive_audio`,
+  not `iphone_positive_audio_wav` or similar).
+
+- **`02_extract_whistle_clips.py` → `PRE`/`POST`/`TARGET_LEN`**: `0.3s` / `1.2s` /
+  `1.5s`, set from manual listening QC (`processed/calibration_sample.csv`).
+  `04b_extract_iphone_whistles.py` and `08_realtime_test.py`'s `WINDOW_SEC` must
+  match `TARGET_LEN` exactly -- a mismatch here previously caused a single long
+  whistle to be reported as 2-3 separate triggers in real-time testing.
 
 ## Data notes
 
-- Audio loading uses `soundfile` + `scipy` resampling, not `librosa`, to avoid
-  Windows DLL import failures (numba/soxr). Don't reintroduce `librosa.load` calls.
-- iPhone data is a **co-primary** source alongside Volleylitics, not merely
-  supplementary — see the thesis Methods chapter for the current framing.
-- Whistle-containing and negative-only iPhone recordings must stay in separate files,
-  since `04_process_iphone_negatives.py` has no whistle-location awareness and would
-  mislabel whistle audio as negative if they're mixed.
+- Audio loading uses `soundfile` + `scipy` resampling, not `librosa` -- avoids
+  Windows DLL import failures (numba/soxr). Don't reintroduce `librosa.load`.
+- iPhone data is co-primary alongside Volleylitics, not merely supplementary.
+  Current counts: 358 iPhone whistle clips (195 clean + 163 noisy), 30 iPhone
+  negative clips, alongside Volleylitics's ~600 whistle clips across 10 matches.
+- Latest held-out evaluation (3 Volleylitics matches + 1 held-out iPhone
+  recording): ~98% accuracy, 0.97-0.99 precision/recall across both classes.
+  Note in the paper that iPhone test performance reflects close-mic recording
+  conditions, not broadcast match audio -- avoid overstating this as a strict
+  like-for-like improvement over the Volleylitics-only baseline.
+- Real-time detection (`08_realtime_test.py`) is intentionally binary
+  (whistle / no whistle trigger only). No blast-duration or call-type
+  classification is done here -- that logic was removed to match the thesis's
+  stated scope; call interpretation is the gesture recognition module's job.

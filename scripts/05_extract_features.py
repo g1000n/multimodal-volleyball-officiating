@@ -20,7 +20,7 @@ ROOT = Path(__file__).parent.parent
 CLIPS_DIR = ROOT / "processed" / "clips"
 SR = 22050
 N_MFCC = 13
-TEST_MATCHES = ["match9", "match7", "match13"]
+TEST_MATCHES = ["match9", "match7", "match13", "iphone_positive_audio"]
 
 def normalize(y):
     max_abs = np.max(np.abs(y))

@@ -1,12 +1,16 @@
 """
-Step 8: Final Meta-Ensemble Real-Time Whistle Detector (86 Dimensions)
-Features: Thread-Safe Queue, 86-D Extractor, and a Cooldown Timer to prevent multi-triggers.
+Step 8: Real-Time Whistle Detector (86 Dimensions)
 
-FIX (see notes below): WINDOW_SEC now matches the training clip length (TARGET_LEN
-in 02_extract_whistle_clips.py = 1.5s). Previously this was 1.0s, a mismatch with
-what the model was actually trained on -- likely the main cause of a single long
-whistle being reported as 2-3 separate short triggers. WHISTLE_COOLDOWN_SEC is now
-actually enforced (it was defined but unused before).
+Binary whistle detection only -- per the thesis scope ("...classification of
+audio segments into 'Whistle' and 'No Whistle' categories... the system is
+delimited to processing whistle sounds solely as the audio trigger for
+confirming referee calls"). The whistle's role is to trigger/validate a
+referee call; WHAT the call means comes from the gesture recognition module,
+not from whistle duration. Short/long blast classification has been removed.
+
+WINDOW_SEC matches the training clip length (TARGET_LEN in
+02_extract_whistle_clips.py = 1.5s). WHISTLE_COOLDOWN_SEC prevents a single
+whistle from re-triggering multiple times while its tail/echo is still audible.
 """
 import sys
 from pathlib import Path
@@ -19,12 +23,12 @@ import time
 
 ROOT = Path(__file__).parent.parent
 SR = 22050
-WINDOW_SEC = 1.5   # FIX: was 1.0 -- must match TARGET_LEN used in 02_extract_whistle_clips.py
+WINDOW_SEC = 1.5   # must match TARGET_LEN used in 02_extract_whistle_clips.py
 STEP_SEC = 0.5
 N_MFCC = 13
 
 OPTIMIZED_THRESHOLD = 0.30
-WHISTLE_COOLDOWN_SEC = 2.0  # minimum time after an event ends before a new one can start
+WHISTLE_COOLDOWN_SEC = 2.0  # minimum time after a whistle ends before a new one can trigger
 
 def normalize(y):
     max_abs = np.max(np.abs(y))
@@ -121,7 +125,7 @@ def live_test(model):
             print(status, file=sys.stderr)
         audio_queue.put(indata[:, 0].copy())
 
-    print(f"Listening (Triple Ensemble @ Threshold {OPTIMIZED_THRESHOLD}, window={WINDOW_SEC}s)...")
+    print(f"Listening for whistle (Threshold {OPTIMIZED_THRESHOLD}, window={WINDOW_SEC}s)...")
     print("Press Ctrl+C to terminate execution stream safely.")
 
     step_samples = int(STEP_SEC * SR)
@@ -130,9 +134,8 @@ def live_test(model):
     with stream:
         try:
             in_whistle_event = False
-            whistle_length_frames = 0
             silence_counter = 0
-            last_event_end_time = 0.0  # FIX: track when the last event ended, for cooldown
+            last_event_end_time = 0.0  # tracks when the last whistle ended, for cooldown
 
             while True:
                 raw_input = audio_queue.get()
@@ -157,32 +160,22 @@ def live_test(model):
                 if is_whistle_now:
                     silence_counter = 0
 
-                    # FIX: only allow a NEW event to start if the cooldown has elapsed
-                    # since the last event ended. Prevents a single long whistle's tail
-                    # (or its immediate crowd-noise aftermath) from re-triggering as a
-                    # second/third "whistle".
+                    # Only allow a NEW event to start if the cooldown has elapsed
+                    # since the last one ended -- prevents a single whistle's tail
+                    # from re-triggering as a second detection.
                     if not in_whistle_event:
                         if (now - last_event_end_time) < WHISTLE_COOLDOWN_SEC:
                             continue  # still in cooldown, ignore this trigger
                         in_whistle_event = True
-                        whistle_length_frames = 1
-                        print("\n===================================================")
-                        print("★ WHISTLE TRIGGERED! (Waking up MediaPipe...) ★")
-                        print("===================================================")
-                    else:
-                        whistle_length_frames += 1
+                        print("\n========================================================")
+                        print("★ WHISTLE DETECTED (Waking up gesture recognition...) ★")
+                        print("========================================================")
                 else:
                     if in_whistle_event:
                         silence_counter += 1
                         if silence_counter >= 3:
-                            if whistle_length_frames <= 2:
-                                print("  --> Call Logged: SHORT BLAST (Serve / Quick Fault)")
-                            else:
-                                print("  --> Call Logged: LONG BLAST (Rally End / Timeout)")
-
                             in_whistle_event = False
-                            whistle_length_frames = 0
-                            last_event_end_time = now  # FIX: start the cooldown clock
+                            last_event_end_time = now  # start the cooldown clock
 
         except KeyboardInterrupt:
             print("\nShutting down live audio session context safely.")
