@@ -2,12 +2,17 @@
 Step 3: Extract negative (non-whistle) clips from the SAME match audio,
 sampled away from any whistle timestamp.
 
-This version bypasses librosa and uses soundfile to prevent Windows DLL import crashes.
+These are "hard negatives" -- crowd noise, ball hits, shouting -- from the
+exact same recording domain as your positives. This matters more than the
+iPhone negatives because it isolates "whistle vs. not" instead of
+accidentally teaching "match recording vs. iPhone recording."
 """
 import json
 from pathlib import Path
 from collections import defaultdict
+
 import numpy as np
+import librosa
 import soundfile as sf
 import pandas as pd
 
@@ -20,6 +25,10 @@ SR = 22050
 SEG_LEN = 1.0        # match TARGET_LEN from step 2
 MIN_GAP = 2.0         # seconds away from any whistle timestamp
 PER_MATCH = 60        # negatives to pull per match (mirrors whistle cap for 1:1 balance)
+                      # online match-audio negatives only for now (~600 total,
+                      # matching ~600 whistle positives). Revisit this once
+                      # iPhone recordings are ready to add as a second source.
+
 
 def extract_negatives(audio, sr, whistle_times, n_segments, seg_len=SEG_LEN, min_gap=MIN_GAP):
     duration = len(audio) / sr
@@ -36,6 +45,7 @@ def extract_negatives(audio, sr, whistle_times, n_segments, seg_len=SEG_LEN, min
         attempts += 1
 
     return segments
+
 
 def main():
     with open(JSON_PATH) as f:
@@ -55,11 +65,7 @@ def main():
             continue
 
         print(f"Extracting negatives from {match_id}...")
-        
-        # Load audio safely without librosa
-        audio, sr = sf.read(wav_path)
-        if len(audio.shape) > 1:
-            audio = np.mean(audio, axis=1) # Mono conversion
+        audio, sr = librosa.load(wav_path, sr=SR)
 
         segments = extract_negatives(audio, sr, whistle_times, PER_MATCH)
 
@@ -80,6 +86,7 @@ def main():
     out_csv = ROOT / "processed" / "match_negative_index.csv"
     df.to_csv(out_csv, index=False)
     print(f"\nExtracted {len(df)} match negative clips -> {out_csv}")
+
 
 if __name__ == "__main__":
     main()
