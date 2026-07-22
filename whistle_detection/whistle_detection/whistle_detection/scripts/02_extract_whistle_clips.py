@@ -2,13 +2,21 @@
 Step 2: Extract whistle clips from the 14 match recordings using t_anchor
 timestamps from the reanchored JSON.
 
-Adjusted PRE/POST/TARGET_LEN based on QC pass, and added deduplication (merge) logic.
-This version bypasses librosa and uses soundfile to prevent Windows DLL import crashes.
+Adjust PRE / POST / TARGET_LEN after your listening QC pass from step 1.
+
+NOTE ON 'type' FIELD: labeling is currently binary (whistle=1). The JSON's
+"type" field (serve / rally_end / other) is preserved in the index CSV as
+an extra column ("whistle_type") even though it isn't used for anything yet.
+That means if you later want to classify by type, you won't need to
+re-extract clips -- just re-run step 5/6 using that column instead of the
+binary label.
 """
 import json
 from pathlib import Path
 from collections import defaultdict
+
 import numpy as np
+import librosa
 import soundfile as sf
 
 ROOT = Path(__file__).parent.parent
@@ -18,10 +26,12 @@ OUT_DIR = ROOT / "processed" / "clips" / "whistle"
 
 SR = 22050          # matches Volleylitics native sample rate
 PRE = 0.3            # seconds before anchor
-POST = 1.2           # seconds after anchor (widened to capture long blasts)
-TARGET_LEN = 1.5     # final fixed clip length in seconds (adjusted)
+POST = 0.7           # seconds after anchor
+TARGET_LEN = 1.0     # final fixed clip length in seconds
 MAX_PER_MATCH = 60   # cap so no single match dominates the dataset
-MERGE_GAP = 0.5      # Merge timestamps closer than 0.5s
+                      # (every one of your 10 annotated matches has 265+ whistles,
+                      # so this cap is doing real balancing work -- ~600 total clips)
+
 
 def extract_clip(audio, sr, t_anchor, pre=PRE, post=POST, target_len=TARGET_LEN):
     center = int(t_anchor * sr)
@@ -36,6 +46,7 @@ def extract_clip(audio, sr, t_anchor, pre=PRE, post=POST, target_len=TARGET_LEN)
         clip = clip[:target_samples]
     return clip
 
+
 def main():
     with open(JSON_PATH) as f:
         whistles = json.load(f)
@@ -46,7 +57,6 @@ def main():
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     index_rows = []
-    total_merged = 0
 
     for match_id, entries in by_match.items():
         wav_path = AUDIO_DIR / f"{match_id}.wav"
@@ -54,24 +64,10 @@ def main():
             print(f"  Skipping {match_id}: audio file not found at {wav_path}")
             continue
 
-        # merge anchors that are < MERGE_GAP apart
-        entries = sorted(entries, key=lambda w: w["t_anchor"])
-        merged = []
-        for w in entries:
-            if merged and (w["t_anchor"] - merged[-1]["t_anchor"]) < MERGE_GAP:
-                total_merged += 1
-                continue
-            merged.append(w)
-        entries = merged
-
         print(f"Processing {match_id} ({len(entries)} whistles)...")
-        
-        # Load audio safely without librosa/numba/soxr
-        audio, sr = sf.read(wav_path)
-        if len(audio.shape) > 1:
-            audio = np.mean(audio, axis=1) # Mono conversion
+        audio, sr = librosa.load(wav_path, sr=SR)
 
-        # Cap per match to keep the dataset balanced
+        # cap per match to avoid one match dominating
         entries = entries[:MAX_PER_MATCH]
 
         for w in entries:
@@ -86,15 +82,15 @@ def main():
                 "start_time": w["t_anchor"],
                 "label": 1,
                 "source": "volleylitics_whistle",
-                "whistle_type": w.get("type", "unknown"),
+                "whistle_type": w.get("type", "unknown"),  # kept for future use
             })
 
     import pandas as pd
     df = pd.DataFrame(index_rows)
     out_csv = ROOT / "processed" / "whistle_index.csv"
     df.to_csv(out_csv, index=False)
-    print(f"\nMerged {total_merged} near-duplicate anchor(s) (< {MERGE_GAP}s apart)")
-    print(f"Extracted {len(df)} whistle clips -> {out_csv}")
+    print(f"\nExtracted {len(df)} whistle clips -> {out_csv}")
+
 
 if __name__ == "__main__":
     main()
