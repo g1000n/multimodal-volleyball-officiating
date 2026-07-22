@@ -23,7 +23,7 @@ import ffmpeg
 import pandas as pd
 
 ROOT = Path(__file__).parent.parent
-RAW_DIR = ROOT / "raw_data" / "iphone_recordings"
+RAW_DIR = ROOT / "raw_data" / "iphone_recordings" / "negative_audio"
 OUT_DIR = ROOT / "processed" / "clips" / "non_whistle"
 
 SR = 22050            # downsample to match Volleylitics

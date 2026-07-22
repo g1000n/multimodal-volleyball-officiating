@@ -27,6 +27,11 @@ FRAME_SEC = 0.1          # RMS window size
 MIN_GAP_SEC = 1.0        # candidates closer than this are merged (same whistle)
 PERCENTILE_THRESHOLD = 92  # only the loudest ~8% of frames become candidates
 
+# Only scan folders that contain whistle sounds. "negative_audio" is deliberately
+# excluded -- it has no whistles, and running candidate detection on it would just
+# waste time (or worse, false-flag a loud non-whistle noise as a "whistle").
+WHISTLE_SUBDIRS = ["positive_audio", "positive_negative_audio"]
+
 
 def to_mmss(t):
     m, s = divmod(t, 60)
@@ -46,18 +51,24 @@ def rms_envelope(y, sr, frame_sec=FRAME_SEC):
 
 def main():
     rows = []
-    source_files = list(RAW_DIR.glob("*.wav")) + list(RAW_DIR.glob("*_converted.wav"))
-    # skip double-counting: prefer the converted wav if a raw m4a's conversion exists
+    source_files = []
+    for sub in WHISTLE_SUBDIRS:
+        d = RAW_DIR / sub
+        if not d.exists():
+            print(f"  Note: expected folder not found: {d}")
+            continue
+        source_files.extend(d.glob("*.wav"))
+        source_files.extend(d.glob("*.WAV"))
+        source_files.extend(d.glob("*_converted.wav"))
     source_files = sorted(set(source_files))
 
     if not source_files:
-        print(f"No .wav files found in {RAW_DIR}.")
-        print("If you only have .m4a files, run 04_process_iphone_negatives.py first")
-        print("(it converts .m4a -> .wav) or convert manually with ffmpeg, then rerun this.")
+        print(f"No .wav files found in {WHISTLE_SUBDIRS} under {RAW_DIR}.")
+        print("If you only have .m4a files, convert them to .wav first (see 04's convert_to_wav), then rerun this.")
         return
 
     for wav_path in source_files:
-        print(f"Scanning {wav_path.name}...")
+        print(f"Scanning {wav_path.relative_to(RAW_DIR)}...")
         y, sr = sf.read(wav_path)
         if len(y.shape) > 1:
             y = np.mean(y, axis=1)
@@ -78,7 +89,7 @@ def main():
         for idx in peak_indices:
             t = times[idx]
             rows.append({
-                "source_file": wav_path.name,
+                "source_file": str(wav_path.relative_to(RAW_DIR)),
                 "t_candidate_sec": round(float(t), 2),
                 "vlc_jump_time": to_mmss(max(0, t - 1)),
                 "confirmed": "",  # fill in: y = real whistle, n = false positive
