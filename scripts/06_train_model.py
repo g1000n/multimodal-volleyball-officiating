@@ -10,6 +10,9 @@ from sklearn.ensemble import RandomForestClassifier, VotingClassifier, HistGradi
 
 ROOT = Path(__file__).parent.parent
 TEST_MATCHES = ["match9", "match7", "match13"]
+# CO-PRIMARY DATA NOTE: once iPhone whistle/negative clips are extracted,
+# add at least one iphone_<filename> group here too, e.g.:
+#   TEST_MATCHES = ["match9", "match7", "match13", "iphone_recording2"]
 
 def main():
     feat_csv = ROOT / "processed" / "features.csv"

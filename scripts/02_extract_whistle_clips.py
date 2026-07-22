@@ -16,19 +16,18 @@ JSON_PATH = ROOT / "raw_data" / "volleylitics" / "whistles_all_reanchored.json"
 AUDIO_DIR = ROOT / "raw_data" / "volleylitics"
 OUT_DIR = ROOT / "processed" / "clips" / "whistle"
 
-SR = 22050          # matches Volleylitics native sample rate
-PRE = 0.3            # seconds before anchor
-POST = 1.2           # seconds after anchor (widened to capture long blasts)
-TARGET_LEN = 1.5     # final fixed clip length in seconds (adjusted)
-MAX_PER_MATCH = 60   # cap so no single match dominates the dataset
-MERGE_GAP = 0.5      # Merge timestamps closer than 0.5s
+SR = 22050
+PRE = 0.3
+POST = 1.2
+TARGET_LEN = 1.5
+MAX_PER_MATCH = 60
+MERGE_GAP = 0.5
 
 def extract_clip(audio, sr, t_anchor, pre=PRE, post=POST, target_len=TARGET_LEN):
     center = int(t_anchor * sr)
     start = max(0, center - int(pre * sr))
     end = center + int(post * sr)
     clip = audio[start:end]
-
     target_samples = int(target_len * sr)
     if len(clip) < target_samples:
         clip = np.pad(clip, (0, target_samples - len(clip)))
@@ -54,7 +53,6 @@ def main():
             print(f"  Skipping {match_id}: audio file not found at {wav_path}")
             continue
 
-        # merge anchors that are < MERGE_GAP apart
         entries = sorted(entries, key=lambda w: w["t_anchor"])
         merged = []
         for w in entries:
@@ -65,13 +63,10 @@ def main():
         entries = merged
 
         print(f"Processing {match_id} ({len(entries)} whistles)...")
-        
-        # Load audio safely without librosa/numba/soxr
         audio, sr = sf.read(wav_path)
         if len(audio.shape) > 1:
-            audio = np.mean(audio, axis=1) # Mono conversion
+            audio = np.mean(audio, axis=1)
 
-        # Cap per match to keep the dataset balanced
         entries = entries[:MAX_PER_MATCH]
 
         for w in entries:

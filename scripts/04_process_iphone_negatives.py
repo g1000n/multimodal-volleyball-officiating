@@ -5,15 +5,20 @@ negative clips.
 Pipeline: convert -> segment (non-overlapping) -> filter near-silence ->
 subsample with minimum time spacing so selected clips aren't clustered.
 
-Target: ~100-150 clips total across all your recordings (diversity matters
-more than volume here -- this is a supplementary domain, not the primary
-negative source).
+Target: ~100-150 clips total across all your recordings. iPhone audio is now
+a CO-PRIMARY source alongside Volleylitics (not merely supplementary), so
+aim for a clip count that's a meaningful fraction of your Volleylitics
+negatives, not just a token addition.
+
+NOTE: uses soundfile + scipy for loading/resampling instead of librosa, since
+librosa pulls in numba/soxr which caused DLL import failures on Windows.
 """
 from pathlib import Path
+from math import gcd
 
 import numpy as np
-import librosa
 import soundfile as sf
+from scipy.signal import resample_poly
 import ffmpeg
 import pandas as pd
 
@@ -22,12 +27,21 @@ RAW_DIR = ROOT / "raw_data" / "iphone_recordings"
 OUT_DIR = ROOT / "processed" / "clips" / "non_whistle"
 
 SR = 22050            # downsample to match Volleylitics
-WINDOW_SEC = 1.0        # match your whistle clip length
+WINDOW_SEC = 1.5         # FIX: match TARGET_LEN in 02_extract_whistle_clips.py
 SILENCE_PERCENTILE = 20  # drop the quietest 20% of segments
 MIN_GAP_SEC = 5.0        # minimum spacing between selected clips
-TARGET_PER_FILE = 30     # adjust based on how many recordings you have --
-                          # exact split vs. online negatives not decided yet,
-                          # revisit once iPhone recordings are ready
+TARGET_PER_FILE = 30     # adjust based on how many recordings you have
+
+
+def load_resampled(path, target_sr=SR):
+    y, sr = sf.read(path)
+    if len(y.shape) > 1:
+        y = np.mean(y, axis=1)
+    if sr != target_sr:
+        g = gcd(sr, target_sr)
+        y = resample_poly(y, target_sr // g, sr // g)
+    return y, target_sr
+
 
 
 def convert_to_wav(src_path, dst_path, sr=SR):
@@ -87,7 +101,7 @@ def main():
         else:
             load_path = src
 
-        y, sr = librosa.load(load_path, sr=SR)
+        y, sr = load_resampled(load_path, SR)
 
         segments = segment_long_recording(y, sr)
         segments = energy_filter(segments)

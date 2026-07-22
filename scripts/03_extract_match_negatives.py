@@ -17,9 +17,9 @@ AUDIO_DIR = ROOT / "raw_data" / "volleylitics"
 OUT_DIR = ROOT / "processed" / "clips" / "non_whistle"
 
 SR = 22050
-SEG_LEN = 1.0        # match TARGET_LEN from step 2
-MIN_GAP = 2.0         # seconds away from any whistle timestamp
-PER_MATCH = 60        # negatives to pull per match (mirrors whistle cap for 1:1 balance)
+SEG_LEN = 1.0
+MIN_GAP = 2.0
+PER_MATCH = 60
 
 def extract_negatives(audio, sr, whistle_times, n_segments, seg_len=SEG_LEN, min_gap=MIN_GAP):
     duration = len(audio) / sr
@@ -55,11 +55,9 @@ def main():
             continue
 
         print(f"Extracting negatives from {match_id}...")
-        
-        # Load audio safely without librosa
         audio, sr = sf.read(wav_path)
         if len(audio.shape) > 1:
-            audio = np.mean(audio, axis=1) # Mono conversion
+            audio = np.mean(audio, axis=1)
 
         segments = extract_negatives(audio, sr, whistle_times, PER_MATCH)
 
