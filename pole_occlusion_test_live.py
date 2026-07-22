@@ -1,19 +1,14 @@
 """
-pole_occlusion_test.py
+pole_occlusion_test_live.py
 
-Simulates a solid occluding object (like a net pole) over part of a
-video frame, BEFORE running pose/hand detection on it — so you can see
-whether your extraction pipeline still tracks the referee correctly
-when part of their body is physically blocked from the camera's view.
-
-Adjust the rectangle's position and size live using the sliders/
-trackbars in the "Controls" window, and watch the "SKELETON" panel
-update in real time to see how detection holds up.
+Same idea as pole_occlusion_test.py, but LIVE — uses your webcam/iPhone
+feed (via Camo, same as live_auto_inference.py) instead of a pre-recorded
+clip. Lets you physically stand in front of the camera, adjust a
+simulated occluding rectangle (like a net pole) over yourself in real
+time using sliders, and watch whether pose/hand detection survives.
 
 Run:
-    python pole_occlusion_test.py
-You'll be prompted for a video path (any raw_clips or reference_clips
-video works — paste the full path when asked).
+    python pole_occlusion_test_live.py
 
 Controls:
   Q - quit
@@ -31,6 +26,7 @@ mp_pose = mp.solutions.pose
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 
+CAMERA_INDEX = 1  # set to whatever index your iPhone/Camo feed showed in list_cameras.py
 DISPLAY_HEIGHT = 480
 OCCLUSION_COLOR = (15, 15, 15)  # near-black, dark like a solid pole
 
@@ -81,20 +77,17 @@ def nothing(x):
 
 
 def main():
-    video_path = input("Enter the full path to a video clip to test: ").strip().strip('"')
-
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        print(f"Could not open {video_path}")
+        print(f"ERROR: could not open camera at index {CAMERA_INDEX}.")
         return
 
     success, first_frame = cap.read()
     if not success:
-        print("Could not read a frame from this video.")
+        print("Could not read a frame from the camera.")
         return
 
     frame_h, frame_w = first_frame.shape[:2]
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # rewind after reading the first frame
 
     pose_model = mp_pose.Pose(
         static_image_mode=False, model_complexity=0,
@@ -106,7 +99,7 @@ def main():
     )
 
     controls_window = "Controls"
-    display_window = "Pole Occlusion Test"
+    display_window = "Pole Occlusion Test (Live)"
 
     cv2.namedWindow(controls_window)
     cv2.resizeWindow(controls_window, 400, 200)
@@ -123,15 +116,17 @@ def main():
     cv2.resizeWindow(display_window, 1200, 650)
     cv2.moveWindow(display_window, 0, 0)
 
-    print("Adjust the X, Y, Width, Height sliders in the 'Controls' window.")
-    print("Watch the SKELETON panel to see if detection survives the occlusion.")
+    print("Live feed active. Stand in front of the camera and try your gestures.")
+    print("Adjust the X, Y, Width, Height sliders in the 'Controls' window to move")
+    print("the simulated occlusion over different parts of your body.")
+    print("Watch the SKELETON panel to see if detection survives it.")
     print("Press Q to quit.\n")
 
     while True:
         success, frame = cap.read()
         if not success:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            continue
+            print("Camera feed lost.")
+            break
 
         x = cv2.getTrackbarPos("X", controls_window)
         y = cv2.getTrackbarPos("Y", controls_window)
@@ -156,7 +151,7 @@ def main():
 
         cv2.imshow(display_window, combined)
 
-        key = cv2.waitKey(30) & 0xFF
+        key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
 

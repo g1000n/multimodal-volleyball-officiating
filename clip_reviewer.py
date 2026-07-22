@@ -113,6 +113,36 @@ def resize_to_height(frame, target_height):
     return cv2.resize(frame, (int(w * scale), target_height))
 
 
+def fit_to_window(image, window_name):
+    """
+    Manually fits `image` into the CURRENT real size of the given window,
+    preserving aspect ratio and padding with black bars (letterboxing)
+    instead of stretching. This replaces relying on cv2's WINDOW_KEEPRATIO
+    flag, which silently does nothing unless OpenCV was built with Qt
+    support (the standard pip packages are not).
+    """
+    try:
+        _, _, win_w, win_h = cv2.getWindowImageRect(window_name)
+    except Exception:
+        win_w, win_h = 0, 0
+
+    if win_w <= 0 or win_h <= 0:
+        return image  # window not realized yet on this frame, just show as-is
+
+    img_h, img_w = image.shape[:2]
+    scale = min(win_w / img_w, win_h / img_h)
+    new_w, new_h = max(1, int(img_w * scale)), max(1, int(img_h * scale))
+
+    resized = cv2.resize(image, (new_w, new_h))
+
+    canvas = np.zeros((win_h, win_w, 3), dtype=np.uint8)
+    x_offset = (win_w - new_w) // 2
+    y_offset = (win_h - new_h) // 2
+    canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+
+    return canvas
+
+
 def choose_gesture_filter(rows):
     labels = sorted(set(r["gesture_label"] for r in rows))
     counts = {label: sum(1 for r in rows if r["gesture_label"] == label) for label in labels}
@@ -205,11 +235,17 @@ def main():
     print(f"Resuming at clip {index + 1}/{len(rows)}.")
     print("SPACE=pause/resume  D=flag for removal  K=keep  N=skip  B=back  R=restart  Q=quit\n")
 
-    # Resizable window — lets you drag the corners/edges to make it bigger
-    # or smaller, and OpenCV will scale the displayed image to fit instead
-    # of cropping or locking to a fixed size.
+    # NOTE: WINDOW_KEEPRATIO only works if OpenCV was built with Qt support,
+    # which the standard pip opencv-python/opencv-contrib-python packages
+    # are NOT. So we do the aspect-ratio preservation manually instead —
+    # see fit_to_window() above, called every frame right before imshow.
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, 1400, 700)
+    cv2.resizeWindow(WINDOW_NAME, 1200, 650)
+    # Force the window to open at the screen's top-left corner. Without
+    # this, it can spawn partially off-screen (left edge and title bar
+    # cut off), which looks like content is being cropped but is really
+    # just a window-positioning issue, not a video display problem.
+    cv2.moveWindow(WINDOW_NAME, 0, 0)
 
     while 0 <= index < len(rows):
         row = rows[index]
@@ -271,7 +307,7 @@ def main():
                     cv2.putText(combined, line, (10, 85 + i * 22),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-                cv2.imshow(WINDOW_NAME, combined)
+                cv2.imshow(WINDOW_NAME, fit_to_window(combined, WINDOW_NAME))
 
             key = cv2.waitKey(delay_ms if not paused else 30) & 0xFF
 

@@ -194,8 +194,8 @@ def main():
         min_detection_confidence=0.5, min_tracking_confidence=0.5,
     )
     hands_model = mp_hands.Hands(
-        static_image_mode=True, max_num_hands=1,
-        min_detection_confidence=0.28, min_tracking_confidence=0.28,
+        static_image_mode=True, max_num_hands=2,
+        min_detection_confidence=0.1, min_tracking_confidence=0.28,
     )
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
