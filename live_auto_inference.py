@@ -55,7 +55,15 @@ from extract_keypoints import (
     extract_hand_features,
     compute_elbow_angles,
 )
-from train import normalize_sequence, resample_sequence, SEQUENCE_LENGTH
+from train import (
+    normalize_sequence,
+    resample_sequence,
+    SEQUENCE_LENGTH,
+    TOTAL_FEATURES,          # NEW
+    ablate,                  # NEW
+    ABLATE_HAND_COORDS,      # NEW
+    ABLATED_FEATURE_COUNT,   # NEW
+)
 from model import GestureCNNLSTM
 
 MODEL_PATH = "models/final_model.pt"
@@ -69,9 +77,11 @@ MIN_ACTIVE_FRAMES = 12          # ignore tiny flickers shorter than this many fr
 PRE_BUFFER_SIZE = 10            # keep this many recent idle frames so gesture start isn't clipped
 MAX_ACTIVE_FRAMES = 300         # safety cap (~10s at 30fps) so a stuck "active" state can't buffer forever
 
-# Which part of the 122-feature vector to use for motion scoring
-# (pose + hand coords only — skip flags/fingers/elbow, which are more
-# categorical and jump around even during small tracking noise)
+# Which part of the 122-feature RAW (pre-ablation) vector to use for
+# motion scoring — pose + hand coords only. UNCHANGED by the ablation:
+# motion detection happens on the raw per-frame features before
+# normalize/ablate ever run, so this slice still refers to the original
+# 122-dim layout regardless of what the model itself sees.
 MOTION_FEATURE_SLICE = slice(0, 108)
 
 SHOW_SKELETON_DEFAULT = True  # starting state — press S anytime to toggle
@@ -86,7 +96,8 @@ def load_model():
         label_to_idx = json.load(f)
     idx_to_label = {v: k for k, v in label_to_idx.items()}
 
-    model = GestureCNNLSTM(input_size=122, num_classes=len(label_to_idx))
+    input_size = ABLATED_FEATURE_COUNT if ABLATE_HAND_COORDS else TOTAL_FEATURES  # CHANGED — was hardcoded 122
+    model = GestureCNNLSTM(input_size=input_size, num_classes=len(label_to_idx))
     model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
     model.eval()
     return model, idx_to_label
@@ -95,6 +106,7 @@ def load_model():
 def predict_clip(frame_sequence, model, idx_to_label):
     raw = np.array(frame_sequence)
     normalized = normalize_sequence(raw)
+    normalized = ablate(normalized)   # NEW LINE — must match what the model was trained on
     resampled = resample_sequence(normalized, SEQUENCE_LENGTH)
     x = torch.tensor(resampled, dtype=torch.float32).unsqueeze(0)
 

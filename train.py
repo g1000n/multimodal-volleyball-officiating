@@ -33,6 +33,18 @@ ELBOW_ANGLE_FEATURES = 2   # left_elbow_angle, right_elbow_angle
 TOTAL_FEATURES = POSE_FEATURES + HAND_COORD_FEATURES + HAND_FLAG_FEATURES + FINGER_FEATURES + ELBOW_ANGLE_FEATURES  # 122
 BATCH_SIZE = 16
 
+# --- NEW: hand-coordinate ablation experiment ---
+# Tests the hypothesis that the model over-relies on the 84 raw hand
+# x/y coordinates, which are reliable in training footage (85-100%
+# detection) but frequently missing/garbage on real external footage
+# (seen as low as 0-35% detection). If True, those 84 columns are
+# dropped before the model ever sees them, leaving only pose (24) +
+# hand-detected flags (2) + finger-extension (10) + elbow angles (2)
+# = 38 features. Nothing on disk changes -- this only affects what
+# gets fed into the model at train/eval time.
+ABLATE_HAND_COORDS = True
+ABLATED_FEATURE_COUNT = POSE_FEATURES + HAND_FLAG_FEATURES + FINGER_FEATURES + ELBOW_ANGLE_FEATURES  # 38
+
 # Column ranges for the tie-breaker logic (see below)
 LEFT_FINGERS_START = POSE_FEATURES + HAND_COORD_FEATURES + HAND_FLAG_FEATURES        # 110
 RIGHT_FINGERS_START = LEFT_FINGERS_START + 5                                        # 115
@@ -73,7 +85,7 @@ def load_manifest_rows():
 
 def normalize_sequence(seq):
     """
-    seq shape: (frames, TOTAL_FEATURES) = (frames, 120)
+    seq shape: (frames, TOTAL_FEATURES) = (frames, 122)
       [0:24]     pose:        8 landmarks x (x, y, visibility)
       [24:66]    left hand:  21 landmarks x (x, y)
       [66:108]   right hand: 21 landmarks x (x, y)
@@ -81,6 +93,7 @@ def normalize_sequence(seq):
       [109]      right_hand_detected  (0.0 or 1.0)
       [110:115]  left hand finger extension  (0.0-1.0 each)
       [115:120]  right hand finger extension (0.0-1.0 each)
+      [120:122]  elbow angles
 
     Pose and hand COORDINATES are normalized relative to shoulder
     midpoint/width. Detection flags and finger-extension values are
@@ -119,6 +132,21 @@ def normalize_sequence(seq):
     ], axis=1)
 
     return normalized
+
+
+def ablate(normalized_seq):
+    """
+    NEW FUNCTION.
+    Drops the 84 raw hand-coordinate columns [24:108] from an already-
+    normalized sequence, keeping only pose (0:24) + flags/fingers/elbow
+    (108:122) -- 38 columns total. No-op if ABLATE_HAND_COORDS is False.
+    Only ever called on the NORMALIZED tensor that feeds the model --
+    never on the raw array used by the tie-breaker.
+    """
+    if not ABLATE_HAND_COORDS:
+        return normalized_seq
+    keep_cols = list(range(0, POSE_FEATURES)) + list(range(POSE_FEATURES + HAND_COORD_FEATURES, TOTAL_FEATURES))
+    return normalized_seq[:, keep_cols]
 
 
 def resample_sequence(seq, target_len):
@@ -187,6 +215,7 @@ class GestureDataset(Dataset):
         row = self.rows[i]
         raw = np.load(row["keypoint_path"])
         normalized = normalize_sequence(raw)
+        normalized = ablate(normalized)   # NEW LINE — drops hand coords if ABLATE_HAND_COORDS is True
 
         if self.augment:
             normalized = augment_sequence(normalized)
@@ -214,9 +243,12 @@ def is_peace_sign(finger_block_avg):
 
 def apply_tie_breaker(raw_sequence, top1_label, top2_label, top1_prob, top2_prob, idx_to_label):
     """
-    raw_sequence: the ORIGINAL (pre-normalization) keypoint sequence for one
-    clip, shape (frames, 120) — needed because finger features are easiest
-    to read directly here rather than re-deriving from the normalized tensor.
+    raw_sequence: the ORIGINAL (pre-normalization, pre-ablation) keypoint
+    sequence for one clip, shape (frames, 122) — needed because finger
+    features are easiest to read directly here rather than re-deriving
+    from the normalized/ablated tensor. This function is UNCHANGED by
+    the ablation experiment: it always reads from the full raw array,
+    regardless of what the model itself was trained on.
 
     Only overrides the model's prediction when:
       1. The top-2 predicted classes are both in CONFUSABLE_CLASSES, AND
@@ -264,6 +296,9 @@ def train():
 
     print(f"Train clips: {len(train_rows)} | Val clips: {len(val_rows)} | Test clips: {len(test_rows)}")
     print(f"Classes: {all_labels}")
+    if ABLATE_HAND_COORDS:
+        print(f"ABLATION ACTIVE: dropping {HAND_COORD_FEATURES} raw hand-coordinate features. "
+              f"Model input size: {ABLATED_FEATURE_COUNT} (instead of {TOTAL_FEATURES}).")
 
     train_ds = GestureDataset(train_rows, label_to_idx, augment=True)
     val_ds = GestureDataset(val_rows, label_to_idx, augment=False)
@@ -273,7 +308,7 @@ def train():
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-    input_size = TOTAL_FEATURES
+    input_size = ABLATED_FEATURE_COUNT if ABLATE_HAND_COORDS else TOTAL_FEATURES   # CHANGED
     num_classes = len(all_labels)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -348,6 +383,7 @@ def train():
         for row in test_rows:
             raw = np.load(row["keypoint_path"])
             normalized = normalize_sequence(raw)
+            normalized = ablate(normalized)   # NEW LINE — must match what the model was trained on
             resampled = resample_sequence(normalized, SEQUENCE_LENGTH)
             x = torch.tensor(resampled, dtype=torch.float32).unsqueeze(0).to(device)
 
@@ -360,8 +396,10 @@ def train():
             top2_label = idx_to_label[top2_idx_]
             top1_prob, top2_prob = probs[top1_idx], probs[top2_idx_]
 
-            # Use the RAW (pre-normalized, pre-resampled) sequence for the
-            # tie-breaker so finger-extension values are easy to read directly.
+            # Use the RAW (pre-normalized, pre-ablation, pre-resampled)
+            # sequence for the tie-breaker so finger-extension values are
+            # easy to read directly. UNCHANGED — always the full 122-column
+            # raw array regardless of ABLATE_HAND_COORDS.
             raw_resampled_for_tiebreak = resample_sequence(raw, SEQUENCE_LENGTH)
             final_label = apply_tie_breaker(
                 raw_resampled_for_tiebreak, top1_label, top2_label, top1_prob, top2_prob, idx_to_label

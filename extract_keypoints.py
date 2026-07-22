@@ -80,14 +80,14 @@ FINGER_JOINTS = {
 }
 EXTENSION_MARGIN = 1.1
 
-CROP_MARGIN_MULTIPLIER = 1.0
+CROP_MARGIN_MULTIPLIER = 1.5
 # Single-wrist crops use a SMALLER margin than the combined crop — they
 # only need to comfortably contain one hand, not account for spanning
 # both wrists. Using the same large margin as the combined crop for
 # both was the bug: it made single crops so big that the overlap check
 # almost always concluded "would overlap," silently forcing the
 # combined (lower-resolution) branch even for widely spread arms.
-SINGLE_CROP_MARGIN_MULTIPLIER = 0.7
+SINGLE_CROP_MARGIN_MULTIPLIER = 0.9
 MIN_VISIBILITY_FOR_CROP = 0.18
 # If the wrists are farther apart than this (relative to shoulder width),
 # use two separate high-resolution crops instead of one wide combined

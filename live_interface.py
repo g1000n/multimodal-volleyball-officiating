@@ -42,7 +42,15 @@ from extract_keypoints import (
     extract_hand_features,
     compute_elbow_angles,
 )
-from train import normalize_sequence, resample_sequence, SEQUENCE_LENGTH
+from train import (
+    normalize_sequence,
+    resample_sequence,
+    SEQUENCE_LENGTH,
+    TOTAL_FEATURES,          # NEW
+    ablate,                  # NEW
+    ABLATE_HAND_COORDS,      # NEW
+    ABLATED_FEATURE_COUNT,   # NEW
+)
 from model import GestureCNNLSTM
 
 MODEL_PATH = "models/final_model.pt"
@@ -62,7 +70,7 @@ def load_model():
     idx_to_label = {v: k for k, v in label_to_idx.items()}
 
     num_classes = len(label_to_idx)
-    input_size = 122  # must match TOTAL_FEATURES in train.py
+    input_size = ABLATED_FEATURE_COUNT if ABLATE_HAND_COORDS else TOTAL_FEATURES  # CHANGED — was hardcoded 122
 
     model = GestureCNNLSTM(input_size=input_size, num_classes=num_classes)
     model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
@@ -73,6 +81,7 @@ def load_model():
 def predict_clip(frame_sequence, model, idx_to_label):
     raw = np.array(frame_sequence)
     normalized = normalize_sequence(raw)
+    normalized = ablate(normalized)   # NEW LINE — must match what the model was trained on
     resampled = resample_sequence(normalized, SEQUENCE_LENGTH)
     x = torch.tensor(resampled, dtype=torch.float32).unsqueeze(0)
 

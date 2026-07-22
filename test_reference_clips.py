@@ -29,7 +29,15 @@ from multiprocessing import Pool, cpu_count
 
 from model import GestureCNNLSTM
 from extract_keypoints import mp_pose, mp_hands, extract_keypoints_from_video
-from train import normalize_sequence, resample_sequence, SEQUENCE_LENGTH, TOTAL_FEATURES
+from train import (
+    normalize_sequence,
+    resample_sequence,
+    SEQUENCE_LENGTH,
+    TOTAL_FEATURES,
+    ablate,                  # NEW
+    ABLATE_HAND_COORDS,      # NEW
+    ABLATED_FEATURE_COUNT,   # NEW
+)
 
 REFERENCE_DIR = "data/reference_clips"
 MODEL_PATH = "models/final_model.pt"
@@ -84,8 +92,14 @@ def _init_worker():
     _worker_idx_to_label = {v: k for k, v in label_to_idx.items()}
 
     _worker_device = torch.device("cpu")  # CPU is safest across multiple processes
+
+    # CHANGED: input_size must match whatever train.py actually trained
+    # with. If ABLATE_HAND_COORDS was True during training, the saved
+    # checkpoint expects 38 features, not 122 -- loading it with the
+    # wrong size will error out or silently produce garbage.
+    input_size = ABLATED_FEATURE_COUNT if ABLATE_HAND_COORDS else TOTAL_FEATURES
     _worker_gesture_model = GestureCNNLSTM(
-        input_size=TOTAL_FEATURES, num_classes=len(label_to_idx)
+        input_size=input_size, num_classes=len(label_to_idx)
     ).to(_worker_device)
     _worker_gesture_model.load_state_dict(torch.load(MODEL_PATH, map_location=_worker_device))
     _worker_gesture_model.eval()
@@ -103,6 +117,7 @@ def _process_one_reference_clip(task):
                 "confidence": 0.0, "correct": False, "skipped": True}
 
     normalized = normalize_sequence(keypoints)
+    normalized = ablate(normalized)   # NEW LINE — must match what the model was trained on
     resampled = resample_sequence(normalized, SEQUENCE_LENGTH)
     x = torch.tensor(resampled, dtype=torch.float32).unsqueeze(0).to(_worker_device)
 
@@ -153,6 +168,9 @@ def main():
 
     num_workers = min(len(tasks), max(1, cpu_count() - 1))
     print(f"Testing {len(tasks)} reference clips using {num_workers} worker process(es)...\n")
+    if ABLATE_HAND_COORDS:
+        print(f"NOTE: ABLATE_HAND_COORDS is True -- evaluating the hand-coordinate-ablated model "
+              f"({ABLATED_FEATURE_COUNT} features).\n")
 
     results = []
     with Pool(processes=num_workers, initializer=_init_worker) as pool:
