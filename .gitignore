@@ -1,22 +1,28 @@
-# Raw data (download separately -- see README)
-raw_data/volleylitics/*.wav
-raw_data/volleylitics/*.json
-raw_data/iphone_recordings/*
-
-# Keep the folder structure but ignore contents
-!raw_data/volleylitics/.gitkeep
-!raw_data/iphone_recordings/.gitkeep
-
-# Generated/processed data (reproducible by re-running scripts)
-processed/
-models/*.pkl
-
-# Python
+# Python Virtual Environments & Cache
 whistle_env/
+.venv/
 __pycache__/
 *.pyc
-.venv/
 
-# OS
+# OS Files
 .DS_Store
 Thumbs.db
+
+# Large Audio Files & Datasets (Exceeds GitHub Limits)
+raw_data/volleylitics/*.wav
+raw_data/iphone_recordings/**/*.wav
+raw_data/iphone_recordings/**/*.m4a
+raw_data/iphone_recordings/**/*.mp3
+
+# Processed Feature Files & Large Data Dumps
+processed/
+
+# Model Files & Binary Weights
+models/*.pkl
+
+# Preserve folder structure on GitHub
+!raw_data/
+!raw_data/**/.gitkeep
+!raw_data/**/.gitattributes
+!processed/.gitkeep
+!models/.gitkeep
