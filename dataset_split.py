@@ -18,6 +18,24 @@ Handles real-world messiness automatically:
   possible. Falls back to a clip-level split for that class only, and
   prints a clear warning so you can mention this as a known limitation.
 
+--------------------------------------------------------------------
+FIX (this version): previously, ONE random.seed(SEED) call at the top
+seeded a single shared random stream, and every class's shuffle drew
+from that same stream sequentially. That meant adding/removing people
+from ONE class (e.g. adding new volunteers to ball_out) changed how
+many random numbers that class's shuffle consumed -- which silently
+shifted the random state for every class processed AFTER it in the
+loop, even though their data never changed. In practice this could
+reassign which person gets held out for test/val in completely
+unrelated, untouched classes, causing accuracy swings that look like a
+regression in a class you didn't even touch.
+
+Fixed by giving each class its OWN independent random.Random() instance,
+seeded deterministically from (SEED, gesture_label). Adding data to one
+class can now only ever affect that class's own held-out assignment --
+never any other class's.
+--------------------------------------------------------------------
+
 Safe to re-run any time you add more clips — it recalculates from
 scratch based on whatever is currently in the manifest.
 """
@@ -44,7 +62,8 @@ def save_manifest(rows, fieldnames):
 
 
 def assign_splits(rows):
-    random.seed(SEED)
+    # REMOVED: random.seed(SEED) -- no longer used. Each class now gets
+    # its own independent RNG below instead of sharing one global stream.
 
     # Group rows by gesture class -> person -> list of row indices
     class_to_people = defaultdict(lambda: defaultdict(list))
@@ -55,9 +74,16 @@ def assign_splits(rows):
         row["split"] = ""  # will fill in below
 
     print("=" * 60)
-    for gesture_label, people in class_to_people.items():
+    # sorted() so class processing order is always the same regardless
+    # of manifest row order or dict iteration order
+    for gesture_label, people in sorted(class_to_people.items()):
+        # FIX: independent RNG per class, seeded from the class name
+        # itself. This is the actual isolation -- no class's shuffle can
+        # ever consume random draws that affect another class's outcome.
+        class_rng = random.Random(f"{SEED}-{gesture_label}")
+
         person_ids = list(people.keys())
-        random.shuffle(person_ids)
+        class_rng.shuffle(person_ids)
         num_people = len(person_ids)
 
         print(f"\nClass: {gesture_label}  ({num_people} contributing people)")
@@ -91,7 +117,7 @@ def assign_splits(rows):
             train_indices = []
             for p in train_people:
                 train_indices.extend(people[p])
-            random.shuffle(train_indices)
+            class_rng.shuffle(train_indices)  # FIX: was random.shuffle(...)
             num_val = max(1, int(len(train_indices) * VAL_FRACTION_OF_TRAIN_CLIPS))
             val_indices = train_indices[:num_val]
             train_only_indices = train_indices[num_val:]
@@ -109,7 +135,7 @@ def assign_splits(rows):
             # Only 1 person for this class — true subject holdout impossible.
             only_person = person_ids[0]
             indices = people[only_person][:]
-            random.shuffle(indices)
+            class_rng.shuffle(indices)  # FIX: was random.shuffle(...)
 
             n = len(indices)
             n_test = max(1, int(n * 0.15))

@@ -26,6 +26,23 @@ CONTROLS (while a clip is playing):
 
 Run from your project root:
     python clip_reviewer.py
+
+--------------------------------------------------------------------
+PATCH (this version): fixes a hang / "Not Responding" freeze.
+Previously, if a clip's cap.isOpened() succeeded but cap.read() then
+NEVER produced a real frame (a handful of malformed/truncated files
+can do this — OpenCV can "open" them but never decode a frame from
+them), the loop would seek back to frame 0 and retry forever without
+ever reaching cv2.imshow()/cv2.waitKey(). That means the window never
+repaints and never processes key presses, which Windows reports as
+"Not Responding" — looks exactly like a crash even though it's really
+just spinning in place.
+
+Fix: track consecutive_read_failures. After MAX_READ_FAILURES failed
+reads in a row, the clip is auto-marked "unreadable", its filename is
+printed to the console, and the reviewer moves on to the next clip
+instead of hanging forever.
+--------------------------------------------------------------------
 """
 
 import os
@@ -41,6 +58,7 @@ MANIFEST_PATH = "data/dataset_manifest.csv"
 PROGRESS_PATH = "data/clip_review_progress.json"
 DISPLAY_HEIGHT = 480  # each side panel resized to this height for consistent display
 WINDOW_NAME = "Clip Reviewer"
+MAX_READ_FAILURES = 30  # consecutive failed cap.read() calls before we give up on a clip
 
 mp_pose = mp.solutions.pose
 mp_hands = mp.solutions.hands
@@ -257,7 +275,9 @@ def main():
 
         cap = cv2.VideoCapture(clip_path)
         if not cap.isOpened():
-            print(f"Could not open {clip_path}, skipping.")
+            print(f"Could not open {clip_path} — auto-flagged for removal, skipping.")
+            progress["reviewed"][clip_path] = "flagged"
+            save_progress(progress)
             index += 1
             continue
 
@@ -266,13 +286,30 @@ def main():
 
         paused = False
         advance_action = None  # set to "next", "prev", "flag", "keep", "skip" to break the playback loop
+        consecutive_read_failures = 0  # PATCH: counts failed cap.read() calls in a row
 
         while advance_action is None:
             if not paused:
                 success, frame = cap.read()
                 if not success:
+                    # PATCH: previously this just seeked back to frame 0 and
+                    # retried forever if a clip could never produce a real
+                    # frame — that infinite loop never reaches imshow() or
+                    # waitKey(), which is what makes the window look frozen
+                    # ("Not Responding") even though nothing crashed.
+                    consecutive_read_failures += 1
+                    if consecutive_read_failures >= MAX_READ_FAILURES:
+                        # Auto-flagged (not just marked "unreadable") so it flows
+                        # straight into apply_flagged_removals.py along with your
+                        # manual D-flags — no separate cleanup step needed.
+                        print(f"  WARNING: {clip_path} produced no readable frames "
+                              f"after {MAX_READ_FAILURES} attempts — auto-flagged for removal.")
+                        progress["reviewed"][clip_path] = "flagged"
+                        advance_action = "next"
+                        break
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop back to start
                     continue
+                consecutive_read_failures = 0  # reset once a real frame comes through
 
                 skeleton_frame = draw_skeleton_frame(frame, pose_model, hands_model)
 
@@ -325,6 +362,7 @@ def main():
                 advance_action = "prev"
             elif key == ord('r'):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                consecutive_read_failures = 0  # PATCH: manual restart also resets the failure counter
             elif key == ord('q'):
                 advance_action = "quit"
 
@@ -351,7 +389,8 @@ def main():
     if index >= len(rows):
         flagged_count = sum(1 for v in progress["reviewed"].values() if v == "flagged")
         kept_count = sum(1 for v in progress["reviewed"].values() if v == "kept")
-        print(f"\nAll clips reviewed. {kept_count} kept, {flagged_count} flagged for removal.")
+        print(f"\nAll clips reviewed. {kept_count} kept, {flagged_count} flagged for removal "
+              f"(includes any auto-flagged unreadable clips).")
         print("Run apply_flagged_removals.py to move flagged clips out of the dataset.")
 
 

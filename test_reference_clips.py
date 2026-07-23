@@ -17,6 +17,27 @@ bytes" / "should be 'TFL3'" errors seen before).
 This is a DIAGNOSTIC tool only -- these clips are never added to
 data/raw_clips/, the manifest, or training.
 
+--------------------------------------------------------------------
+PATCH (this version): _init_worker()'s hands_model settings were stale
+-- they did NOT match extract_keypoints.py's actual worker settings
+used to build the training data (max_num_hands=2,
+min_detection_confidence=0.1, min_tracking_confidence=0.28). This file
+was still using max_num_hands=1, 0.4/0.4, which is the same class of
+bug Anya found and fixed in live_auto_inference.py -- just never
+applied here too.
+
+This matters even with ABLATE_HAND_COORDS=True: ablation only drops
+the raw 84 hand x/y coordinates, but the model still trains on
+hand-detected flags (2 features) and finger-extension (10 features),
+both of which come from this hands_model. Evaluating reference clips
+with a stricter, single-hand detector than what training data was
+extracted with is a real train/eval mismatch, separate from any
+labeling issue -- it can independently hurt reference-clip accuracy
+and confidence readings.
+
+Fixed to match extract_keypoints.py's worker exactly.
+--------------------------------------------------------------------
+
 Usage:
     python test_reference_clips.py
 """
@@ -53,7 +74,10 @@ def warm_up_mediapipe():
     """
     print("Warming up MediaPipe models (one-time, sequential)...")
     pose = mp_pose.Pose(static_image_mode=False, model_complexity=0)
-    hands = mp_hands.Hands(static_image_mode=True, max_num_hands=1)
+    # PATCH: max_num_hands=2 to match extract_keypoints.py's worker --
+    # this warm-up just needs to trigger the model download, but keeping
+    # it consistent avoids any confusion when reading this file later.
+    hands = mp_hands.Hands(static_image_mode=True, max_num_hands=2)
     pose.close()
     hands.close()
     print("Warm-up complete.\n")
@@ -80,11 +104,17 @@ def _init_worker():
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
+    # PATCH: these three values were previously max_num_hands=1,
+    # min_detection_confidence=0.4, min_tracking_confidence=0.4 -- stale
+    # and inconsistent with extract_keypoints.py's actual training-time
+    # worker settings. Now matches exactly, so hand-detected flags and
+    # finger-extension features are computed under the same conditions
+    # the model was trained on.
     _worker_hands_model = mp_hands.Hands(
         static_image_mode=True,
-        max_num_hands=1,
-        min_detection_confidence=0.4,
-        min_tracking_confidence=0.4,
+        max_num_hands=2,
+        min_detection_confidence=0.1,
+        min_tracking_confidence=0.28,
     )
 
     with open(LABEL_MAP_PATH, "r") as f:
