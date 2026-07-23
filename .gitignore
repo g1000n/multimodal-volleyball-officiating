@@ -1,28 +1,24 @@
-# Python Virtual Environments & Cache
-whistle_env/
-.venv/
-__pycache__/
-*.pyc
+# Raw data audio files (ignored in all subdirectories)
+raw_data/**/*.wav
 
-# OS Files
-.DS_Store
-Thumbs.db
-
-# Large Audio Files & Datasets (Exceeds GitHub Limits)
-raw_data/volleylitics/*.wav
-raw_data/iphone_recordings/**/*.wav
-raw_data/iphone_recordings/**/*.m4a
-raw_data/iphone_recordings/**/*.mp3
-
-# Processed Feature Files & Large Data Dumps
+# Processed feature files & outputs
 processed/
 
-# Model Files & Binary Weights
+# Model binary weights
 models/*.pkl
 
-# Preserve folder structure on GitHub
-!raw_data/
+# Keep directory structure tracked on Git
 !raw_data/**/.gitkeep
 !raw_data/**/.gitattributes
 !processed/.gitkeep
 !models/.gitkeep
+
+# Python
+whistle_env/
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
