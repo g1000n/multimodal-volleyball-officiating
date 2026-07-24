@@ -76,6 +76,23 @@ class DecisionEngine:
         self.set_over = False
         self.last_settle_start_time = None  # NEW: when the current settle window began
 
+    def manual_override_score(self, side, delta):
+        """
+        Lets a human operator correct the score directly if the
+        automated system gets something wrong live -- a necessary
+        safety net for any real deployed officiating aid, not just a
+        demo. Re-checks the win condition after the edit so a manual
+        correction can also end (or un-end) the set correctly.
+        """
+        self.score[side] = max(0, self.score[side] + delta)
+        self.set_over = self._check_set_over()
+        return dict(self.score)
+
+    def manual_clear_reason(self):
+        """Lets a human operator clear an incorrectly-attached fault
+        reason for the current point, so a new one can be attached."""
+        self.last_reason = None
+
     def on_whistle_detected(self, timestamp=None):
         # Whistles are never blocked by the settle window -- they're
         # the deliberate start of the next cycle, not tail-end noise.

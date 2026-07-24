@@ -73,7 +73,12 @@ from train import (
 )
 from model import GestureCNNLSTM
 from decision_engine import DecisionEngine, SCORING_GESTURES, FAULT_REASON_GESTURES
-from scoreboard_gui import ScoreboardGUI
+# NOTE: ScoreboardGUI (separate Tkinter window) REMOVED -- having two
+# separate windows meant keyboard focus could be on either one, and
+# cv2.waitKey() only sees keys typed while ITS window has focus. This
+# was very likely why W (and earlier, Q) intermittently failed to
+# register. Score is now drawn directly on the same camera window via
+# draw_score_bar() below -- one window, no more focus-switching.
 
 MODEL_PATH = "models/final_model.pt"
 LABEL_MAP_PATH = "models/label_map.json"
@@ -91,6 +96,27 @@ COMMIT_COOLDOWN_SECONDS = 1.0
 # simulated set finishes in a reasonable test session.
 TEST_WIN_SCORE = 7
 TEST_WIN_BY_MARGIN = 2
+
+# NEW: set True to test gesture detection + scoring/sequencing WITHOUT
+# needing to press W first each time -- the engine is fed a continuous
+# "fresh" whistle every frame, so the "no recent whistle" gate never
+# blocks a scoring gesture. Whistle-gating itself still fully exists in
+# decision_engine.py and is unaffected -- this is purely a testing
+# convenience in THIS script, not a change to the engine's real logic.
+# Set back to False once you want to test the whistle-gated flow again.
+DISABLE_WHISTLE_REQUIREMENT = True
+
+# Pretty display names for the sequence bar, mirroring MaxLSB's
+# action_fullname() -- e.g. "Point Right -> Out of Bounds -> Substitution"
+DISPLAY_NAME = {
+    "team_to_serve_left": "Team to Serve Left",
+    "team_to_serve_right": "Team to Serve Right",
+    "ball_out": "Ball Out",
+    "double_contact": "Double Contact",
+    "end_of_set": "End of Set",
+    "service_authorization_left": "Service Auth. Left",
+    "service_authorization_right": "Service Auth. Right",
+}
 
 mp_pose = mp.solutions.pose
 mp_hands = mp.solutions.hands
@@ -185,6 +211,23 @@ def draw_instruction_banner(frame, expected_step, frame_width):
     cv2.putText(frame, text, (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
 
 
+def draw_vote_progress(frame, recent_predictions, frame_width, origin_y=155):
+    """
+    Shows the CURRENT vote tally, so it's visible that a green
+    probability bar is only a single window's raw guess -- not a
+    commit. A commit only happens once a class wins
+    VOTES_NEEDED_TO_COMMIT out of the last VOTE_WINDOW_SIZE windows.
+    """
+    if not recent_predictions:
+        return
+    counts = Counter(recent_predictions)
+    top_label, top_count = counts.most_common(1)[0]
+    pretty = DISPLAY_NAME.get(top_label, top_label)
+    text = f"building vote: {pretty} ({top_count}/{VOTE_WINDOW_SIZE}, needs {VOTES_NEEDED_TO_COMMIT})"
+    color = (0, 255, 0) if top_count >= VOTES_NEEDED_TO_COMMIT else (0, 200, 255)
+    cv2.putText(frame, text, (15, origin_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+
 def draw_score_bar(frame, engine, frame_width, frame_height):
     score_text = f"LEFT {engine.score['left']}  -  {engine.score['right']} RIGHT   (first to {engine.win_score}, win by {engine.win_by_margin})"
     cv2.rectangle(frame, (0, 65), (frame_width, 100), (20, 20, 20), -1)
@@ -207,19 +250,19 @@ def draw_probability_bars(frame, probs, real_labels, origin_y=190):
 
 
 def draw_gesture_history_bar(frame, history, frame_width, frame_height):
-    text = "  ->  ".join(history) if history else "(no gestures committed yet)"
+    pretty_history = [DISPLAY_NAME.get(label, label) for label in history]
+    text = "  ->  ".join(pretty_history) if pretty_history else "(no gestures committed yet)"
     rect_y1, rect_y2 = frame_height - 60, frame_height - 15
     cv2.rectangle(frame, (0, rect_y1), (frame_width, rect_y2), (40, 40, 40), -1)
-    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
     text_x = max(10, (frame_width - text_size[0]) // 2)
     cv2.putText(frame, text, (text_x, frame_height - 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
 
 def main():
     model, idx_to_real_label, real_labels = load_model()
     engine = DecisionEngine(win_score=TEST_WIN_SCORE, win_by_margin=TEST_WIN_BY_MARGIN)
-    gui = ScoreboardGUI()
 
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, f"simgame_{int(time.time())}.csv")
@@ -259,7 +302,7 @@ def main():
     last_decision_time = 0
     whistle_flash_until = 0
 
-    expected_step = "whistle"
+    expected_step = "scoring_gesture" if DISABLE_WHISTLE_REQUIREMENT else "whistle"
 
     print("Guided simulated match running. Follow the on-screen instruction. Press Q/ESC to quit.\n")
 
@@ -276,6 +319,13 @@ def main():
 
         rolling_window.append(features)
         frame_counter += 1
+
+        # NEW: keep the engine's whistle "fresh" every frame when the
+        # requirement is disabled, so the "no recent whistle" gate in
+        # decision_engine.py never blocks a scoring gesture during
+        # this test mode.
+        if DISABLE_WHISTLE_REQUIREMENT:
+            engine.on_whistle_detected(time.time())
 
         if len(rolling_window) == ROLLING_WINDOW_FRAMES and frame_counter % INFERENCE_EVERY_N_FRAMES == 0:
             current_label, current_conf, full_probs = classify_window(list(rolling_window), model, idx_to_real_label)
@@ -313,14 +363,8 @@ def main():
 
                             if result["event"] == "point_awarded":
                                 expected_step = "reason_gesture"
-                                gui.update_display(
-                                    left_score=engine.score["left"],
-                                    right_score=engine.score["right"],
-                                    gesture_text=top_label,
-                                )
                             elif result["event"] == "reason_attached":
-                                expected_step = "whistle"
-                                gui.update_display(gesture_text=f"{top_label} ({result['side']})")
+                                expected_step = "scoring_gesture" if DISABLE_WHISTLE_REQUIREMENT else "whistle"
 
                         last_decision_time = commit_now
                         last_committed_label = top_label
@@ -334,8 +378,6 @@ def main():
                                     engine.score["left"], engine.score["right"]])
             log_file.flush()
 
-        gui.tick()
-
         if engine.set_over:
             winner = "LEFT" if engine.score["left"] > engine.score["right"] else "RIGHT"
             cv2.rectangle(frame, (0, 0), (frame_width, 100), (0, 100, 0), -1)
@@ -344,6 +386,7 @@ def main():
         else:
             draw_instruction_banner(frame, expected_step, frame_width)
             draw_score_bar(frame, engine, frame_width, frame_height)
+            draw_vote_progress(frame, recent_predictions, frame_width)
 
         if last_probs is not None:
             draw_probability_bars(frame, last_probs, real_labels)
@@ -353,12 +396,19 @@ def main():
             cv2.putText(frame, f"decision_engine: {last_decision_text}", (10, frame_height - 75),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, last_decision_color, 2, cv2.LINE_AA)
 
+        # MUCH more obvious whistle acknowledgment than before -- big,
+        # centered, longer duration, since "the W doesn't work" turned
+        # out to partly be that the old feedback was too subtle to
+        # notice even when the press DID register.
         if time.time() < whistle_flash_until:
-            cv2.putText(frame, "WHISTLE (manual)", (frame_width - 220, 130),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+            whistle_text = "WHISTLE!"
+            text_size = cv2.getTextSize(whistle_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 4)[0]
+            text_x = (frame_width - text_size[0]) // 2
+            cv2.putText(frame, whistle_text, (text_x, 260),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 165, 255), 4, cv2.LINE_AA)
 
-        cv2.putText(frame, "(click this window, then Q/ESC to quit)", (frame_width - 340, frame_height - 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+        cv2.putText(frame, "(click this window, then Q/ESC=quit  W=whistle  [/]=left score  -/+=right score  R=clear reason)",
+                    (10, frame_height - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 150), 1)
 
         cv2.imshow("Simulated Match", frame)
         key = cv2.waitKey(1) & 0xFF
@@ -368,13 +418,30 @@ def main():
             show_skeleton = not show_skeleton
         elif key == ord('w'):
             engine.on_whistle_detected(time.time())
-            whistle_flash_until = time.time() + 1.0
+            whistle_flash_until = time.time() + 1.5
+            print(f"  -> WHISTLE registered at {time.time():.3f}")  # console confirmation too, in case the on-screen flash is missed
             if expected_step == "whistle":
                 expected_step = "scoring_gesture"
+        # --- MANUAL SCORE OVERRIDE -- human-operator safety net for
+        # correcting a mistake live, without needing to fully restart ---
+        elif key == ord('['):
+            engine.manual_override_score("left", -1)
+            print(f"  -> MANUAL: left score -1 -> {engine.score}")
+        elif key == ord(']'):
+            engine.manual_override_score("left", +1)
+            print(f"  -> MANUAL: left score +1 -> {engine.score}")
+        elif key == ord('-'):
+            engine.manual_override_score("right", -1)
+            print(f"  -> MANUAL: right score -1 -> {engine.score}")
+        elif key == ord('+') or key == ord('='):
+            engine.manual_override_score("right", +1)
+            print(f"  -> MANUAL: right score +1 -> {engine.score}")
+        elif key == ord('r'):
+            engine.manual_clear_reason()
+            print("  -> MANUAL: cleared last reason for the current point")
 
     cap.release()
     cv2.destroyAllWindows()
-    gui.close()
     pose_model.close()
     hands_model.close()
     log_file.close()
