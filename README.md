@@ -35,8 +35,19 @@ Every new terminal session needs `whistle_env\Scripts\activate` run again first.
 python -m pip install -U huggingface_hub
 hf download GYdevy/volleyball-whistles --repo-type dataset --local-dir raw_data/volleylitics
 ```
+If `hf` isn't recognized as a command, try one of these instead:
+```powershell
+huggingface-cli download GYdevy/volleyball-whistles --repo-type dataset --local-dir raw_data/volleylitics
+```
+or, as a fallback that should always work:
+```powershell
+python -m huggingface_hub download GYdevy/volleyball-whistles --repo-type dataset --local-dir raw_data/volleylitics
+```
 
-**iPhone recordings (co-primary source):** organize recordings into these exact subfolders:
+**iPhone recordings (co-primary source, private -- not on Hugging Face):**
+1. Download from this shared Drive folder:
+   https://drive.google.com/drive/folders/1QsFHW6hpkjNp6-fj4D7KCkzXxZdK81Wn?usp=sharing
+2. Place the folders into these exact paths:
 
 raw_data/iphone_recordings/
 ├── positive_audio/ <- clean whistle-only session(s), .m4a or .wav
