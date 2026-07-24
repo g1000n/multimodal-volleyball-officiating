@@ -1,6 +1,11 @@
 """
 extract_keypoints.py (v6 — Pose + COMBINED-CROP two-hand detection + finger extension)
 [OPTIMIZED: multiprocessing + auto warm-up fix + timer + alarm]
+[INCREMENTAL: process_manifest() now skips already-extracted clips, only
+ processes new ones — e.g. after adding a new "nothing" class, this turns
+ a ~50-60 min full re-extraction into a ~1-2 min run for just the new clips.
+ See the FORCE_REPROCESS_ALL flag inside process_manifest() if you ever
+ need to force a full re-extraction after changing any extraction logic.]
 
 Feature layout: 122 features per frame (24 pose + 84 hand coords +
 2 hand-detected flags + 10 finger-extension + 2 elbow angles).
@@ -542,24 +547,66 @@ def _process_one_clip(row):
 
 
 def process_manifest():
+    """
+    NEW: incremental extraction. Skips any row that already has a
+    keypoint_path pointing to a .npy file that STILL EXISTS on disk --
+    only genuinely new rows (e.g. a newly added "nothing" class, or any
+    other freshly added clips) get processed. Turns a ~50-60 min full
+    re-extraction into a ~1-2 min run when you've only added a handful
+    of new clips, instead of reprocessing everything every time.
+
+    IMPORTANT CAVEAT: this only checks whether a .npy file EXISTS, not
+    whether it's still correct for the CURRENT extraction code. If you
+    ever change any extraction logic (crop margins, confidence
+    thresholds, anything in extract_hand_features/compute_elbow_angles/
+    etc.), this will NOT automatically re-extract your existing clips --
+    it'll just see they already have a .npy and skip them, silently
+    leaving them extracted with the OLD logic. When that happens, set
+    FORCE_REPROCESS_ALL = True below, run once to fully redo everything,
+    then set it back to False.
+    """
     start_time = time.time()
 
     with open(MANIFEST_PATH, "r") as f:
         rows = list(csv.DictReader(f))
 
+    FORCE_REPROCESS_ALL = False  # set True to force a full re-extraction of every clip
+
+    if FORCE_REPROCESS_ALL:
+        rows_to_process = rows
+        already_done_rows = []
+    else:
+        rows_to_process = []
+        already_done_rows = []
+        for row in rows:
+            existing_path = row.get("keypoint_path", "")
+            if existing_path and os.path.exists(existing_path):
+                already_done_rows.append(row)
+            else:
+                rows_to_process.append(row)
+
+    print(f"Manifest has {len(rows)} total clips. "
+          f"{len(already_done_rows)} already extracted (skipping), "
+          f"{len(rows_to_process)} to process now.")
+
+    if not rows_to_process:
+        print("Nothing new to extract. If you expected new clips here, "
+              "check that build_manifest.py picked up your new folder/clips.")
+        return
+
     # THE FIX: warm up sequentially BEFORE spinning up the parallel pool
     warm_up_mediapipe()
 
     num_workers = max(1, cpu_count() - 1)
-    print(f"Starting extraction on {len(rows)} clips using {num_workers} worker processes...")
+    print(f"Starting extraction on {len(rows_to_process)} NEW clips using {num_workers} worker processes...")
 
     updated_rows = []
     flagged_low_pose_detection = []
     hand_detection_by_class = defaultdict(list)
 
     with Pool(processes=num_workers, initializer=_init_worker) as pool:
-        for i, (row, diagnostic) in enumerate(pool.imap(_process_one_clip, rows, chunksize=4)):
-            print(f"[{i+1}/{len(rows)}] {row['clip_path']}")
+        for i, (row, diagnostic) in enumerate(pool.imap(_process_one_clip, rows_to_process, chunksize=4)):
+            print(f"[{i+1}/{len(rows_to_process)}] {row['clip_path']}")
 
             if diagnostic is None:
                 print(f"  SKIPPED (unreadable): {row['clip_path']}")
@@ -577,30 +624,36 @@ def process_manifest():
 
             updated_rows.append(row)
 
-    fieldnames = list(updated_rows[0].keys())
+    # Merge newly-processed rows back with the rows that were already
+    # done and skipped, so the manifest written back out still contains
+    # every clip, not just the ones processed in this run.
+    all_final_rows = already_done_rows + updated_rows
+
+    fieldnames = list(all_final_rows[0].keys())
     with open(MANIFEST_PATH, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(updated_rows)
+        writer.writerows(all_final_rows)
 
     elapsed = time.time() - start_time
     minutes, seconds = divmod(elapsed, 60)
     print(f"\nDone. Manifest updated: {MANIFEST_PATH}")
-    print(f"Total extraction time: {int(minutes)}m {seconds:.1f}s")
+    print(f"Total extraction time: {int(minutes)}m {seconds:.1f}s (for {len(rows_to_process)} new clips)")
 
     if flagged_low_pose_detection:
         print(f"\nWARNING: {len(flagged_low_pose_detection)} clips had low POSE detection rates (<70%):")
         for path, rate in flagged_low_pose_detection:
             print(f"  - {path}  (detected in {rate:.0%} of frames)")
 
-    print("\n" + "=" * 60)
-    print("HAND DETECTION RATE PER CLASS (diagnostic)")
-    print("=" * 60)
-    print(f"  {'class':<30} {'left hand':>12} {'right hand':>12}")
-    for gesture_label, rate_pairs in sorted(hand_detection_by_class.items()):
-        left_rates = [p[0] for p in rate_pairs]
-        right_rates = [p[1] for p in rate_pairs]
-        print(f"  {gesture_label:<30} {np.mean(left_rates):>11.1%} {np.mean(right_rates):>12.1%}")
+    if hand_detection_by_class:
+        print("\n" + "=" * 60)
+        print("HAND DETECTION RATE PER CLASS (diagnostic, NEW clips only this run)")
+        print("=" * 60)
+        print(f"  {'class':<30} {'left hand':>12} {'right hand':>12}")
+        for gesture_label, rate_pairs in sorted(hand_detection_by_class.items()):
+            left_rates = [p[0] for p in rate_pairs]
+            right_rates = [p[1] for p in rate_pairs]
+            print(f"  {gesture_label:<30} {np.mean(left_rates):>11.1%} {np.mean(right_rates):>12.1%}")
 
     try:
         for _ in range(3):

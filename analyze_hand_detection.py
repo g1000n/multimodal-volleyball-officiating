@@ -10,7 +10,7 @@ in seconds instead of re-processing every video.
 
 Run this any time you want to check hand-detection quality without
 re-doing the slow extraction step.
-"""
+""" 
 
 import csv
 import numpy as np
