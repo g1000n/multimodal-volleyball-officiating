@@ -1,42 +1,31 @@
 """
-test_reference_clips.py [OPTIMIZED - parallel version]
+test_reference_clips.py (MULTI-LABEL ARCHITECTURE VERSION) [parallel]
 
 Scans data/reference_clips/<gesture_name>/*.mp4 (or .mov) and runs each
-one through the ALREADY-TRAINED model, IN PARALLEL across CPU cores.
+one through the ALREADY-TRAINED multi-label model, IN PARALLEL across
+CPU cores.
+
+CHANGED FOR MULTI-LABEL ARCHITECTURE:
+  - label_map.json now has the format {"real_label_to_idx": {...},
+    "nothing_label": "nothing"} instead of a flat {label: idx} dict --
+    model output size is len(real_label_to_idx) (7), not 8.
+  - Uses sigmoid (independent per-class scores), not softmax. A class
+    must clear DECISION_THRESHOLD to be considered a confident
+    detection at all -- otherwise the predicted label is "nothing",
+    via decide_label() (same function train.py uses for its own
+    test-set evaluation).
+  - The double_contact/SAL/SAR tie-breaker is applied on top, exactly
+    as before, only when a real class was actually predicted.
 
 Prints a summary table: expected label, predicted label, confidence,
 and match, for every reference clip.
 
 SAFE ON FRESH DEVICES: does a one-time SEQUENTIAL warm-up (single
 process) to make sure MediaPipe's model file is fully downloaded and
-valid BEFORE spinning up parallel workers. This avoids the race
-condition where multiple workers try to download the same model file
-at once and corrupt it (the "Model provided must have at least 7
-bytes" / "should be 'TFL3'" errors seen before).
+valid BEFORE spinning up parallel workers.
 
 This is a DIAGNOSTIC tool only -- these clips are never added to
 data/raw_clips/, the manifest, or training.
-
---------------------------------------------------------------------
-PATCH (this version): _init_worker()'s hands_model settings were stale
--- they did NOT match extract_keypoints.py's actual worker settings
-used to build the training data (max_num_hands=2,
-min_detection_confidence=0.1, min_tracking_confidence=0.28). This file
-was still using max_num_hands=1, 0.4/0.4, which is the same class of
-bug Anya found and fixed in live_auto_inference.py -- just never
-applied here too.
-
-This matters even with ABLATE_HAND_COORDS=True: ablation only drops
-the raw 84 hand x/y coordinates, but the model still trains on
-hand-detected flags (2 features) and finger-extension (10 features),
-both of which come from this hands_model. Evaluating reference clips
-with a stricter, single-hand detector than what training data was
-extracted with is a real train/eval mismatch, separate from any
-labeling issue -- it can independently hurt reference-clip accuracy
-and confidence readings.
-
-Fixed to match extract_keypoints.py's worker exactly.
---------------------------------------------------------------------
 
 Usage:
     python test_reference_clips.py
@@ -55,9 +44,13 @@ from train import (
     resample_sequence,
     SEQUENCE_LENGTH,
     TOTAL_FEATURES,
-    ablate,                  # NEW
-    ABLATE_HAND_COORDS,      # NEW
-    ABLATED_FEATURE_COUNT,   # NEW
+    ablate,
+    ABLATE_HAND_COORDS,
+    ABLATED_FEATURE_COUNT,
+    DECISION_THRESHOLD,
+    NOTHING_LABEL,
+    decide_label,
+    apply_tie_breaker,
 )
 
 REFERENCE_DIR = "data/reference_clips"
@@ -67,16 +60,8 @@ VALID_EXTENSIONS = (".mp4", ".mov")
 
 
 def warm_up_mediapipe():
-    """
-    Runs ONE sequential Pose + Hands initialization before any parallel
-    workers start, to force a clean, single-process model download.
-    Prevents the multi-worker race condition that corrupts the model file.
-    """
     print("Warming up MediaPipe models (one-time, sequential)...")
     pose = mp_pose.Pose(static_image_mode=False, model_complexity=0)
-    # PATCH: max_num_hands=2 to match extract_keypoints.py's worker --
-    # this warm-up just needs to trigger the model download, but keeping
-    # it consistent avoids any confusion when reading this file later.
     hands = mp_hands.Hands(static_image_mode=True, max_num_hands=2)
     pose.close()
     hands.close()
@@ -90,13 +75,13 @@ def warm_up_mediapipe():
 _worker_pose_model = None
 _worker_hands_model = None
 _worker_gesture_model = None
-_worker_idx_to_label = None
+_worker_idx_to_real_label = None
 _worker_device = None
 
 
 def _init_worker():
     global _worker_pose_model, _worker_hands_model
-    global _worker_gesture_model, _worker_idx_to_label, _worker_device
+    global _worker_gesture_model, _worker_idx_to_real_label, _worker_device
 
     _worker_pose_model = mp_pose.Pose(
         static_image_mode=False,
@@ -104,12 +89,6 @@ def _init_worker():
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
-    # PATCH: these three values were previously max_num_hands=1,
-    # min_detection_confidence=0.4, min_tracking_confidence=0.4 -- stale
-    # and inconsistent with extract_keypoints.py's actual training-time
-    # worker settings. Now matches exactly, so hand-detected flags and
-    # finger-extension features are computed under the same conditions
-    # the model was trained on.
     _worker_hands_model = mp_hands.Hands(
         static_image_mode=True,
         max_num_hands=2,
@@ -117,19 +96,20 @@ def _init_worker():
         min_tracking_confidence=0.28,
     )
 
+    # CHANGED: new label_map.json format from the multi-label train.py
     with open(LABEL_MAP_PATH, "r") as f:
-        label_to_idx = json.load(f)
-    _worker_idx_to_label = {v: k for k, v in label_to_idx.items()}
+        label_map_data = json.load(f)
+    real_label_to_idx = label_map_data["real_label_to_idx"]
+    _worker_idx_to_real_label = {int(v): k for k, v in real_label_to_idx.items()}
 
-    _worker_device = torch.device("cpu")  # CPU is safest across multiple processes
+    _worker_device = torch.device("cpu")
 
-    # CHANGED: input_size must match whatever train.py actually trained
-    # with. If ABLATE_HAND_COORDS was True during training, the saved
-    # checkpoint expects 38 features, not 122 -- loading it with the
-    # wrong size will error out or silently produce garbage.
+    # CHANGED: input_size still depends on ABLATE_HAND_COORDS, but
+    # num_classes is now len(real_label_to_idx) -- 7, not 8. "nothing"
+    # is not one of the model's output neurons.
     input_size = ABLATED_FEATURE_COUNT if ABLATE_HAND_COORDS else TOTAL_FEATURES
     _worker_gesture_model = GestureCNNLSTM(
-        input_size=input_size, num_classes=len(label_to_idx)
+        input_size=input_size, num_classes=len(real_label_to_idx)
     ).to(_worker_device)
     _worker_gesture_model.load_state_dict(torch.load(MODEL_PATH, map_location=_worker_device))
     _worker_gesture_model.eval()
@@ -147,17 +127,21 @@ def _process_one_reference_clip(task):
                 "confidence": 0.0, "correct": False, "skipped": True}
 
     normalized = normalize_sequence(keypoints)
-    normalized = ablate(normalized)   # NEW LINE — must match what the model was trained on
+    normalized = ablate(normalized)
     resampled = resample_sequence(normalized, SEQUENCE_LENGTH)
     x = torch.tensor(resampled, dtype=torch.float32).unsqueeze(0).to(_worker_device)
 
     with torch.no_grad():
         logits = _worker_gesture_model(x)
-        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+        probs = torch.sigmoid(logits).cpu().numpy()[0]  # CHANGED: sigmoid, not softmax
 
-    top_idx = int(np.argmax(probs))
-    predicted_label = _worker_idx_to_label[top_idx]
-    confidence = float(probs[top_idx])
+    predicted_label, top1_label, top2_label, top1_prob, top2_prob = decide_label(probs, _worker_idx_to_real_label)
+
+    if predicted_label != NOTHING_LABEL:
+        raw_resampled_for_tiebreak = resample_sequence(keypoints, SEQUENCE_LENGTH)
+        predicted_label = apply_tie_breaker(raw_resampled_for_tiebreak, top1_label, top2_label, top1_prob, top2_prob)
+
+    confidence = float(top1_prob)
 
     return {
         "file": filename,
@@ -180,7 +164,6 @@ def main():
 
     warm_up_mediapipe()
 
-    # Build the full list of (video_path, expected_label, filename) tasks
     tasks = []
     for expected_label in sorted(os.listdir(REFERENCE_DIR)):
         folder_path = os.path.join(REFERENCE_DIR, expected_label)
@@ -198,6 +181,9 @@ def main():
 
     num_workers = min(len(tasks), max(1, cpu_count() - 1))
     print(f"Testing {len(tasks)} reference clips using {num_workers} worker process(es)...\n")
+    print(f"NOTE: multi-label architecture -- a class's sigmoid score must clear "
+          f"DECISION_THRESHOLD ({DECISION_THRESHOLD}) to count as a confident detection; "
+          f"otherwise predicted label is '{NOTHING_LABEL}'.\n")
     if ABLATE_HAND_COORDS:
         print(f"NOTE: ABLATE_HAND_COORDS is True -- evaluating the hand-coordinate-ablated model "
               f"({ABLATED_FEATURE_COUNT} features).\n")

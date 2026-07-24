@@ -1,12 +1,33 @@
 """
-train.py
+train.py (MULTI-LABEL ARCHITECTURE — matches MaxLSB/volley-judge's approach)
 
 Loads keypoint sequences according to the manifest's train/val/test
 split (produced by dataset_split.py), normalizes and resamples them
 to a fixed length, trains the CNN-LSTM model, and evaluates on the
 held-out test set.
 
-Run order (full pipeline):
+--------------------------------------------------------------------
+ARCHITECTURE CHANGE (this version): switched from single-label
+CrossEntropyLoss/softmax (8-way mutually-exclusive classification,
+"nothing" as its own competing output neuron) to multi-label
+BCEWithLogitsLoss/sigmoid (7-way INDEPENDENT per-class detection,
+"nothing" represented as an all-zero label vector -- not a neuron at
+all). This directly mirrors MaxLSB/volley-judge's design.
+
+WHY: under softmax, every class (including "nothing") competes for a
+shared probability budget that sums to 1 -- so even during genuine
+ambiguity (idle standing, mid-gesture transitions), the model is
+FORCED to push relative confidence toward SOME class, and an
+underrepresented "nothing" class's inflated weight could win that
+competition and steal confidence from real gestures. Under
+independent sigmoid outputs, each of the 7 REAL gesture classes gets
+its own yes/no confidence, with no shared budget -- so during genuine
+non-gesture content, ALL 7 outputs can genuinely be low simultaneously,
+and "nothing" naturally falls out as "no class was confident enough,"
+rather than needing to be predicted by a dedicated neuron competing
+against everything else.
+
+Run order (full pipeline, UNCHANGED):
     1. build_manifest.py
     2. extract_keypoints.py
     3. dataset_split.py
@@ -18,6 +39,7 @@ import json
 import numpy as np
 import torch
 import torch.nn as nn
+import random
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 
@@ -33,43 +55,51 @@ ELBOW_ANGLE_FEATURES = 2   # left_elbow_angle, right_elbow_angle
 TOTAL_FEATURES = POSE_FEATURES + HAND_COORD_FEATURES + HAND_FLAG_FEATURES + FINGER_FEATURES + ELBOW_ANGLE_FEATURES  # 122
 BATCH_SIZE = 16
 
-# --- NEW: hand-coordinate ablation experiment ---
-# Tests the hypothesis that the model over-relies on the 84 raw hand
-# x/y coordinates, which are reliable in training footage (85-100%
-# detection) but frequently missing/garbage on real external footage
-# (seen as low as 0-35% detection). If True, those 84 columns are
-# dropped before the model ever sees them, leaving only pose (24) +
-# hand-detected flags (2) + finger-extension (10) + elbow angles (2)
-# = 38 features. Nothing on disk changes -- this only affects what
-# gets fed into the model at train/eval time.
+# --- REPRODUCIBILITY FIX: train.py never seeded torch/numpy/random,
+# which caused meaningfully different results (accuracy, confusion
+# patterns) across retrains on IDENTICAL data. Seeding here makes
+# retrains on unchanged data reproducible. ---
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+
 ABLATE_HAND_COORDS = True
 ABLATED_FEATURE_COUNT = POSE_FEATURES + HAND_FLAG_FEATURES + FINGER_FEATURES + ELBOW_ANGLE_FEATURES  # 38
 
-# Column ranges for the tie-breaker logic (see below)
+# "nothing" is a real label in the manifest/data (used for filtering
+# training clips), but it is NOT one of the model's output neurons --
+# it's represented as an all-zero prediction across the 7 real classes.
+NOTHING_LABEL = "nothing"
+
+# Column ranges for the tie-breaker logic (unchanged from before)
 LEFT_FINGERS_START = POSE_FEATURES + HAND_COORD_FEATURES + HAND_FLAG_FEATURES        # 110
 RIGHT_FINGERS_START = LEFT_FINGERS_START + 5                                        # 115
-# Within each 5-value finger block: [thumb, index, middle, ring, pinky]
 INDEX_FINGER_OFFSET = 1
 MIDDLE_FINGER_OFFSET = 2
 RING_FINGER_OFFSET = 3
 PINKY_FINGER_OFFSET = 4
 
-# Classes involved in the known confusable pair — tie-breaker only activates
-# when the model's top-2 predictions fall inside this set and are close in
-# probability. Adjust if your dataset's confusable pair changes.
 CONFUSABLE_CLASSES = {"double_contact", "service_authorization_left", "service_authorization_right"}
-TIE_BREAKER_PROB_MARGIN = 0.20   # only override when top-2 probabilities are this close
-PEACE_SIGN_THRESHOLD = 0.5       # fraction of frames needed to count a finger as "extended" overall
+TIE_BREAKER_PROB_MARGIN = 0.20
+PEACE_SIGN_THRESHOLD = 0.5
+
+# DECISION_THRESHOLD: a class's sigmoid output must clear this to be
+# considered a confident detection at all. If NO class clears it,
+# the prediction is "nothing" -- this is the multi-label equivalent of
+# MaxLSB's backend.py: `if proba > threshold: predictions.append(...)`.
+DECISION_THRESHOLD = 0.5
+
 EPOCHS = 100
-PATIENCE = 10              # early stopping
+PATIENCE = 10
 LEARNING_RATE = 5e-4
-GRAD_CLIP_NORM = 1.0       # caps how large a single update step can be, prevents loss spikes
+GRAD_CLIP_NORM = 1.0
 MODEL_SAVE_PATH = "models/final_model.pt"
 LABEL_MAP_SAVE_PATH = "models/label_map.json"
 
 
 # ---------------------------------------------------------------------
-# Data loading and preprocessing
+# Data loading and preprocessing (UNCHANGED from before)
 # ---------------------------------------------------------------------
 
 def load_manifest_rows():
@@ -84,28 +114,15 @@ def load_manifest_rows():
 
 
 def normalize_sequence(seq):
-    """
-    seq shape: (frames, TOTAL_FEATURES) = (frames, 122)
-      [0:24]     pose:        8 landmarks x (x, y, visibility)
-      [24:66]    left hand:  21 landmarks x (x, y)
-      [66:108]   right hand: 21 landmarks x (x, y)
-      [108]      left_hand_detected   (0.0 or 1.0)
-      [109]      right_hand_detected  (0.0 or 1.0)
-      [110:115]  left hand finger extension  (0.0-1.0 each)
-      [115:120]  right hand finger extension (0.0-1.0 each)
-      [120:122]  elbow angles
-
-    Pose and hand COORDINATES are normalized relative to shoulder
-    midpoint/width. Detection flags and finger-extension values are
-    NOT normalized — they're already clean 0/1-ish signals, and
-    scaling them would distort that meaning.
-    """
+    """UNCHANGED. See original docstring -- pose/hand coordinates
+    normalized relative to shoulder midpoint/width; detection flags
+    and finger-extension values left untouched."""
     pose_part = seq[:, :POSE_FEATURES].reshape(seq.shape[0], 8, 3)
     left_hand_part = seq[:, POSE_FEATURES:POSE_FEATURES + 42].reshape(seq.shape[0], 21, 2)
     right_hand_part = seq[:, POSE_FEATURES + 42:POSE_FEATURES + 84].reshape(seq.shape[0], 21, 2)
-    hand_flags = seq[:, POSE_FEATURES + 84:POSE_FEATURES + 86]        # (frames, 2)
-    finger_features = seq[:, POSE_FEATURES + 86:POSE_FEATURES + 96]   # (frames, 10)
-    elbow_angles = seq[:, POSE_FEATURES + 96:]                        # (frames, 2) — already 0.0-1.0, no normalization needed
+    hand_flags = seq[:, POSE_FEATURES + 84:POSE_FEATURES + 86]
+    finger_features = seq[:, POSE_FEATURES + 86:POSE_FEATURES + 96]
+    elbow_angles = seq[:, POSE_FEATURES + 96:]
 
     left_shoulder = pose_part[:, 0, :2]
     right_shoulder = pose_part[:, 1, :2]
@@ -126,23 +143,17 @@ def normalize_sequence(seq):
         pose_normalized.reshape(seq.shape[0], -1),
         left_hand_norm.reshape(seq.shape[0], -1),
         right_hand_norm.reshape(seq.shape[0], -1),
-        hand_flags,        # untouched
-        finger_features,   # untouched
-        elbow_angles,      # untouched
+        hand_flags,
+        finger_features,
+        elbow_angles,
     ], axis=1)
 
     return normalized
 
 
 def ablate(normalized_seq):
-    """
-    NEW FUNCTION.
-    Drops the 84 raw hand-coordinate columns [24:108] from an already-
-    normalized sequence, keeping only pose (0:24) + flags/fingers/elbow
-    (108:122) -- 38 columns total. No-op if ABLATE_HAND_COORDS is False.
-    Only ever called on the NORMALIZED tensor that feeds the model --
-    never on the raw array used by the tie-breaker.
-    """
+    """UNCHANGED. Drops the 84 raw hand-coordinate columns if
+    ABLATE_HAND_COORDS is True."""
     if not ABLATE_HAND_COORDS:
         return normalized_seq
     keep_cols = list(range(0, POSE_FEATURES)) + list(range(POSE_FEATURES + HAND_COORD_FEATURES, TOTAL_FEATURES))
@@ -150,12 +161,11 @@ def ablate(normalized_seq):
 
 
 def resample_sequence(seq, target_len):
-    """Linearly interpolates a (frames, features) sequence to a fixed length."""
+    """UNCHANGED."""
     orig_len = seq.shape[0]
     if orig_len == target_len:
         return seq
     if orig_len < 2:
-        # Degenerate clip (basically no frames) — pad by repeating.
         return np.repeat(seq, target_len, axis=0)[:target_len]
 
     orig_idx = np.linspace(0, 1, orig_len)
@@ -168,28 +178,14 @@ def resample_sequence(seq, target_len):
 
 
 def augment_sequence(seq):
-    """
-    Applies small random perturbations to a normalized keypoint sequence
-    to make the model more tolerant of real-world variation: different
-    distances/scales, slightly different body proportions, gesture speed
-    differences, and minor camera-angle differences. Only applied to
-    TRAINING clips — never to val/test, which must stay unmodified to
-    give an honest accuracy reading.
-    """
+    """UNCHANGED."""
     seq = seq.copy()
-
-    # 1. Random spatial scaling (simulates different camera distances)
     scale_factor = np.random.uniform(0.9, 1.1)
     seq[:, :] *= scale_factor
 
-    # 2. Small random spatial jitter/noise (simulates body proportion
-    #    differences and minor detection noise)
     noise = np.random.normal(0, 0.01, seq.shape)
     seq = seq + noise
 
-    # 3. Random time-warping (simulates different gesture speeds/rhythms)
-    #    Stretches or compresses the sequence slightly before it gets
-    #    resampled back to SEQUENCE_LENGTH.
     warp_factor = np.random.uniform(0.85, 1.15)
     orig_len = seq.shape[0]
     warped_len = max(2, int(orig_len * warp_factor))
@@ -203,10 +199,17 @@ def augment_sequence(seq):
 
 
 class GestureDataset(Dataset):
-    def __init__(self, rows, label_to_idx, augment=False):
+    """
+    CHANGED: y is now a multi-hot FLOAT vector of length
+    len(real_labels) (7), not a single class index. A "nothing" clip
+    gets an all-zero vector; a real gesture clip gets a single 1 at
+    its own index -- everything else 0.
+    """
+    def __init__(self, rows, real_label_to_idx, augment=False):
         self.rows = rows
-        self.label_to_idx = label_to_idx
-        self.augment = augment  # only True for the training set
+        self.real_label_to_idx = real_label_to_idx
+        self.num_real_classes = len(real_label_to_idx)
+        self.augment = augment
 
     def __len__(self):
         return len(self.rows)
@@ -215,7 +218,7 @@ class GestureDataset(Dataset):
         row = self.rows[i]
         raw = np.load(row["keypoint_path"])
         normalized = normalize_sequence(raw)
-        normalized = ablate(normalized)   # NEW LINE — drops hand coords if ABLATE_HAND_COORDS is True
+        normalized = ablate(normalized)
 
         if self.augment:
             normalized = augment_sequence(normalized)
@@ -223,17 +226,18 @@ class GestureDataset(Dataset):
         resampled = resample_sequence(normalized, SEQUENCE_LENGTH)
 
         x = torch.tensor(resampled, dtype=torch.float32)
-        y = self.label_to_idx[row["gesture_label"]]
+
+        y = np.zeros(self.num_real_classes, dtype=np.float32)
+        gesture_label = row["gesture_label"]
+        if gesture_label != NOTHING_LABEL:
+            y[self.real_label_to_idx[gesture_label]] = 1.0
+        y = torch.tensor(y, dtype=torch.float32)
+
         return x, y
 
 
 def is_peace_sign(finger_block_avg):
-    """
-    finger_block_avg: length-5 array, [thumb, index, middle, ring, pinky],
-    each value is the AVERAGE extension (0.0-1.0) across all frames in the clip.
-    Returns True if this looks like a peace sign: index + middle extended,
-    ring + pinky curled (thumb is ambiguous/unreliable, not used as a deciding factor).
-    """
+    """UNCHANGED."""
     index_extended = finger_block_avg[INDEX_FINGER_OFFSET] > PEACE_SIGN_THRESHOLD
     middle_extended = finger_block_avg[MIDDLE_FINGER_OFFSET] > PEACE_SIGN_THRESHOLD
     ring_curled = finger_block_avg[RING_FINGER_OFFSET] <= PEACE_SIGN_THRESHOLD
@@ -241,29 +245,20 @@ def is_peace_sign(finger_block_avg):
     return index_extended and middle_extended and ring_curled and pinky_curled
 
 
-def apply_tie_breaker(raw_sequence, top1_label, top2_label, top1_prob, top2_prob, idx_to_label):
+def apply_tie_breaker(raw_sequence, top1_label, top2_label, top1_prob, top2_prob):
     """
-    raw_sequence: the ORIGINAL (pre-normalization, pre-ablation) keypoint
-    sequence for one clip, shape (frames, 122) — needed because finger
-    features are easiest to read directly here rather than re-deriving
-    from the normalized/ablated tensor. This function is UNCHANGED by
-    the ablation experiment: it always reads from the full raw array,
-    regardless of what the model itself was trained on.
-
-    Only overrides the model's prediction when:
-      1. The top-2 predicted classes are both in CONFUSABLE_CLASSES, AND
-      2. Their probabilities are close enough that the model is genuinely
-         unsure (not just slightly preferring one).
-    Otherwise, returns the model's original top-1 prediction unchanged —
-    this tie-breaker is a safety net, not a replacement for the model.
+    UNCHANGED in logic, only the caller now passes sigmoid-derived
+    top1/top2 (from the 7 real-class outputs) instead of softmax
+    values. Only fires when BOTH top1 and top2 are real classes in
+    CONFUSABLE_CLASSES and close in score -- never fires when the
+    predicted label is "nothing" (nothing to break a tie against).
     """
     if top1_label not in CONFUSABLE_CLASSES or top2_label not in CONFUSABLE_CLASSES:
-        return top1_label  # not a relevant confusion, leave the model's answer alone
+        return top1_label
 
     if (top1_prob - top2_prob) > TIE_BREAKER_PROB_MARGIN:
-        return top1_label  # model isn't actually torn, no need to intervene
+        return top1_label
 
-    # Average finger extension across all frames, separately for each hand
     left_fingers_avg = raw_sequence[:, LEFT_FINGERS_START:LEFT_FINGERS_START + 5].mean(axis=0)
     right_fingers_avg = raw_sequence[:, RIGHT_FINGERS_START:RIGHT_FINGERS_START + 5].mean(axis=0)
 
@@ -273,63 +268,90 @@ def apply_tie_breaker(raw_sequence, top1_label, top2_label, top1_prob, top2_prob
     if peace_sign_detected and "double_contact" in candidates:
         return "double_contact"
     else:
-        # Pick whichever candidate isn't double_contact
         non_double_contact = [c for c in candidates if c != "double_contact"]
         return non_double_contact[0] if non_double_contact else top1_label
 
 
+def decide_label(sigmoid_probs, idx_to_real_label):
+    """
+    NEW: the core multi-label decision rule, mirroring MaxLSB's
+    backend.py (`predicted_label = argmax; if proba > threshold: ...`).
+
+    Returns (predicted_label, top1_label, top2_label, top1_prob, top2_prob)
+    -- predicted_label is "nothing" if no class cleared DECISION_THRESHOLD,
+    otherwise it's the tie-breaker-adjusted top1 real class.
+    """
+    sorted_idx = np.argsort(sigmoid_probs)[::-1]
+    top1_idx, top2_idx = sorted_idx[0], sorted_idx[1]
+    top1_label = idx_to_real_label[top1_idx]
+    top2_label = idx_to_real_label[top2_idx]
+    top1_prob = sigmoid_probs[top1_idx]
+    top2_prob = sigmoid_probs[top2_idx]
+
+    if top1_prob <= DECISION_THRESHOLD:
+        # No class was confident enough -- this IS how "nothing" gets
+        # predicted, same as MaxLSB's `if proba > threshold` gate.
+        return NOTHING_LABEL, top1_label, top2_label, top1_prob, top2_prob
+
+    return top1_label, top1_label, top2_label, top1_prob, top2_prob
 
 
 def train():
     rows = load_manifest_rows()
 
-    all_labels = sorted(set(r["gesture_label"] for r in rows))
-    label_to_idx = {label: i for i, label in enumerate(all_labels)}
-    idx_to_label = {i: label for label, i in label_to_idx.items()}
+    all_labels = sorted(set(r["gesture_label"] for r in rows))          # includes "nothing", for reporting only
+    real_labels = sorted(l for l in all_labels if l != NOTHING_LABEL)    # 7 real gestures -- these are the model's outputs
+    real_label_to_idx = {label: i for i, label in enumerate(real_labels)}
+    idx_to_real_label = {i: label for label, i in real_label_to_idx.items()}
 
+    # Save the FULL label set (including "nothing") for downstream
+    # scripts that need to know all possible labels for reporting --
+    # but also save which ones are real model outputs, since that's
+    # what determines the model's actual output layer size now.
     with open(LABEL_MAP_SAVE_PATH, "w") as f:
-        json.dump(label_to_idx, f, indent=2)
+        json.dump({"real_label_to_idx": real_label_to_idx, "nothing_label": NOTHING_LABEL}, f, indent=2)
 
     train_rows = [r for r in rows if r["split"] == "train"]
     val_rows = [r for r in rows if r["split"] == "val"]
     test_rows = [r for r in rows if r["split"] == "test"]
 
     print(f"Train clips: {len(train_rows)} | Val clips: {len(val_rows)} | Test clips: {len(test_rows)}")
-    print(f"Classes: {all_labels}")
+    print(f"Real gesture classes (model outputs): {real_labels}")
+    print(f"'{NOTHING_LABEL}' clips are used in training but represented as an all-zero label, not a model output.")
     if ABLATE_HAND_COORDS:
         print(f"ABLATION ACTIVE: dropping {HAND_COORD_FEATURES} raw hand-coordinate features. "
               f"Model input size: {ABLATED_FEATURE_COUNT} (instead of {TOTAL_FEATURES}).")
 
-    train_ds = GestureDataset(train_rows, label_to_idx, augment=True)
-    val_ds = GestureDataset(val_rows, label_to_idx, augment=False)
-    test_ds = GestureDataset(test_rows, label_to_idx, augment=False)
+    train_ds = GestureDataset(train_rows, real_label_to_idx, augment=True)
+    val_ds = GestureDataset(val_rows, real_label_to_idx, augment=False)
+    test_ds = GestureDataset(test_rows, real_label_to_idx, augment=False)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-    input_size = ABLATED_FEATURE_COUNT if ABLATE_HAND_COORDS else TOTAL_FEATURES   # CHANGED
-    num_classes = len(all_labels)
+    input_size = ABLATED_FEATURE_COUNT if ABLATE_HAND_COORDS else TOTAL_FEATURES
+    num_real_classes = len(real_labels)   # 7, NOT 8 -- "nothing" is not an output neuron
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = GestureCNNLSTM(input_size=input_size, num_classes=num_classes).to(device)
+    model = GestureCNNLSTM(input_size=input_size, num_classes=num_real_classes).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    # Class weighting: rarer classes get a higher weight, so misclassifying
-    # them costs more during training. Without this, classes with far more
-    # clips (e.g. double_contact) can dominate what the model learns to
-    # favor, just because it saw more examples of them.
-    class_counts = np.array([sum(1 for r in train_rows if r["gesture_label"] == label) for label in all_labels])
-    class_weights = 1.0 / np.maximum(class_counts, 1)
-    class_weights = class_weights / class_weights.sum() * len(all_labels)  # normalize so weights average to ~1
-    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    # CHANGED: pos_weight for BCEWithLogitsLoss, one value PER REAL
+    # CLASS ONLY -- there is no "nothing" weight to worry about
+    # anymore, since nothing isn't a competing output neuron. This
+    # structurally eliminates the whole "nothing's weight got
+    # cranked up and stole confidence from real classes" failure mode.
+    class_counts = np.array([sum(1 for r in train_rows if r["gesture_label"] == label) for label in real_labels])
+    pos_weight = torch.tensor(
+        np.sqrt(len(train_rows) / np.maximum(class_counts, 1)), dtype=torch.float32
+    ).to(device)
 
-    print("\nClass weights (higher = rarer, weighted more heavily):")
-    for label, weight, count in zip(all_labels, class_weights, class_counts):
-        print(f"  {label:<30} weight={weight:.3f}  (train clips: {count})")
+    print("\nPer-class pos_weight (higher = rarer positive examples, weighted more in loss):")
+    for label, weight, count in zip(real_labels, pos_weight.cpu().numpy(), class_counts):
+        print(f"  {label:<30} pos_weight={weight:.3f}  (train clips: {count})")
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     best_val_loss = float("inf")
     epochs_without_improvement = 0
@@ -383,35 +405,29 @@ def train():
         for row in test_rows:
             raw = np.load(row["keypoint_path"])
             normalized = normalize_sequence(raw)
-            normalized = ablate(normalized)   # NEW LINE — must match what the model was trained on
+            normalized = ablate(normalized)
             resampled = resample_sequence(normalized, SEQUENCE_LENGTH)
             x = torch.tensor(resampled, dtype=torch.float32).unsqueeze(0).to(device)
 
             logits = model(x)
-            probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+            # CHANGED: sigmoid instead of softmax -- each class's score
+            # is INDEPENDENT, doesn't have to sum to 1 with the others.
+            probs = torch.sigmoid(logits).cpu().numpy()[0]
 
-            top2_idx = np.argsort(probs)[-2:][::-1]  # descending: [top1_idx, top2_idx]
-            top1_idx, top2_idx_ = top2_idx[0], top2_idx[1]
-            top1_label = idx_to_label[top1_idx]
-            top2_label = idx_to_label[top2_idx_]
-            top1_prob, top2_prob = probs[top1_idx], probs[top2_idx_]
+            predicted_label, top1_label, top2_label, top1_prob, top2_prob = decide_label(probs, idx_to_real_label)
 
-            # Use the RAW (pre-normalized, pre-ablation, pre-resampled)
-            # sequence for the tie-breaker so finger-extension values are
-            # easy to read directly. UNCHANGED — always the full 122-column
-            # raw array regardless of ABLATE_HAND_COORDS.
             raw_resampled_for_tiebreak = resample_sequence(raw, SEQUENCE_LENGTH)
-            final_label = apply_tie_breaker(
-                raw_resampled_for_tiebreak, top1_label, top2_label, top1_prob, top2_prob, idx_to_label
-            )
-            if final_label != top1_label:
-                tie_breaker_overrides += 1
+            final_label = apply_tie_breaker(raw_resampled_for_tiebreak, top1_label, top2_label, top1_prob, top2_prob)
+            # Only apply the tie-breaker's override if we actually predicted
+            # a real class -- if predicted_label came back "nothing", there's
+            # no tie to break.
+            if predicted_label != NOTHING_LABEL:
+                if final_label != top1_label:
+                    tie_breaker_overrides += 1
+                predicted_label = final_label
 
-            all_preds.append(label_to_idx[final_label])
-            all_true.append(label_to_idx[row["gesture_label"]])
-
-    true_labels = [idx_to_label[i] for i in all_true]
-    pred_labels = [idx_to_label[i] for i in all_preds]
+            all_preds.append(predicted_label)
+            all_true.append(row["gesture_label"])
 
     print("\n" + "=" * 60)
     print("TEST SET RESULTS")
@@ -419,13 +435,14 @@ def train():
     print(f"Accuracy: {accuracy_score(all_true, all_preds):.4f}")
     print(f"Tie-breaker overrides applied: {tie_breaker_overrides} / {len(test_rows)} test clips")
     print("\nPer-class report:")
-    print(classification_report(true_labels, pred_labels, zero_division=0))
+    print(classification_report(all_true, all_preds, labels=all_labels, zero_division=0))
     print("Confusion matrix (rows=true, cols=predicted):")
     print(f"Labels order: {all_labels}")
-    print(confusion_matrix(true_labels, pred_labels, labels=all_labels))
+    print(confusion_matrix(all_true, all_preds, labels=all_labels))
 
     print(f"\nModel saved to: {MODEL_SAVE_PATH}")
     print(f"Label map saved to: {LABEL_MAP_SAVE_PATH}")
+    print(f"Decision threshold used: {DECISION_THRESHOLD} (a class's sigmoid score must clear this to count)")
 
 
 if __name__ == "__main__":

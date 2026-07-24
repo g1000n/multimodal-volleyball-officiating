@@ -100,6 +100,21 @@ MIN_VISIBILITY_FOR_CROP = 0.18
 # hand). Far apart = separate crops (avoids resolution loss on wide poses).
 WRIST_DISTANCE_COMBINED_THRESHOLD = 1.3  # in units of shoulder width
 
+# LIVE-ONLY SPEED OPTION: when True, ALWAYS use the combined-crop branch,
+# never the far-apart double-crop branch -- caps hands_model.process()
+# to ONE call per frame instead of up to two. Live throughput was
+# measured at only ~9.7-10.7fps even after lowering pose model_complexity,
+# suggesting the double-crop branch (up to 2 separate Hands inferences
+# per frame) is a real bottleneck. Since raw hand coordinates are already
+# ablated out of the model (ABLATE_HAND_COORDS=True in train.py), only
+# finger-extension + detection flags survive from hand data anyway --
+# a slightly lower-resolution combined crop for wide-armed poses is an
+# acceptable trade for real speed here.
+# DEFAULT FALSE: training/batch extraction (extract_keypoints_from_video,
+# process_manifest) is completely unaffected unless this is explicitly
+# set True by a live inference script.
+LIVE_FAST_MODE = False
+
 
 def extract_pose_features(pose_results):
     if pose_results.pose_landmarks is None:
@@ -334,7 +349,7 @@ def extract_hand_features(frame_rgb, pose_landmarks, hands_model):
     )
 
     use_combined_crop = True
-    if both_wrists_visible:
+    if both_wrists_visible and not LIVE_FAST_MODE:
         # Pixel-space distance, correctly scaling x and y by their own
         # frame dimensions (previous version incorrectly scaled both
         # by frame_width only, distorting the distance on non-square
@@ -349,6 +364,9 @@ def extract_hand_features(frame_rgb, pose_landmarks, hands_model):
         crops_would_overlap = wrist_dist_px < (2 * single_crop_half_size)
 
         use_combined_crop = crops_would_overlap
+    # NEW: LIVE_FAST_MODE skips the distance check entirely and always
+    # uses the combined crop -- caps hand detection to ONE MediaPipe
+    # Hands call per frame instead of up to two.
 
     if use_combined_crop:
         crop_box = get_combined_hand_crop_box(left_wrist_lm, right_wrist_lm, shoulder_width_px, frame_width, frame_height)

@@ -48,7 +48,7 @@ import numpy as np
 # Use a raw string (r"...") or forward slashes to avoid backslash
 # escape errors on Windows paths.
 # ---------------------------------------------------------------------
-SOURCE_DATA_ROOT = r"C:\Users\notgi\Downloads\test\volley-judge\data"
+SOURCE_DATA_ROOT = r"C:\path\to\volley-judge\data"  # EDIT THIS locally to your actual path -- don't commit your real path
 
 # Maps his folder names to YOUR gesture_label names. "Substi" has no
 # equivalent in your 7-class set and is intentionally left out --

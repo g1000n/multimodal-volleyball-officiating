@@ -80,18 +80,20 @@ BASE_DELAY_MS = 30
 # last computed skeleton overlay instead of recomputing every frame.
 SPEED_SKIP_THRESHOLD = 2
 
-# The suspect classes/people from the Dwayne/Liam regression, in the
-# order you want to work through them. Edit freely -- add/remove
-# (gesture, person) pairs as needed.
+# Focused on tonight's actual question: is service_authorization_left
+# content-clean across all 4 contributors, and how does it actually
+# compare to end_of_set (the class it's being confused with)? SAL
+# clips come first, end_of_set clips right after -- use B/N to flip
+# back and forth between them and directly compare the motions.
 TARGETS = [
-    ("ball_out", "p08"),
-    ("ball_out", "p09"),
-    ("double_contact", "p08"),
-    ("double_contact", "p09"),
-    ("end_of_set", "p08"),
-    ("end_of_set", "p09"),
+    ("service_authorization_left", "p02"),
+    ("service_authorization_left", "p03"),
     ("service_authorization_left", "p08"),
     ("service_authorization_left", "p09"),
+    ("end_of_set", "p02"),
+    ("end_of_set", "p03"),
+    ("end_of_set", "p07"),
+    ("end_of_set", "p08"),
 ]
 
 mp_pose = mp.solutions.pose
