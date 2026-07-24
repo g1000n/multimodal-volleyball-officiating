@@ -1,8 +1,15 @@
 # Raw data audio files (ignored in all subdirectories)
 raw_data/**/*.wav
+raw_data/**/*.m4a
+
+# Augmented / generated audio living outside raw_data/
+data/augmented_dataset/
+data/**/*.wav
+data/**/*.m4a
 
 # Processed feature files & outputs
 processed/
+data/processed/
 
 # Model binary weights
 models/*.pkl
