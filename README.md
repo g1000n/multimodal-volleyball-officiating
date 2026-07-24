@@ -14,11 +14,6 @@ the call means. The whistle's only job is to trigger/validate that a call happen
 git pull origin audio
 ```
 
-If you're pulling after 2026-07-25: `.gitignore` and the tracked-file list changed
-(untracked `data/augmented_dataset/` and added `.m4a` ignore rules). Your local
-copy of those files won't be deleted, but git will stop tracking them -- if you
-regenerate that folder yourself, it'll stay untracked automatically.
-
 ## Environment setup (one-time)
 
 Use **Python 3.12** -- Python 3.14 has known DLL compatibility issues with
@@ -65,21 +60,14 @@ python scripts/04a_detect_iphone_whistle_candidates.py    # auto-detect candidat
 #  -> open processed/iphone_whistle_candidates.csv, confirm each row y/n in VLC (Ctrl+T to jump to vlc_jump_time), save
 python scripts/04b_extract_iphone_whistles.py             # extracts confirmed whistle clips -> iphone_whistle_index.csv
 python scripts/04_process_iphone_negatives.py             # only reads negative_audio/ -> iphone_negative_index.csv
-python scripts/04c_generate_synthetic_negatives.py        # synthetic squeak/bounce hard negatives -> synthetic_negative_index.csv
+python scripts/04c_synthetic_hard_negatives.py             # synthetic squeak/bounce hard negatives -> synthetic_negative_index.csv
 
 python scripts/05_extract_features.py                     # combines ALL sources -> features.csv
 python scripts/06_train_model.py                          # edit TEST_MATCHES first, see below
 python scripts/07_evaluate.py                              # run once, don't re-tune on this result
 
-# Real-time testing (binary whistle trigger only) -- pick one:
-python scripts/08_realtime_test.py live                    # CLI version
-python scripts/08b_realtime_ui.py                          # Tkinter GUI (confidence bar, live mic energy, adjustable threshold)
+python scripts/08_realtime_ui.py                           # live mic test -- GUI: confidence bar, live mic energy, adjustable threshold
 ```
-
-`08b_realtime_ui.py` duplicates the feature-extraction function from
-`05_extract_features.py` on purpose (kept separate for the live-mic loop) --
-if you ever change the feature math in one, copy the change to the other, or
-training and live inference will silently disagree.
 
 ## Important settings to check before training
 
@@ -99,9 +87,9 @@ training and live inference will silently disagree.
 
 - **`02_extract_whistle_clips.py` → `PRE`/`POST`/`TARGET_LEN`**: `0.3s` / `1.2s` /
   `1.5s`, set from manual listening QC (`processed/calibration_sample.csv`).
-  `04b_extract_iphone_whistles.py` and `08_realtime_test.py`/`08b_realtime_ui.py`'s
-  `WINDOW_SEC` must match `TARGET_LEN` exactly -- a mismatch here previously caused
-  a single long whistle to be reported as 2-3 separate triggers in real-time testing.
+  `04b_extract_iphone_whistles.py` and `08_realtime_ui.py`'s `WINDOW_SEC` must
+  match `TARGET_LEN` exactly -- a mismatch here previously caused a single long
+  whistle to be reported as 2-3 separate triggers in real-time testing.
 
 - **`04_process_iphone_negatives.py` → `TARGET_PER_FILE`**: currently `120`
   (increased from `30`). This is a **per-recording-file** target, not a total
@@ -131,10 +119,10 @@ Held-out eval accuracy / precision / recall: ___
   Note in the paper that iPhone test performance reflects close-mic recording
   conditions, not broadcast match audio -- avoid overstating this as a strict
   like-for-like improvement over the Volleylitics-only baseline.
-- Real-time detection (`08_realtime_test.py` / `08b_realtime_ui.py`) is
-  intentionally binary (whistle / no whistle trigger only). No blast-duration or
-  call-type classification is done here -- that logic was removed to match the
-  thesis's stated scope; call interpretation is the gesture recognition module's job.
+- Real-time detection (`08_realtime_ui.py`) is intentionally binary
+  (whistle / no whistle trigger only). No blast-duration or call-type
+  classification is done here -- that logic was removed to match the thesis's
+  stated scope; call interpretation is the gesture recognition module's job.
 
 ## Utility scripts
 
