@@ -2,14 +2,17 @@
 Step 3: Extract negative (non-whistle) clips from the SAME match audio,
 sampled away from any whistle timestamp.
 
-This version bypasses librosa and uses soundfile to prevent Windows DLL import crashes.
+These are "hard negatives" -- crowd noise, ball hits, shouting -- from the
+exact same recording domain as your positives.
 """
 import json
 from pathlib import Path
 from collections import defaultdict
+
 import numpy as np
 import soundfile as sf
 import pandas as pd
+from scipy import signal
 
 ROOT = Path(__file__).parent.parent
 JSON_PATH = ROOT / "raw_data" / "volleylitics" / "whistles_all_reanchored.json"
@@ -17,9 +20,10 @@ AUDIO_DIR = ROOT / "raw_data" / "volleylitics"
 OUT_DIR = ROOT / "processed" / "clips" / "non_whistle"
 
 SR = 22050
-SEG_LEN = 1.0
-MIN_GAP = 2.0
-PER_MATCH = 60
+SEG_LEN = 1.5         # Updated to 1.5s to match positive whistle clips
+MIN_GAP = 2.0         # seconds away from any whistle timestamp
+PER_MATCH = 60        # negatives to pull per match
+
 
 def extract_negatives(audio, sr, whistle_times, n_segments, seg_len=SEG_LEN, min_gap=MIN_GAP):
     duration = len(audio) / sr
@@ -36,6 +40,7 @@ def extract_negatives(audio, sr, whistle_times, n_segments, seg_len=SEG_LEN, min
         attempts += 1
 
     return segments
+
 
 def main():
     with open(JSON_PATH) as f:
@@ -55,9 +60,21 @@ def main():
             continue
 
         print(f"Extracting negatives from {match_id}...")
-        audio, sr = sf.read(wav_path)
+        
+        # Safe audio loading without librosa/soxr dependency
+        audio, native_sr = sf.read(wav_path)
+        
+        # Convert stereo to mono if necessary
         if len(audio.shape) > 1:
             audio = np.mean(audio, axis=1)
+
+        # Resample to 22050 Hz if necessary using scipy
+        if native_sr != SR:
+            num_samples = int(len(audio) * SR / native_sr)
+            audio = signal.resample(audio, num_samples)
+            sr = SR
+        else:
+            sr = native_sr
 
         segments = extract_negatives(audio, sr, whistle_times, PER_MATCH)
 
@@ -78,6 +95,7 @@ def main():
     out_csv = ROOT / "processed" / "match_negative_index.csv"
     df.to_csv(out_csv, index=False)
     print(f"\nExtracted {len(df)} match negative clips -> {out_csv}")
+
 
 if __name__ == "__main__":
     main()

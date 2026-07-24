@@ -30,7 +30,9 @@ SR = 22050            # downsample to match Volleylitics
 WINDOW_SEC = 1.5         # FIX: match TARGET_LEN in 02_extract_whistle_clips.py
 SILENCE_PERCENTILE = 20  # drop the quietest 20% of segments
 MIN_GAP_SEC = 5.0        # minimum spacing between selected clips
-TARGET_PER_FILE = 30     # adjust based on how many recordings you have
+TARGET_PER_FILE = 120   # increased from 30 -- pulls more from longer recordings.
+                          # Script auto-limits to what a recording can actually support
+                          # given MIN_GAP_SEC spacing, so shorter files just yield fewer.
 
 
 def load_resampled(path, target_sr=SR):
