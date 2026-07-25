@@ -73,11 +73,27 @@ LOG_DIR = "data/live_test_logs"
 
 ROLLING_WINDOW_FRAMES = 24          # TUNABLE. Frames of context per classification.
 INFERENCE_EVERY_N_FRAMES = 3        # TUNABLE. Classify every Nth camera frame.
-STREAK_NEEDED_TO_COMMIT = 5         # TUNABLE. Consecutive confident hits needed.
+STREAK_NEEDED_TO_COMMIT = 5         # TUNABLE. Consecutive confident hits needed for a SCORING
+# gesture (team_to_serve) specifically -- kept strict since being wrong here means an
+# incorrectly awarded point.
+FAULT_STREAK_NEEDED_TO_COMMIT = 3   # TUNABLE. Consecutive hits needed for a FAULT/reason
+# gesture (ball_out, double_contact, service_authorization_left/right, end_of_set) to commit,
+# AND for a same-side service_authorization to CANCEL a pending team_to_serve. Lower than the
+# scoring threshold on purpose -- real deployment logs showed genuine attempts often only
+# sustain 3-4 consecutive hits before naturally shifting to another label or ending, and a
+# wrong fault-reason is much lower-stakes than a wrong point.
 COMMIT_COOLDOWN_SECONDS = 2.0       # TUNABLE. Must stay ABOVE decision_engine.py's SETTLE_WINDOW_SECONDS.
 STALE_VOTE_SECONDS = 3.0            # TUNABLE. Old streak entries expire after this long.
 TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS = 2.0   # TUNABLE. Wait before confirming a scoring gesture.
 MIN_POSE_DETECTED_FRACTION = 0.5    # TUNABLE. Below this, force "nothing".
+HISTORY_CLEAR_AFTER_IDLE_SECONDS = 6.0  # TUNABLE. Gesture history bar clears itself after this
+# long with nothing new committed, instead of just capping at 8 entries and lingering forever.
+
+CONSOLE_REFRESH_AFTER_IDLE_SECONDS = 8.0   # TUNABLE. Clears the terminal after
+# this many seconds of continuous "nothing" (no streak building, no manual key
+# presses) since the last real activity -- keeps the console from endlessly
+# stacking prints. The CSV log still records everything regardless of this --
+# only the on-screen terminal history is cleared, not the actual data.
 
 # REAL game win condition -- NOT the shortened practice target.
 GAME_WIN_SCORE = 25
@@ -282,6 +298,57 @@ def draw_score_bar(frame, engine, frame_width, frame_height):
     cv2.putText(frame, score_text, (text_x, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
 
+SCOREBOARD_WIDTH = 900
+SCOREBOARD_HEIGHT = 400
+
+
+def build_scoreboard_canvas(engine, paused):
+    """
+    Builds a clean, audience-facing scoreboard image -- NOT the camera feed,
+    a separate blank canvas, big and legible from a distance (second
+    monitor/projector). Shown in its own window, separate from the
+    behind-the-scenes control window.
+    """
+    canvas = np.zeros((SCOREBOARD_HEIGHT, SCOREBOARD_WIDTH, 3), dtype=np.uint8)
+    canvas[:] = (25, 25, 25)
+
+    if paused:
+        text = "PAUSED"
+        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 2.5, 6)[0]
+        text_x = (SCOREBOARD_WIDTH - text_size[0]) // 2
+        cv2.putText(canvas, text, (text_x, SCOREBOARD_HEIGHT // 2 + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0, 165, 255), 6, cv2.LINE_AA)
+        return canvas
+
+    if engine.set_over:
+        winner = "LEFT" if engine.score["left"] > engine.score["right"] else "RIGHT"
+        text = f"{winner} WINS"
+        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 2.0, 6)[0]
+        text_x = (SCOREBOARD_WIDTH - text_size[0]) // 2
+        cv2.putText(canvas, text, (text_x, 150), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 255, 0), 6, cv2.LINE_AA)
+
+    cv2.putText(canvas, "TEAM 1", (100, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (200, 200, 200), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "TEAM 2", (SCOREBOARD_WIDTH - 300, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (200, 200, 200), 2, cv2.LINE_AA)
+
+    left_text = str(engine.score["left"])
+    right_text = str(engine.score["right"])
+    cv2.putText(canvas, left_text, (140, 320), cv2.FONT_HERSHEY_SIMPLEX, 5.5, (255, 255, 255), 12, cv2.LINE_AA)
+    cv2.putText(canvas, right_text, (SCOREBOARD_WIDTH - 320, 320), cv2.FONT_HERSHEY_SIMPLEX, 5.5, (255, 255, 255), 12, cv2.LINE_AA)
+
+    dash_size = cv2.getTextSize("-", cv2.FONT_HERSHEY_SIMPLEX, 3.0, 8)[0]
+    cv2.putText(canvas, "-", ((SCOREBOARD_WIDTH - dash_size[0]) // 2, 290),
+                cv2.FONT_HERSHEY_SIMPLEX, 3.0, (150, 150, 150), 8, cv2.LINE_AA)
+
+    return canvas
+
+
+def draw_strict_score_small(frame, strict_engine, frame_width):
+    """Small, unobtrusive readout of the background strict (whistle-required)
+    engine -- not the real/displayed score, just comparison data."""
+    text = f"[if whistle required] L {strict_engine.score['left']} - {strict_engine.score['right']} R"
+    cv2.putText(frame, text, (frame_width - 260, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+
+
 def draw_gesture_history_bar(frame, history, frame_width, frame_height):
     pretty_history = [DISPLAY_NAME.get(label, label) for label in history]
     text = "  ->  ".join(pretty_history) if pretty_history else "(no gestures committed yet)"
@@ -295,15 +362,43 @@ def draw_gesture_history_bar(frame, history, frame_width, frame_height):
 def main():
     model, idx_to_real_label, real_labels = load_model()
     engine = DecisionEngine(win_score=GAME_WIN_SCORE, win_by_margin=GAME_WIN_BY_MARGIN)
+    # PARALLEL STRICT ENGINE: same real gesture commits, same real whistle
+    # detections, but requires the whistle for scoring (decision_engine.py's
+    # normal, unmodified behavior). Runs entirely in the background -- never
+    # displayed as the primary score, never affects expected_step/gesture
+    # flow, purely for comparison data on whether strict whistle-gating
+    # would have worked, without betting the actual live score on it.
+    # TEMPORAL_WINDOW (10.0s) is shared from decision_engine.py's module
+    # constant for both engines -- already generous enough for real
+    # gesture/whistle timing mismatches.
+    strict_engine = DecisionEngine(win_score=GAME_WIN_SCORE, win_by_margin=GAME_WIN_BY_MARGIN)
 
     os.makedirs(LOG_DIR, exist_ok=True)
-    log_path = os.path.join(LOG_DIR, f"deployment_{int(time.time())}.csv")
+    session_start_time = time.time()
+    log_path = os.path.join(LOG_DIR, f"deployment_{int(session_start_time)}.csv")
     log_file = open(log_path, "w", newline="")
     log_writer = csv.writer(log_file)
     log_writer.writerow(["timestamp", "expected_step", "window_predicted_label",
                           "vote_committed_label", "engine_event", "engine_reason",
-                          "score_left", "score_right"])
+                          "score_left", "score_right",
+                          "strict_score_left", "strict_score_right"])
+
+    # SEPARATE dedicated log for the background strict (whistle-required)
+    # engine -- its own file, own events, so it can be reviewed and
+    # compared independently against a full match recording afterward.
+    strict_log_path = os.path.join(LOG_DIR, f"deployment_strict_{int(session_start_time)}.csv")
+    strict_log_file = open(strict_log_path, "w", newline="")
+    strict_log_writer = csv.writer(strict_log_file)
+    strict_log_writer.writerow(["timestamp", "event_type", "label", "engine_event", "engine_reason",
+                                 "strict_score_left", "strict_score_right"])
+
     print(f"Logging to: {log_path}")
+    print(f"Strict (whistle-required) log: {strict_log_path}")
+    print(f"SESSION START (epoch seconds): {session_start_time:.3f}")
+    print("If you're recording the whole match on video, note this number (or when the "
+          "recording actually starts) -- every row's timestamp is a real epoch second, so "
+          "elapsed_video_time = row_timestamp - session_start_time lets you find the exact "
+          "moment in the recording that corresponds to any logged event.")
     print(f"REAL GAME: first to {GAME_WIN_SCORE}, win by {GAME_WIN_BY_MARGIN}.\n")
 
     whistle_mode = {"value": "manual"}
@@ -315,6 +410,10 @@ def main():
         # what's actually gating scoring (see the per-frame auto-refresh
         # below), it's purely the visible/logged "a whistle was heard" record.
         engine.on_whistle_detected(timestamp)
+        strict_engine.on_whistle_detected(timestamp)  # ONLY real detections feed strict_engine -- no auto-refresh for this one
+        strict_log_writer.writerow([f"{timestamp:.3f}", "whistle", "", "", "",
+                                     strict_engine.score["left"], strict_engine.score["right"]])
+        strict_log_file.flush()
         whistle_flash_until_holder["value"] = time.time() + 1.5
         conf_str = f" (confidence={confidence:.2f})" if confidence is not None else ""
         print(f"  -> WHISTLE{conf_str} at {timestamp:.3f}")
@@ -353,6 +452,10 @@ def main():
     pending_scoring_since = 0.0
 
     expected_step = "whistle"
+    paused = True  # START paused -- gives you time to position/arrange both windows before anything gets processed
+    last_scoreboard_state = [None]
+    last_scoreboard_canvas = [build_scoreboard_canvas(engine, paused)]
+    fps_frame_times = deque(maxlen=30)
 
     print("Live deployment running. Press Q/ESC to quit.\n")
 
@@ -360,6 +463,11 @@ def main():
         nonlocal last_decision_text, last_decision_color, last_decision_time
         nonlocal last_committed_label, last_commit_time, expected_step
         result = engine.on_gesture_detected(label, now)
+        strict_result = strict_engine.on_gesture_detected(label, now)  # same real event, background-only, never affects display/flow
+        strict_log_writer.writerow([f"{now:.3f}", "gesture", label, strict_result["event"],
+                                     strict_result.get("reason", ""),
+                                     strict_engine.score["left"], strict_engine.score["right"]])
+        strict_log_file.flush()
         last_decision_text = f"{label}: {result['event']}"
         if result["event"] == "ignored":
             last_decision_text += f" ({result['reason']})"
@@ -382,18 +490,22 @@ def main():
             break
 
         frame_height, frame_width = frame.shape[:2]
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        features, draw_info = extract_frame_features(frame_rgb, pose_model, hands_model)
-        if show_skeleton:
-            draw_skeleton_overlay(frame, draw_info)
+        fps_frame_times.append(time.time())
+        measured_fps = (len(fps_frame_times) - 1) / (fps_frame_times[-1] - fps_frame_times[0]) if len(fps_frame_times) > 1 else 0.0
 
-        rolling_window.append(features)
-        frame_counter += 1
+        if not paused:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            features, draw_info = extract_frame_features(frame_rgb, pose_model, hands_model)
+            if show_skeleton:
+                draw_skeleton_overlay(frame, draw_info)
 
-        if not REQUIRE_WHISTLE_FOR_SCORING:
-            engine.on_whistle_detected(time.time())
+            rolling_window.append(features)
+            frame_counter += 1
 
-        if len(rolling_window) == ROLLING_WINDOW_FRAMES and frame_counter % INFERENCE_EVERY_N_FRAMES == 0:
+            if not REQUIRE_WHISTLE_FOR_SCORING:
+                engine.on_whistle_detected(time.time())
+
+        if not paused and len(rolling_window) == ROLLING_WINDOW_FRAMES and frame_counter % INFERENCE_EVERY_N_FRAMES == 0:
             current_label, current_conf, full_probs = classify_window(list(rolling_window), model, idx_to_real_label)
             last_probs = full_probs
 
@@ -407,6 +519,9 @@ def main():
             elif streak_label is not None and (time.time() - last_confident_append_time) > STALE_VOTE_SECONDS:
                 streak_label = None
                 streak_count = 0
+
+            if gesture_history and (time.time() - last_commit_time) > HISTORY_CLEAR_AFTER_IDLE_SECONDS:
+                gesture_history.clear()
 
             now = time.time()
             committed_label_this_frame = ""
@@ -422,8 +537,18 @@ def main():
                 streak_label = None
                 streak_count = 0
                 rolling_window.clear()
+                # FIX: this path (plain confirmation-delay timeout, most common
+                # when team_to_serve is performed slowly) never bypassed the
+                # settle window -- meaning whatever fault gesture came next
+                # almost always got rejected as "settle window active" too,
+                # same root cause as the fault-arrives-early path fixed
+                # earlier. Bypassing here too, since the streak requirement +
+                # elbow-angle check + pose gate already substantially cover
+                # what the settle window was originally protecting against.
+                engine.last_settle_start_time = None
+                strict_engine.last_settle_start_time = None
 
-            elif streak_label is not None and streak_count >= STREAK_NEEDED_TO_COMMIT:
+            elif streak_label is not None and streak_count >= (STREAK_NEEDED_TO_COMMIT if streak_label in SCORING_SIDE_MAP else FAULT_STREAK_NEEDED_TO_COMMIT):
                 top_label = streak_label
 
                 if top_label in SCORING_SIDE_MAP:
@@ -450,6 +575,26 @@ def main():
                             engine_event_this_frame = result["event"]
                             engine_reason_this_frame = result.get("reason", "")
                             pending_scoring_label = None
+
+                            # FIX: without this, the fault gesture (top_label)
+                            # would need its OWN separate commit attempt on the
+                            # NEXT cycle -- landing well within
+                            # decision_engine.py's SETTLE_WINDOW_SECONDS (1.5s),
+                            # which was rejecting it as "settle window active"
+                            # every single time. This isn't a spurious tail-end
+                            # spike the settle window is meant to catch -- it's
+                            # the deliberate fast-confirm mechanism -- so bypass
+                            # the settle window just this once and commit the
+                            # fault gesture as the reason in the SAME instant.
+                            engine.last_settle_start_time = None
+                            strict_engine.last_settle_start_time = None
+                            fault_result = do_commit(top_label, now)
+                            committed_label_this_frame = top_label
+                            engine_event_this_frame = fault_result["event"]
+                            engine_reason_this_frame = fault_result.get("reason", "")
+                            streak_label = None
+                            streak_count = 0
+                            rolling_window.clear()
                     else:
                         is_new_gesture = (top_label != last_committed_label)
                         cooldown_passed = (now - last_commit_time) >= COMMIT_COOLDOWN_SECONDS
@@ -465,7 +610,8 @@ def main():
 
             log_writer.writerow([f"{time.time():.3f}", expected_step, current_label,
                                   committed_label_this_frame, engine_event_this_frame, engine_reason_this_frame,
-                                  engine.score["left"], engine.score["right"]])
+                                  engine.score["left"], engine.score["right"],
+                                  strict_engine.score["left"], strict_engine.score["right"]])
             log_file.flush()
 
         if engine.set_over:
@@ -479,6 +625,7 @@ def main():
                 pending_remaining = max(0.0, TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS - (time.time() - pending_scoring_since))
             draw_instruction_banner(frame, expected_step, frame_width, pending_scoring_label, pending_remaining, whistle_mode["value"])
             draw_score_bar(frame, engine, frame_width, frame_height)
+            draw_strict_score_small(frame, strict_engine, frame_width)
             draw_vote_progress(frame, streak_label, streak_count, frame_width)
 
         if last_probs is not None:
@@ -496,13 +643,46 @@ def main():
             text_x = (frame_width - text_size[0]) // 2
             cv2.putText(frame, whistle_text, (text_x, 260), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 165, 255), 4, cv2.LINE_AA)
 
-        cv2.putText(frame, "(click this window: Q/ESC=quit  W=manual whistle  [/]=left score  -/+=right score  R=clear reason)",
+        if paused:
+            cv2.putText(frame, "PAUSED -- nothing being processed (press P to resume)",
+                        (frame_width // 2 - 260, frame_height // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
+
+        cv2.putText(frame, f"measured fps: {measured_fps:.1f}", (frame_width - 220, frame_height - 105),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        cv2.putText(frame, "(click this window: Q/ESC=quit  P=pause/resume  W=manual whistle  [/]=left score  -/+=right score  R=clear reason)",
                     (10, frame_height - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
 
-        cv2.imshow("LIVE DEPLOYMENT", frame)
+        cv2.imshow("BACKSTAGE (control)", frame)
+        # OPTIMIZATION: only rebuild the scoreboard canvas when something on
+        # it actually changed -- rebuilding a fresh image with several
+        # cv2.putText calls every single frame (most of which the score is
+        # unchanged) was real, avoidable per-frame overhead on top of an
+        # already fps-sensitive pipeline.
+        current_scoreboard_state = (engine.score["left"], engine.score["right"], paused, engine.set_over)
+        if current_scoreboard_state != last_scoreboard_state[0]:
+            last_scoreboard_canvas[0] = build_scoreboard_canvas(engine, paused)
+            last_scoreboard_state[0] = current_scoreboard_state
+        cv2.imshow("SCOREBOARD", last_scoreboard_canvas[0])
+
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == 27:
             break
+        elif key == ord('p'):
+            paused = not paused
+            if not paused:
+                # Clear anything that accumulated before/around the pause --
+                # don't let stale frames from the referee moving out of
+                # position feed into the next real classification.
+                rolling_window.clear()
+                streak_label = None
+                streak_count = 0
+                pending_scoring_label = None
+                frame_counter = 0
+                print("  -> RESUMED (cleared stale buffer)")
+            else:
+                print("  -> PAUSED")
         elif key == ord('s'):
             show_skeleton = not show_skeleton
         elif key == ord('w'):
@@ -532,9 +712,12 @@ def main():
     if detector is not None:
         detector.stop()
     log_file.close()
+    strict_log_file.close()
 
     print(f"\nLog saved to: {log_path}")
-    print(f"Final score: LEFT {engine.score['left']} - {engine.score['right']} RIGHT")
+    print(f"Strict log saved to: {strict_log_path}")
+    print(f"Final score (informational whistle): LEFT {engine.score['left']} - {engine.score['right']} RIGHT")
+    print(f"Final score (strict, whistle-required): LEFT {strict_engine.score['left']} - {strict_engine.score['right']} RIGHT")
 
 
 if __name__ == "__main__":
