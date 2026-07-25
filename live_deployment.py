@@ -97,7 +97,7 @@ FAST_HAND_CROP_MODE = False
 # `python -c "import sounddevice as sd; print(sd.query_devices())"` to see
 # the list again if you need to re-check it on game day, in case Windows
 # picks a different default after a reboot/reconnect).
-WHISTLE_DEVICE_INDEX = None  # TUNABLE -- set to your confirmed-working index, e.g. 3
+WHISTLE_DEVICE_INDEX = None  # TUNABLE -- set to your confirmed-working index, e.g. 3 //CHANGE THIS TO WHATEVER LIST_MICS.PY SHOWS
 
 # REQUIRE_WHISTLE_FOR_SCORING: set True to make a real detected whistle
 # GATE scoring (decision_engine.py's normal, strict behavior). Default
