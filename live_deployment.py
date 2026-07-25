@@ -1,0 +1,541 @@
+"""
+live_deployment.py
+
+REAL DEPLOYMENT SCRIPT -- built directly on simulate_game_test.py's proven
+foundation (streak-based commit, pending-confirmation for team_to_serve vs
+service_authorization, pose-detection gate, settle window via
+decision_engine.py). Differences from the practice/simulation version:
+
+  1. REAL win condition: first to 25, win by 2 (not the shortened 7-point
+     practice target).
+  2. REAL whistle detection: tries to load whistle_detector.py's trained
+     model automatically. If the .pkl file isn't available yet (audio
+     teammate hasn't sent it), this FALLS BACK to the manual W-key
+     placeholder automatically and tells you clearly on-screen/console
+     which mode you're in -- you don't need to remember to flip a flag
+     under game-day pressure.
+  3. No guided-practice countdown/instruction scaffolding -- runs
+     continuously from the start, same instruction banner (whistle /
+     scoring_gesture / reason_gesture) as a live status indicator instead
+     of a practice guide.
+
+ALL TUNABLE SETTINGS ARE MARKED BELOW, SAME AS simulate_game_test.py.
+
+Controls:
+  W - manual whistle (only matters if real whistle detection isn't active)
+  Q / ESC - quit
+  S - toggle skeleton overlay
+  [ / ] - manually adjust LEFT score down/up (mistake-correction safety net)
+  - / + - manually adjust RIGHT score down/up
+  R - manually clear the last-attached reason for the current point
+"""
+
+import time
+import csv
+import os
+from collections import deque
+
+import cv2
+import json
+import numpy as np
+import torch
+import mediapipe as mp
+
+import extract_keypoints
+from extract_keypoints import (
+    extract_pose_features,
+    extract_hand_features,
+    compute_elbow_angles,
+)
+from train import (
+    normalize_sequence,
+    resample_sequence,
+    SEQUENCE_LENGTH,
+    TOTAL_FEATURES,
+    ablate,
+    ABLATE_HAND_COORDS,
+    ABLATED_FEATURE_COUNT,
+    NOTHING_LABEL,
+    decide_label,
+    apply_tie_breaker,
+)
+from model import GestureCNNLSTM
+from decision_engine import DecisionEngine
+
+MODEL_PATH = "models/final_model.pt"
+LABEL_MAP_PATH = "models/label_map.json"
+CAMERA_INDEX = 1
+LOG_DIR = "data/live_test_logs"
+
+# ============================================================
+# TUNABLE SETTINGS
+# ============================================================
+
+ROLLING_WINDOW_FRAMES = 24          # TUNABLE. Frames of context per classification.
+INFERENCE_EVERY_N_FRAMES = 3        # TUNABLE. Classify every Nth camera frame.
+STREAK_NEEDED_TO_COMMIT = 5         # TUNABLE. Consecutive confident hits needed.
+COMMIT_COOLDOWN_SECONDS = 2.0       # TUNABLE. Must stay ABOVE decision_engine.py's SETTLE_WINDOW_SECONDS.
+STALE_VOTE_SECONDS = 3.0            # TUNABLE. Old streak entries expire after this long.
+TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS = 2.0   # TUNABLE. Wait before confirming a scoring gesture.
+MIN_POSE_DETECTED_FRACTION = 0.5    # TUNABLE. Below this, force "nothing".
+
+# REAL game win condition -- NOT the shortened practice target.
+GAME_WIN_SCORE = 25
+GAME_WIN_BY_MARGIN = 2
+
+# FAST_HAND_CROP_MODE: forces extract_keypoints.py's LIVE_FAST_MODE, capping
+# hand detection to ONE MediaPipe Hands call per frame instead of up to two.
+# UNTESTED as of writing -- only enable this if you've verified it doesn't
+# hurt accuracy with a real test tonight. Leave False if you haven't.
+FAST_HAND_CROP_MODE = False
+
+# WHISTLE_DEVICE_INDEX: which mic sounddevice should actually use. None =
+# OS default -- NOT recommended, since the OS default silently picked the
+# wrong device (a virtual Camo mic channel) during earlier testing, with no
+# error, just total silence. Set this to whatever index you confirmed
+# working when testing whistle_detector.py directly (run
+# `python -c "import sounddevice as sd; print(sd.query_devices())"` to see
+# the list again if you need to re-check it on game day, in case Windows
+# picks a different default after a reboot/reconnect).
+WHISTLE_DEVICE_INDEX = None  # TUNABLE -- set to your confirmed-working index, e.g. 3
+
+# REQUIRE_WHISTLE_FOR_SCORING: set True to make a real detected whistle
+# GATE scoring (decision_engine.py's normal, strict behavior). Default
+# False given a real, demonstrated risk: whistle detection was only
+# validated standing still, close to the mic, blowing cleanly -- during
+# actual gesture performance (movement, distance, breathing, ambient
+# noise) it may not fire reliably, and a missed detection would silently
+# cost a real point. With this False, the real detector still runs, still
+# shows the on-screen "WHISTLE!" flash, and still logs every detection --
+# it's purely informational and does not block scoring. Flip to True only
+# once you've validated whistle detection holds up during actual gesture
+# performance, not just standing still.
+REQUIRE_WHISTLE_FOR_SCORING = False  # TUNABLE
+
+DISPLAY_NAME = {
+    "team_to_serve_left": "Team to Serve Left",
+    "team_to_serve_right": "Team to Serve Right",
+    "ball_out": "Ball Out",
+    "double_contact": "Double Contact",
+    "end_of_set": "End of Set",
+    "service_authorization_left": "Service Auth. Left",
+    "service_authorization_right": "Service Auth. Right",
+}
+
+SCORING_SIDE_MAP = {"team_to_serve_left": "left", "team_to_serve_right": "right"}
+
+mp_pose = mp.solutions.pose
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+extract_keypoints.LIVE_FAST_MODE = FAST_HAND_CROP_MODE
+
+
+def load_model():
+    with open(LABEL_MAP_PATH) as f:
+        label_map_data = json.load(f)
+    real_label_to_idx = label_map_data["real_label_to_idx"]
+    idx_to_real_label = {int(v): k for k, v in real_label_to_idx.items()}
+
+    input_size = ABLATED_FEATURE_COUNT if ABLATE_HAND_COORDS else TOTAL_FEATURES
+    model = GestureCNNLSTM(input_size=input_size, num_classes=len(real_label_to_idx))
+    model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
+    model.eval()
+    return model, idx_to_real_label, list(real_label_to_idx.keys())
+
+
+def try_load_whistle_detector(on_whistle):
+    """Returns a started WhistleDetector, or None if the model file isn't
+    available yet -- caller falls back to manual W-key mode either way."""
+    try:
+        from whistle_detector import WhistleDetector
+    except ImportError:
+        print("whistle_detector.py not found -- using MANUAL WHISTLE MODE (press W).")
+        return None
+
+    try:
+        detector = WhistleDetector(on_whistle_callback=on_whistle, device=WHISTLE_DEVICE_INDEX)
+    except FileNotFoundError as e:
+        print(f"Real whistle model not available yet ({e})")
+        print("Falling back to MANUAL WHISTLE MODE (press W).")
+        return None
+
+    detector.start()
+    print("REAL whistle detection ACTIVE (mic-based). W key still works as backup.")
+    return detector
+
+
+def classify_window(raw_window_frames, model, idx_to_real_label):
+    raw = np.array(raw_window_frames)
+
+    pose_part = raw[:, :24]
+    frames_with_pose = np.any(pose_part != 0, axis=1)
+    pose_detected_fraction = frames_with_pose.mean()
+    if pose_detected_fraction < MIN_POSE_DETECTED_FRACTION:
+        return NOTHING_LABEL, 0.0, np.zeros(len(idx_to_real_label))
+
+    normalized = normalize_sequence(raw)
+    normalized = ablate(normalized)
+    resampled = resample_sequence(normalized, SEQUENCE_LENGTH)
+    x = torch.tensor(resampled, dtype=torch.float32).unsqueeze(0)
+
+    with torch.no_grad():
+        logits = model(x)
+        probs = torch.sigmoid(logits).numpy()[0]
+
+    predicted_label, top1_label, top2_label, top1_prob, top2_prob = decide_label(probs, idx_to_real_label)
+
+    if predicted_label != NOTHING_LABEL:
+        raw_resampled_for_tiebreak = resample_sequence(raw, SEQUENCE_LENGTH)
+        predicted_label = apply_tie_breaker(raw_resampled_for_tiebreak, top1_label, top2_label, top1_prob, top2_prob)
+
+    return predicted_label, top1_prob, probs
+
+
+def extract_frame_features(frame_rgb, pose_model, hands_model):
+    pose_results = pose_model.process(frame_rgb)
+    pose_features, pose_landmarks = extract_pose_features(pose_results)
+    hand_coords, left_det, right_det, left_fingers, right_fingers = extract_hand_features(
+        frame_rgb, pose_landmarks, hands_model
+    )
+    elbow_angles = compute_elbow_angles(pose_landmarks)
+
+    features = np.concatenate([
+        pose_features, hand_coords,
+        np.array([left_det, right_det]),
+        left_fingers, right_fingers, elbow_angles,
+    ])
+
+    draw_info = {"pose_results": pose_results, "hand_coords": hand_coords,
+                 "left_detected": left_det, "right_detected": right_det}
+    return features, draw_info
+
+
+def draw_skeleton_overlay(frame, draw_info):
+    frame_height, frame_width = frame.shape[:2]
+    pose_results = draw_info["pose_results"]
+    if pose_results.pose_landmarks is not None:
+        mp_drawing.draw_landmarks(
+            frame, pose_results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+            mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
+            mp_drawing.DrawingSpec(color=(0, 200, 0), thickness=2),
+        )
+
+
+def draw_instruction_banner(frame, expected_step, frame_width, pending_label=None, pending_remaining=None, whistle_mode="manual"):
+    if whistle_mode == "auto" and not REQUIRE_WHISTLE_FOR_SCORING:
+        mode_text = "WHISTLE (info only)"
+        mode_color = (0, 200, 255)
+    elif whistle_mode == "auto":
+        mode_text = "AUTO WHISTLE"
+        mode_color = (0, 255, 0)
+    else:
+        mode_text = "MANUAL WHISTLE (W)"
+        mode_color = (0, 165, 255)
+
+    if pending_label is not None:
+        side = SCORING_SIDE_MAP[pending_label]
+        text = f"team_to_serve_{side} PENDING -- confirming in {pending_remaining:.1f}s"
+        cv2.rectangle(frame, (0, 0), (frame_width, 60), (30, 30, 30), -1)
+        cv2.putText(frame, text, (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, mode_text, (frame_width - 220, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, mode_color, 2)
+        return
+
+    messages = {
+        "whistle": ("Waiting for WHISTLE", (0, 165, 255)),
+        "scoring_gesture": ("Waiting for team_to_serve_LEFT/RIGHT", (0, 255, 255)),
+        "reason_gesture": ("Waiting for fault/reason gesture", (0, 100, 255)),
+    }
+    text, color = messages[expected_step]
+    cv2.rectangle(frame, (0, 0), (frame_width, 60), (30, 30, 30), -1)
+    cv2.putText(frame, text, (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
+    cv2.putText(frame, mode_text, (frame_width - 220, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, mode_color, 2)
+
+
+def draw_probability_bars(frame, probs, real_labels, origin_y=190):
+    for i, label in enumerate(real_labels):
+        score = probs[i]
+        bar_color = (0, 255, 0) if score > 0.5 else (255, 255, 255)
+        text = f"{label:<28} {score:.2f}"
+        cv2.putText(frame, text, (10, origin_y + i * 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, bar_color, 2, cv2.LINE_AA)
+        bar_x1 = 320
+        bar_width = int(150 * score)
+        cv2.rectangle(frame, (bar_x1, origin_y + i * 28 - 15),
+                       (bar_x1 + bar_width, origin_y + i * 28 + 5), bar_color, -1)
+
+
+def draw_vote_progress(frame, streak_label, streak_count, frame_width, origin_y=155):
+    if streak_label is None:
+        return
+    pretty = DISPLAY_NAME.get(streak_label, streak_label)
+    text = f"building streak: {pretty} ({streak_count}/{STREAK_NEEDED_TO_COMMIT})"
+    color = (0, 255, 0) if streak_count >= STREAK_NEEDED_TO_COMMIT else (0, 200, 255)
+    cv2.putText(frame, text, (15, origin_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+
+def draw_score_bar(frame, engine, frame_width, frame_height):
+    score_text = f"LEFT {engine.score['left']}  -  {engine.score['right']} RIGHT   (first to {engine.win_score}, win by {engine.win_by_margin})"
+    cv2.rectangle(frame, (0, 65), (frame_width, 100), (20, 20, 20), -1)
+    text_size = cv2.getTextSize(score_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+    text_x = max(10, (frame_width - text_size[0]) // 2)
+    cv2.putText(frame, score_text, (text_x, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def draw_gesture_history_bar(frame, history, frame_width, frame_height):
+    pretty_history = [DISPLAY_NAME.get(label, label) for label in history]
+    text = "  ->  ".join(pretty_history) if pretty_history else "(no gestures committed yet)"
+    rect_y1, rect_y2 = frame_height - 60, frame_height - 15
+    cv2.rectangle(frame, (0, rect_y1), (frame_width, rect_y2), (40, 40, 40), -1)
+    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+    text_x = max(10, (frame_width - text_size[0]) // 2)
+    cv2.putText(frame, text, (text_x, frame_height - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def main():
+    model, idx_to_real_label, real_labels = load_model()
+    engine = DecisionEngine(win_score=GAME_WIN_SCORE, win_by_margin=GAME_WIN_BY_MARGIN)
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, f"deployment_{int(time.time())}.csv")
+    log_file = open(log_path, "w", newline="")
+    log_writer = csv.writer(log_file)
+    log_writer.writerow(["timestamp", "expected_step", "window_predicted_label",
+                          "vote_committed_label", "engine_event", "engine_reason",
+                          "score_left", "score_right"])
+    print(f"Logging to: {log_path}")
+    print(f"REAL GAME: first to {GAME_WIN_SCORE}, win by {GAME_WIN_BY_MARGIN}.\n")
+
+    whistle_mode = {"value": "manual"}
+    whistle_flash_until_holder = {"value": 0.0}
+
+    def on_whistle(timestamp, confidence=None):
+        # Always feeds the engine (harmless either way) and always shows/logs
+        # the flash -- when REQUIRE_WHISTLE_FOR_SCORING is False, this isn't
+        # what's actually gating scoring (see the per-frame auto-refresh
+        # below), it's purely the visible/logged "a whistle was heard" record.
+        engine.on_whistle_detected(timestamp)
+        whistle_flash_until_holder["value"] = time.time() + 1.5
+        conf_str = f" (confidence={confidence:.2f})" if confidence is not None else ""
+        print(f"  -> WHISTLE{conf_str} at {timestamp:.3f}")
+
+    detector = try_load_whistle_detector(on_whistle)
+    whistle_mode["value"] = "auto" if detector is not None else "manual"
+    if not REQUIRE_WHISTLE_FOR_SCORING:
+        print("REQUIRE_WHISTLE_FOR_SCORING is False -- whistle is informational only, "
+              "scoring will NOT be blocked by a missed detection.")
+
+    pose_model = mp_pose.Pose(static_image_mode=False, model_complexity=0,
+                               min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    hands_model = mp_hands.Hands(static_image_mode=True, max_num_hands=2,
+                                  min_detection_confidence=0.1, min_tracking_confidence=0.28)
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        print(f"ERROR: could not open camera at index {CAMERA_INDEX}.")
+        return
+
+    rolling_window = deque(maxlen=ROLLING_WINDOW_FRAMES)
+    streak_label = None
+    streak_count = 0
+    last_confident_append_time = 0.0
+    last_committed_label = None
+    last_commit_time = 0
+    frame_counter = 0
+    show_skeleton = True
+    gesture_history = deque(maxlen=8)
+    last_decision_text = ""
+    last_probs = None
+    last_decision_color = (255, 255, 255)
+    last_decision_time = 0
+
+    pending_scoring_label = None
+    pending_scoring_since = 0.0
+
+    expected_step = "whistle"
+
+    print("Live deployment running. Press Q/ESC to quit.\n")
+
+    def do_commit(label, now):
+        nonlocal last_decision_text, last_decision_color, last_decision_time
+        nonlocal last_committed_label, last_commit_time, expected_step
+        result = engine.on_gesture_detected(label, now)
+        last_decision_text = f"{label}: {result['event']}"
+        if result["event"] == "ignored":
+            last_decision_text += f" ({result['reason']})"
+            last_decision_color = (0, 0, 255)
+        else:
+            gesture_history.append(label)
+            last_decision_color = (0, 255, 0)
+            if result["event"] == "point_awarded":
+                expected_step = "reason_gesture"
+            elif result["event"] == "reason_attached":
+                expected_step = "whistle"
+        last_decision_time = now
+        last_committed_label = label
+        last_commit_time = now
+        return result
+
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
+
+        frame_height, frame_width = frame.shape[:2]
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        features, draw_info = extract_frame_features(frame_rgb, pose_model, hands_model)
+        if show_skeleton:
+            draw_skeleton_overlay(frame, draw_info)
+
+        rolling_window.append(features)
+        frame_counter += 1
+
+        if not REQUIRE_WHISTLE_FOR_SCORING:
+            engine.on_whistle_detected(time.time())
+
+        if len(rolling_window) == ROLLING_WINDOW_FRAMES and frame_counter % INFERENCE_EVERY_N_FRAMES == 0:
+            current_label, current_conf, full_probs = classify_window(list(rolling_window), model, idx_to_real_label)
+            last_probs = full_probs
+
+            if current_label != NOTHING_LABEL:
+                if current_label == streak_label:
+                    streak_count += 1
+                else:
+                    streak_label = current_label
+                    streak_count = 1
+                last_confident_append_time = time.time()
+            elif streak_label is not None and (time.time() - last_confident_append_time) > STALE_VOTE_SECONDS:
+                streak_label = None
+                streak_count = 0
+
+            now = time.time()
+            committed_label_this_frame = ""
+            engine_event_this_frame = ""
+            engine_reason_this_frame = ""
+
+            if pending_scoring_label is not None and (now - pending_scoring_since) >= TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS:
+                result = do_commit(pending_scoring_label, now)
+                committed_label_this_frame = pending_scoring_label
+                engine_event_this_frame = result["event"]
+                engine_reason_this_frame = result.get("reason", "")
+                pending_scoring_label = None
+                streak_label = None
+                streak_count = 0
+                rolling_window.clear()
+
+            elif streak_label is not None and streak_count >= STREAK_NEEDED_TO_COMMIT:
+                top_label = streak_label
+
+                if top_label in SCORING_SIDE_MAP:
+                    if pending_scoring_label != top_label:
+                        pending_scoring_label = top_label
+                        pending_scoring_since = now
+                    streak_count = STREAK_NEEDED_TO_COMMIT
+
+                else:
+                    if pending_scoring_label is not None:
+                        pending_side = SCORING_SIDE_MAP[pending_scoring_label]
+                        pending_same_side_auth = f"service_authorization_{pending_side}"
+
+                        if top_label == pending_same_side_auth:
+                            last_decision_text = f"{pending_scoring_label} cancelled -> was {top_label}"
+                            last_decision_color = (0, 165, 255)
+                            last_decision_time = now
+                            pending_scoring_label = None
+                            streak_label = None
+                            streak_count = 0
+                        else:
+                            result = do_commit(pending_scoring_label, now)
+                            committed_label_this_frame = pending_scoring_label
+                            engine_event_this_frame = result["event"]
+                            engine_reason_this_frame = result.get("reason", "")
+                            pending_scoring_label = None
+                    else:
+                        is_new_gesture = (top_label != last_committed_label)
+                        cooldown_passed = (now - last_commit_time) >= COMMIT_COOLDOWN_SECONDS
+
+                        if is_new_gesture or cooldown_passed:
+                            result = do_commit(top_label, now)
+                            committed_label_this_frame = top_label
+                            engine_event_this_frame = result["event"]
+                            engine_reason_this_frame = result.get("reason", "")
+                            streak_label = None
+                            streak_count = 0
+                            rolling_window.clear()
+
+            log_writer.writerow([f"{time.time():.3f}", expected_step, current_label,
+                                  committed_label_this_frame, engine_event_this_frame, engine_reason_this_frame,
+                                  engine.score["left"], engine.score["right"]])
+            log_file.flush()
+
+        if engine.set_over:
+            winner = "LEFT" if engine.score["left"] > engine.score["right"] else "RIGHT"
+            cv2.rectangle(frame, (0, 0), (frame_width, 100), (0, 100, 0), -1)
+            cv2.putText(frame, f"MATCH OVER -- {winner} WINS {engine.score['left']}-{engine.score['right']}",
+                        (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 3, cv2.LINE_AA)
+        else:
+            pending_remaining = None
+            if pending_scoring_label is not None:
+                pending_remaining = max(0.0, TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS - (time.time() - pending_scoring_since))
+            draw_instruction_banner(frame, expected_step, frame_width, pending_scoring_label, pending_remaining, whistle_mode["value"])
+            draw_score_bar(frame, engine, frame_width, frame_height)
+            draw_vote_progress(frame, streak_label, streak_count, frame_width)
+
+        if last_probs is not None:
+            draw_probability_bars(frame, last_probs, real_labels)
+
+        draw_gesture_history_bar(frame, list(gesture_history), frame_width, frame_height)
+
+        if last_decision_text and (time.time() - last_decision_time) < 4:
+            cv2.putText(frame, f"decision_engine: {last_decision_text}", (10, frame_height - 75),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, last_decision_color, 2, cv2.LINE_AA)
+
+        if time.time() < whistle_flash_until_holder["value"]:
+            whistle_text = "WHISTLE!"
+            text_size = cv2.getTextSize(whistle_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 4)[0]
+            text_x = (frame_width - text_size[0]) // 2
+            cv2.putText(frame, whistle_text, (text_x, 260), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 165, 255), 4, cv2.LINE_AA)
+
+        cv2.putText(frame, "(click this window: Q/ESC=quit  W=manual whistle  [/]=left score  -/+=right score  R=clear reason)",
+                    (10, frame_height - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+
+        cv2.imshow("LIVE DEPLOYMENT", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == 27:
+            break
+        elif key == ord('s'):
+            show_skeleton = not show_skeleton
+        elif key == ord('w'):
+            on_whistle(time.time())
+            if expected_step == "whistle":
+                expected_step = "scoring_gesture"
+        elif key == ord('['):
+            engine.manual_override_score("left", -1)
+            print(f"  -> MANUAL: left score -1 -> {engine.score}")
+        elif key == ord(']'):
+            engine.manual_override_score("left", +1)
+            print(f"  -> MANUAL: left score +1 -> {engine.score}")
+        elif key == ord('-'):
+            engine.manual_override_score("right", -1)
+            print(f"  -> MANUAL: right score -1 -> {engine.score}")
+        elif key == ord('+') or key == ord('='):
+            engine.manual_override_score("right", +1)
+            print(f"  -> MANUAL: right score +1 -> {engine.score}")
+        elif key == ord('r'):
+            engine.manual_clear_reason()
+            print("  -> MANUAL: cleared last reason for the current point")
+
+    cap.release()
+    cv2.destroyAllWindows()
+    pose_model.close()
+    hands_model.close()
+    if detector is not None:
+        detector.stop()
+    log_file.close()
+
+    print(f"\nLog saved to: {log_path}")
+    print(f"Final score: LEFT {engine.score['left']} - {engine.score['right']} RIGHT")
+
+
+if __name__ == "__main__":
+    main()
