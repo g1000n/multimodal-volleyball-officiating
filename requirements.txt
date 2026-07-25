@@ -1,5 +1,12 @@
 mediapipe==0.10.14
 opencv-python
-numpy
+numpy==1.26.4
 torch
-scikit-learn
+scikit-learn==1.5.1
+soundfile==0.12.1
+scipy==1.13.1
+pandas==2.2.2
+joblib==1.4.2
+sounddevice==0.4.7
+ffmpeg-python==0.2.0
+huggingface_hub>=0.24.6
