@@ -85,11 +85,30 @@ LABEL_MAP_PATH = "models/label_map.json"
 CAMERA_INDEX = 1
 LOG_DIR = "data/live_test_logs"
 
-ROLLING_WINDOW_FRAMES = 60
+ROLLING_WINDOW_FRAMES = 24  # CHANGED from 60 -- was sized assuming ~30fps (~2s), but measured
+# real live throughput is only ~9.7-10.7fps, meaning 60 frames was actually
+# spanning ~5.6-6s of real time, far longer than an actual gesture takes.
+# 24 frames at ~10fps ~= 2.4s, proportionate to real gesture duration --
+# also means a post-clear "cold refill" (see rolling_window.clear() above)
+# only takes ~2.4s instead of ~6s before classification can resume.
 INFERENCE_EVERY_N_FRAMES = 3
-VOTE_WINDOW_SIZE = 10
-VOTES_NEEDED_TO_COMMIT = 7
-COMMIT_COOLDOWN_SECONDS = 1.0
+# REPLACED (see main() for the new streak-based commit logic): the old
+# VOTE_WINDOW_SIZE/VOTES_NEEDED_TO_COMMIT shared-deque majority vote had
+# a real structural flaw -- it tracked ONE mixed history across ALL
+# labels, so two DIFFERENT real gestures performed close together
+# competed for the same slots. A short-but-genuine team_to_serve_right
+# (5 confident hits) got silently erased by a longer ball_out (7 hits)
+# that followed it -- team_to_serve_right never committed at all,
+# confirmed directly from a live session log. Streak-based commit
+# fixes this structurally: each label gets its own count that resets
+# to zero the instant a DIFFERENT label appears, so nothing a later
+# gesture does can erase an earlier one's progress.
+STREAK_NEEDED_TO_COMMIT = 5  # consecutive confident hits of the SAME label needed to commit
+COMMIT_COOLDOWN_SECONDS = 2.0  # CHANGED from 1.0 -- must stay ABOVE SETTLE_WINDOW_SECONDS (1.5)
+# in decision_engine.py. If cooldown were shorter than the settle window,
+# a continuously-held scoring gesture could re-trigger a second point the
+# instant the settle window closes, even though nothing new was performed --
+# a real edge case, not yet confirmed to have happened, but worth closing.
 
 # Shortened win condition for practical end-to-end testing --
 # real games use 25/win-by-2; this is deliberately smaller so a full
@@ -105,6 +124,13 @@ TEST_WIN_BY_MARGIN = 2
 # convenience in THIS script, not a change to the engine's real logic.
 # Set back to False once you want to test the whistle-gated flow again.
 DISABLE_WHISTLE_REQUIREMENT = True
+
+# How long a confident vote entry can sit unrefreshed before a brand-new
+# confident entry is treated as "starting fresh" rather than combining
+# with it -- prevents very old entries (from a completely different
+# moment) from silently voting alongside a new one, now that "nothing"
+# no longer naturally flushes the buffer over time.
+STALE_VOTE_SECONDS = 3.0
 
 # Pretty display names for the sequence bar, mirroring MaxLSB's
 # action_fullname() -- e.g. "Point Right -> Out of Bounds -> Substitution"
@@ -136,8 +162,27 @@ def load_model():
     return model, idx_to_real_label, list(real_label_to_idx.keys())
 
 
+MIN_POSE_DETECTED_FRACTION = 0.5  # if fewer than half the window's frames have a
+# detected pose, treat the whole window as "nothing" regardless of what the
+# model says -- an all-zero (no-pose) input is a real point in feature space
+# the model was never taught to associate with "no signal," and can be
+# confidently misclassified as a real gesture (observed live: a blank/
+# not-yet-connected camera feed got read as double_contact).
+
+
 def classify_window(raw_window_frames, model, idx_to_real_label):
     raw = np.array(raw_window_frames)
+
+    # SAFETY GATE: pose features are the first POSE_FEATURES columns of the
+    # RAW (pre-ablation) array, and extract_pose_features() returns all
+    # zeros when no pose was detected that frame -- checking for that
+    # directly, cheaply, without needing a separate tracked flag.
+    pose_part = raw[:, :24]
+    frames_with_pose = np.any(pose_part != 0, axis=1)
+    pose_detected_fraction = frames_with_pose.mean()
+    if pose_detected_fraction < MIN_POSE_DETECTED_FRACTION:
+        return NOTHING_LABEL, 0.0, np.zeros(len(idx_to_real_label))
+
     normalized = normalize_sequence(raw)
     normalized = ablate(normalized)
     resampled = resample_sequence(normalized, SEQUENCE_LENGTH)
@@ -211,20 +256,20 @@ def draw_instruction_banner(frame, expected_step, frame_width):
     cv2.putText(frame, text, (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
 
 
-def draw_vote_progress(frame, recent_predictions, frame_width, origin_y=155):
+def draw_vote_progress(frame, streak_label, streak_count, frame_width, origin_y=155):
     """
-    Shows the CURRENT vote tally, so it's visible that a green
+    Shows the CURRENT per-label streak, so it's visible that a green
     probability bar is only a single window's raw guess -- not a
-    commit. A commit only happens once a class wins
-    VOTES_NEEDED_TO_COMMIT out of the last VOTE_WINDOW_SIZE windows.
+    commit. A commit only happens once the SAME label hits
+    STREAK_NEEDED_TO_COMMIT confident windows IN A ROW -- a different
+    label appearing resets this to zero, so nothing a later gesture
+    does can silently erase an earlier one's progress.
     """
-    if not recent_predictions:
+    if streak_label is None:
         return
-    counts = Counter(recent_predictions)
-    top_label, top_count = counts.most_common(1)[0]
-    pretty = DISPLAY_NAME.get(top_label, top_label)
-    text = f"building vote: {pretty} ({top_count}/{VOTE_WINDOW_SIZE}, needs {VOTES_NEEDED_TO_COMMIT})"
-    color = (0, 255, 0) if top_count >= VOTES_NEEDED_TO_COMMIT else (0, 200, 255)
+    pretty = DISPLAY_NAME.get(streak_label, streak_label)
+    text = f"building streak: {pretty} ({streak_count}/{STREAK_NEEDED_TO_COMMIT})"
+    color = (0, 255, 0) if streak_count >= STREAK_NEEDED_TO_COMMIT else (0, 200, 255)
     cv2.putText(frame, text, (15, origin_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
 
@@ -290,7 +335,9 @@ def main():
         return
 
     rolling_window = deque(maxlen=ROLLING_WINDOW_FRAMES)
-    recent_predictions = deque(maxlen=VOTE_WINDOW_SIZE)
+    streak_label = None    # the label currently building a consecutive streak
+    streak_count = 0        # how many CONSECUTIVE confident hits of streak_label so far
+    last_confident_append_time = 0.0
     last_committed_label = None
     last_commit_time = 0
     frame_counter = 0
@@ -330,46 +377,70 @@ def main():
         if len(rolling_window) == ROLLING_WINDOW_FRAMES and frame_counter % INFERENCE_EVERY_N_FRAMES == 0:
             current_label, current_conf, full_probs = classify_window(list(rolling_window), model, idx_to_real_label)
             last_probs = full_probs
-            recent_predictions.append(current_label)
+
+            # NEW: per-label STREAK instead of a shared mixed-label vote
+            # deque. "nothing" doesn't touch the streak at all (same
+            # spirit as the earlier fix -- an ambiguous moment can
+            # neither help nor hurt). Any DIFFERENT real label resets
+            # the streak to 1 for itself -- this is the actual fix for
+            # the diagnosed bug: a short-but-real team_to_serve_right
+            # streak can no longer be silently absorbed/overwritten by
+            # a longer ball_out streak that follows it, because they no
+            # longer share the same counter at all.
+            if current_label != NOTHING_LABEL:
+                if current_label == streak_label:
+                    streak_count += 1
+                else:
+                    streak_label = current_label
+                    streak_count = 1
+                last_confident_append_time = time.time()
+            # STALENESS GUARD: if it's been a while since the last
+            # confident hit, don't let a stale streak silently resume --
+            # start fresh.
+            elif streak_label is not None and (time.time() - last_confident_append_time) > STALE_VOTE_SECONDS:
+                streak_label = None
+                streak_count = 0
 
             committed_label_this_frame = ""
             vote_count_this_frame = ""
             engine_event_this_frame = ""
             engine_reason_this_frame = ""
 
-            if len(recent_predictions) == VOTE_WINDOW_SIZE:
-                vote_counts = Counter(recent_predictions)
-                top_label, top_count = vote_counts.most_common(1)[0]
+            if streak_label is not None and streak_count >= STREAK_NEEDED_TO_COMMIT:
+                top_label = streak_label
+                commit_now = time.time()
+                is_new_gesture = (top_label != last_committed_label)
+                cooldown_passed = (commit_now - last_commit_time) >= COMMIT_COOLDOWN_SECONDS
 
-                if top_count >= VOTES_NEEDED_TO_COMMIT and top_label != NOTHING_LABEL:
-                    commit_now = time.time()
-                    is_new_gesture = (top_label != last_committed_label)
-                    cooldown_passed = (commit_now - last_commit_time) >= COMMIT_COOLDOWN_SECONDS
+                if is_new_gesture or cooldown_passed:
+                    result = engine.on_gesture_detected(top_label, commit_now)
+                    committed_label_this_frame = top_label
+                    vote_count_this_frame = streak_count
+                    engine_event_this_frame = result["event"]
+                    engine_reason_this_frame = result.get("reason", "")
 
-                    if is_new_gesture or cooldown_passed:
-                        result = engine.on_gesture_detected(top_label, commit_now)
-                        committed_label_this_frame = top_label
-                        vote_count_this_frame = top_count
-                        engine_event_this_frame = result["event"]
-                        engine_reason_this_frame = result.get("reason", "")
+                    last_decision_text = f"{top_label}: {result['event']}"
+                    if result["event"] == "ignored":
+                        last_decision_text += f" ({result['reason']})"
+                        last_decision_color = (0, 0, 255)
+                    else:
+                        gesture_history.append(top_label)
+                        last_decision_color = (0, 255, 0)
 
-                        last_decision_text = f"{top_label}: {result['event']}"
-                        if result["event"] == "ignored":
-                            last_decision_text += f" ({result['reason']})"
-                            last_decision_color = (0, 0, 255)
-                        else:
-                            gesture_history.append(top_label)
-                            last_decision_color = (0, 255, 0)
+                        if result["event"] == "point_awarded":
+                            expected_step = "reason_gesture"
+                        elif result["event"] == "reason_attached":
+                            expected_step = "scoring_gesture" if DISABLE_WHISTLE_REQUIREMENT else "whistle"
 
-                            if result["event"] == "point_awarded":
-                                expected_step = "reason_gesture"
-                            elif result["event"] == "reason_attached":
-                                expected_step = "scoring_gesture" if DISABLE_WHISTLE_REQUIREMENT else "whistle"
-
-                        last_decision_time = commit_now
-                        last_committed_label = top_label
-                        last_commit_time = commit_now
-                        recent_predictions.clear()
+                    last_decision_time = commit_now
+                    last_committed_label = top_label
+                    last_commit_time = commit_now
+                    streak_label = None
+                    streak_count = 0
+                    # rolling_window is now cleared on every commit -- forces
+                    # a clean slate, no leftover frames of the JUST-FINISHED
+                    # gesture lingering in the buffer.
+                    rolling_window.clear()
 
             log_writer.writerow([f"{time.time():.3f}", expected_step, current_label]
                                  + [f"{score:.4f}" for score in full_probs]
@@ -386,7 +457,7 @@ def main():
         else:
             draw_instruction_banner(frame, expected_step, frame_width)
             draw_score_bar(frame, engine, frame_width, frame_height)
-            draw_vote_progress(frame, recent_predictions, frame_width)
+            draw_vote_progress(frame, streak_label, streak_count, frame_width)
 
         if last_probs is not None:
             draw_probability_bars(frame, last_probs, real_labels)

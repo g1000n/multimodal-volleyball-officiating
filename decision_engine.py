@@ -43,7 +43,13 @@ NEW (this version), on top of the previous win-condition/whistle fixes:
 
 import time
 
-TEMPORAL_WINDOW = 2.0  # seconds -- adjust based on real referee timing
+TEMPORAL_WINDOW = 10.0  # seconds -- CHANGED from 5.0. Live testing showed even
+# 5.0s was too tight: a genuinely natural (not rushed) team_to_serve -> ball_out
+# attempt measured 5.752s total and got rejected. Real pipeline latency alone
+# (SETTLE_WINDOW_SECONDS 1.5s + ~1.5s minimum streak-build time) plus normal
+# human repositioning/reaction time easily approaches 4-6s even when nothing
+# is going wrong -- this value now has real margin above that, rather than a
+# tight fit that keeps failing on ordinary pacing.
 
 # How long to ignore further gesture detections after ANY accepted
 # commit (point or reason). Grounded in the FIVB guideline's confirmed

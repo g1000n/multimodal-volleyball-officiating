@@ -84,6 +84,29 @@ CONFUSABLE_CLASSES = {"double_contact", "service_authorization_left", "service_a
 TIE_BREAKER_PROB_MARGIN = 0.20
 PEACE_SIGN_THRESHOLD = 0.5
 
+# NEW: elbow-angle offsets, for the team_to_serve vs. service_authorization
+# safety check below. Layout: [...110 fingers...][120: left_elbow][121: right_elbow]
+LEFT_ELBOW_ANGLE_IDX = POSE_FEATURES + HAND_COORD_FEATURES + HAND_FLAG_FEATURES + FINGER_FEATURES        # 120
+RIGHT_ELBOW_ANGLE_IDX = LEFT_ELBOW_ANGLE_IDX + 1                                                          # 121
+
+# NEW SAFETY CHECK: team_to_serve_X (a SCORING gesture) vs.
+# service_authorization_X (a non-scoring gesture) on the SAME side. A
+# slow/deliberate service_authorization performance risks being read as
+# team_to_serve, which would incorrectly award a real point -- a genuine
+# scoring-integrity risk, not just a display glitch, since
+# service_authorization legitimately happens right after a whistle in
+# real play too (whistle-gating does NOT protect against this specific
+# confusion). team_to_serve is a straight, extended-arm point;
+# service_authorization involves bending the elbow -- elbow_angle
+# (already a real feature, 0=fully bent, 1=fully straight) is the
+# natural signal to disambiguate them.
+SAME_SIDE_SCORE_AUTH_PAIRS = {
+    frozenset({"team_to_serve_left", "service_authorization_left"}): "left",
+    frozenset({"team_to_serve_right", "service_authorization_right"}): "right",
+}
+SCORE_AUTH_TIE_BREAKER_PROB_MARGIN = 0.25  # slightly wider than the double_contact one -- err toward caution given this affects real scoring
+STRAIGHT_ARM_ELBOW_THRESHOLD = 0.5  # elbow_angle above this = leaning "straight arm" (team_to_serve); below = "bent" (service_authorization). STARTING VALUE -- tune with real data if it misfires.
+
 # DECISION_THRESHOLD: a class's sigmoid output must clear this to be
 # considered a confident detection at all. If NO class clears it,
 # the prediction is "nothing" -- this is the multi-label equivalent of
@@ -247,12 +270,37 @@ def is_peace_sign(finger_block_avg):
 
 def apply_tie_breaker(raw_sequence, top1_label, top2_label, top1_prob, top2_prob):
     """
-    UNCHANGED in logic, only the caller now passes sigmoid-derived
-    top1/top2 (from the 7 real-class outputs) instead of softmax
-    values. Only fires when BOTH top1 and top2 are real classes in
-    CONFUSABLE_CLASSES and close in score -- never fires when the
-    predicted label is "nothing" (nothing to break a tie against).
+    Two independent tie-breaker checks, tried in order:
+
+    1. NEW SAFETY CHECK: team_to_serve_X vs. service_authorization_X
+       (same side) -- uses elbow angle (straight arm = team_to_serve,
+       bent elbow = service_authorization) to prevent a slow/deliberate
+       service_authorization from being misread as a SCORING gesture.
+       This is checked FIRST and with its own (wider) margin, since a
+       wrong call here means an incorrectly awarded point, not just a
+       display mixup.
+
+    2. UNCHANGED: double_contact vs. service_authorization_left/right,
+       using peace-sign finger detection. Only fires when BOTH top1 and
+       top2 are in CONFUSABLE_CLASSES and close in score.
+
+    Neither ever fires when the predicted label is "nothing" -- nothing
+    to break a tie against.
     """
+    label_pair = frozenset({top1_label, top2_label})
+    if label_pair in SAME_SIDE_SCORE_AUTH_PAIRS and (top1_prob - top2_prob) <= SCORE_AUTH_TIE_BREAKER_PROB_MARGIN:
+        side = SAME_SIDE_SCORE_AUTH_PAIRS[label_pair]
+        elbow_idx = LEFT_ELBOW_ANGLE_IDX if side == "left" else RIGHT_ELBOW_ANGLE_IDX
+        avg_elbow_angle = raw_sequence[:, elbow_idx].mean()
+
+        scoring_label = f"team_to_serve_{side}"
+        auth_label = f"service_authorization_{side}"
+
+        if avg_elbow_angle >= STRAIGHT_ARM_ELBOW_THRESHOLD:
+            return scoring_label
+        else:
+            return auth_label
+
     if top1_label not in CONFUSABLE_CLASSES or top2_label not in CONFUSABLE_CLASSES:
         return top1_label
 
