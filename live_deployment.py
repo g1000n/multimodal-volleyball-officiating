@@ -106,13 +106,20 @@ GAME_WIN_BY_MARGIN = 2
 FAST_HAND_CROP_MODE = False
 
 # WHISTLE_DEVICE_INDEX: which mic sounddevice should actually use. None =
-# OS default -- NOT recommended, since the OS default silently picked the
-# wrong device (a virtual Camo mic channel) during earlier testing, with no
-# error, just total silence. Set this to whatever index you confirmed
-# working when testing whistle_detector.py directly (run
-# `python -c "import sounddevice as sd; print(sd.query_devices())"` to see
-# the list again if you need to re-check it on game day, in case Windows
-# picks a different default after a reboot/reconnect).
+# OS default -- NOT recommended. The OS default silently picked the wrong
+# device (a Camo virtual mic channel) during earlier testing, with no error,
+# just total silence.
+#
+# IMPORTANT (updated): this project now DELIBERATELY routes the referee's
+# mic (iPhone 13) through Camo Studio's audio-source selection, alongside
+# the iPhone 14 camera feed -- see HARDWARE_SETUP.md. That means seeing a
+# "Camo" device in the input list is now EXPECTED and CORRECT, not the bug
+# described above. The actual risk today is subtler: since both phones are
+# now connected through the same app, you must confirm Camo Studio's Audio
+# Settings are actually pointed at the iPhone 13 (not defaulting to the
+# iPhone 14's own mic). Run list_mics.py and verify by testing -- blow a
+# whistle near the iPhone 13, talk near the iPhone 14, and confirm the
+# device you're about to set below is picking up the iPhone 13 specifically.
 WHISTLE_DEVICE_INDEX = None  # TUNABLE -- set to your confirmed-working index, e.g. 3
 
 # REQUIRE_WHISTLE_FOR_SCORING: set True to make a real detected whistle
