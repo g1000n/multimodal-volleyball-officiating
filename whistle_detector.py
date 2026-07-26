@@ -77,6 +77,13 @@ GATE_MAX_PITCH_INSTABILITY = 20.0   # CHANGED from 15.0 -- a real session log sh
 # a DIFFERENT mic later (e.g. the real game-day phone setup), re-check this value
 # against a fresh log rather than assuming it still fits -- this is mic-specific,
 # not a universal constant.
+#
+# NOTE: routing the referee mic (iPhone 13) through Camo Studio's audio-source
+# selection (see HARDWARE_SETUP.md) still counts as "a different mic" for this
+# purpose -- Camo's own audio processing/compression sits between the phone's
+# mic and this script, same as any other capture path. Re-verify this gate
+# against a fresh session log the first time you test with that setup, don't
+# assume the WO Mic-era numbers still hold.
 
 SOS_BANDPASS = butter(4, [1800, 4800], btype='bandpass', fs=SR, output='sos')
 
