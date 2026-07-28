@@ -105,21 +105,27 @@ GAME_WIN_BY_MARGIN = 2
 # hurt accuracy with a real test tonight. Leave False if you haven't.
 FAST_HAND_CROP_MODE = False
 
+# RECORD_RAW_FOOTAGE: saves the pure camera feed (no skeleton, no UI text,
+# no overlays -- exactly what the camera captured) to a video file, so you
+# can later replay that EXACT real session through the pipeline via
+# replay_recorded_footage.py to test code changes against real, previously-
+# observed footage -- stronger validation than isolated reference clips,
+# since it preserves real continuous timing/transitions/motion.
+RECORD_RAW_FOOTAGE = True  # TUNABLE
+RECORDINGS_DIR = "data/raw_recordings"
+RAW_RECORD_FPS = 10  # TUNABLE. Matches your measured real live throughput,
+# not the camera's nominal rate -- keeps replay pacing close to how the
+# session actually felt live. Re-check against your own measured_fps
+# readout if your setup changes.
+
 # WHISTLE_DEVICE_INDEX: which mic sounddevice should actually use. None =
-# OS default -- NOT recommended. The OS default silently picked the wrong
-# device (a Camo virtual mic channel) during earlier testing, with no error,
-# just total silence.
-#
-# IMPORTANT (updated): this project now DELIBERATELY routes the referee's
-# mic (iPhone 13) through Camo Studio's audio-source selection, alongside
-# the iPhone 14 camera feed -- see HARDWARE_SETUP.md. That means seeing a
-# "Camo" device in the input list is now EXPECTED and CORRECT, not the bug
-# described above. The actual risk today is subtler: since both phones are
-# now connected through the same app, you must confirm Camo Studio's Audio
-# Settings are actually pointed at the iPhone 13 (not defaulting to the
-# iPhone 14's own mic). Run list_mics.py and verify by testing -- blow a
-# whistle near the iPhone 13, talk near the iPhone 14, and confirm the
-# device you're about to set below is picking up the iPhone 13 specifically.
+# OS default -- NOT recommended, since the OS default silently picked the
+# wrong device (a virtual Camo mic channel) during earlier testing, with no
+# error, just total silence. Set this to whatever index you confirmed
+# working when testing whistle_detector.py directly (run
+# `python -c "import sounddevice as sd; print(sd.query_devices())"` to see
+# the list again if you need to re-check it on game day, in case Windows
+# picks a different default after a reboot/reconnect).
 WHISTLE_DEVICE_INDEX = None  # TUNABLE -- set to your confirmed-working index, e.g. 3
 
 # REQUIRE_WHISTLE_FOR_SCORING: set True to make a real detected whistle
@@ -441,6 +447,23 @@ def main():
         print(f"ERROR: could not open camera at index {CAMERA_INDEX}.")
         return
 
+    raw_writer = None
+    raw_recording_path = None
+    if RECORD_RAW_FOOTAGE:
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        os.makedirs(RECORDINGS_DIR, exist_ok=True)
+        raw_recording_path = os.path.join(RECORDINGS_DIR, f"raw_{int(session_start_time)}.mp4")
+        # RAW_RECORD_FPS: the fps we WRITE the file at, not necessarily what
+        # the camera delivers -- since your measured live throughput is
+        # ~10fps (not the camera's nominal rate), writing one frame per real
+        # loop iteration at this fps keeps playback pacing close to how it
+        # was actually experienced live. See replay_recorded_footage.py,
+        # which paces itself off the file's own fps for exactly this reason.
+        raw_writer = cv2.VideoWriter(raw_recording_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                      RAW_RECORD_FPS, (frame_w, frame_h))
+        print(f"Recording RAW (no overlay) footage to: {raw_recording_path}")
+
     rolling_window = deque(maxlen=ROLLING_WINDOW_FRAMES)
     streak_label = None
     streak_count = 0
@@ -495,6 +518,9 @@ def main():
         success, frame = cap.read()
         if not success:
             break
+
+        if raw_writer is not None:
+            raw_writer.write(frame)  # RAW frame, before any overlay drawing happens below
 
         frame_height, frame_width = frame.shape[:2]
         fps_frame_times.append(time.time())
@@ -713,6 +739,8 @@ def main():
             print("  -> MANUAL: cleared last reason for the current point")
 
     cap.release()
+    if raw_writer is not None:
+        raw_writer.release()
     cv2.destroyAllWindows()
     pose_model.close()
     hands_model.close()
@@ -723,6 +751,8 @@ def main():
 
     print(f"\nLog saved to: {log_path}")
     print(f"Strict log saved to: {strict_log_path}")
+    if raw_recording_path is not None:
+        print(f"Raw footage saved to: {raw_recording_path}")
     print(f"Final score (informational whistle): LEFT {engine.score['left']} - {engine.score['right']} RIGHT")
     print(f"Final score (strict, whistle-required): LEFT {strict_engine.score['left']} - {strict_engine.score['right']} RIGHT")
 
