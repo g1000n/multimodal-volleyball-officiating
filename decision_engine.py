@@ -164,9 +164,7 @@ class DecisionEngine:
         self.last_reason = None
 
     def on_whistle_detected(self, timestamp=None):
-        # Whistles are never blocked by the settle window -- they're
-        # the deliberate start of the next step, not tail-end noise.
-        self.last_whistle_time = timestamp or time.time()
+        self.last_whistle_time = timestamp if timestamp is not None else time.time()
 
     def _check_set_over(self):
         """Returns True if the current score satisfies the win condition."""
@@ -196,7 +194,7 @@ class DecisionEngine:
         self.last_authorization_time = None
 
     def on_gesture_detected(self, label, timestamp=None):
-        timestamp = timestamp or time.time()
+        timestamp = timestamp if timestamp is not None else time.time()
 
         if self.set_over:
             return {"event": "ignored", "reason": "set already over -- call reset_for_new_set() to continue"}
