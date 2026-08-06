@@ -20,17 +20,66 @@ existing timing logic needs to change or be reimplemented.
 
 LIMITATION: this replays VIDEO only, not audio -- whistle events aren't
 in the raw recording. Press W manually at the right moments while
-watching the replay if you want to test whistle-gated behavior, or just
-leave REQUIRE_WHISTLE_FOR_SCORING as False (its default) and let the
-informational-only whistle handling apply, same as an unwired session.
+watching the replay if you want to test whistle-gated behavior.
+
+--------------------------------------------------------------------
+SYNC PASS (this version) -- brings this script back in line with
+live_deployment.py and the new decision_engine.py, after it was found
+to have silently drifted out of sync:
+
+1. RACE-CONDITION FIX PORTED IN: this script was missing the
+   cancellation-priority check entirely -- it still checked the
+   pending-confirmation TIMEOUT first, exactly the bug that was fixed
+   in live_deployment.py. Ported the same top-priority cancellation
+   block over, so a replay through this script now actually exercises
+   (and can validate) that fix, instead of silently running the old
+   buggy ordering.
+
+2. CANCELLATION NOW COMMITS THE AUTHORIZATION: previously, cancelling
+   a pending team_to_serve because a same-side service_authorization
+   streak took over just cleared local state -- it never told
+   decision_engine.py about the authorization at all. The NEW
+   decision_engine.py needs that on_gesture_detected() call to
+   register the authorization and consume its whistle (Phase 1 of the
+   real FIVB two-whistle sequence). Both cancellation sites (the
+   top-priority check, and the mirrored check inside the streak-commit
+   branch) now call do_commit() for the authorization gesture instead
+   of only clearing state.
+
+3. REQUIRE_WHISTLE_FOR_SCORING = True FOR THIS TEST (was False,
+   matching live_deployment.py's informational-only default). Left
+   False, the whistle gets silently refilled every processed frame
+   regardless of real whistle events, which makes the new engine's
+   two-whistle enforcement a no-op -- you'd never actually see whether
+   it works. Set to True here so pressing W (twice, once before
+   service_authorization and once before team_to_serve) is what
+   actually drives scoring during this replay. Flip back to False if
+   you just want an ordinary informational-only replay.
+--------------------------------------------------------------------
 
 USAGE:
     python replay_recorded_footage.py data/raw_recordings/raw_1785010000.mp4
 
 Controls (during replay):
-  Q / ESC - quit
-  W - manual whistle (informational, same as live_deployment.py's default)
-  SPACE - pause/resume the replay itself
+  Q / ESC   - quit
+  W         - manual whistle (REQUIRED for scoring in this version -- see above)
+  SPACE     - pause/resume. FIX (this version): resuming now clears
+              rolling_window/streak/pending state, exactly like
+              live_deployment.py's P key does. Previously this only
+              toggled playback and left old wall-clock timestamps in
+              place -- since real time keeps passing while paused, that
+              made TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS/STALE_VOTE_SECONDS
+              look like they'd already elapsed the instant you resumed,
+              causing phantom immediate timeouts/commits that have
+              nothing to do with the actual footage.
+  A / D     - seek back / forward 5 seconds
+  J / L     - seek back / forward 30 seconds
+              Seeking also clears stream state (same reason as pause --
+              the rolling window would otherwise mix frames from two
+              unrelated points in time). NOTE: seek precision on mp4
+              depends on nearby keyframes -- it may land a little before
+              or after the exact second requested; use the small 5s
+              seek to fine-tune once you're close.
 """
 
 import sys
@@ -79,16 +128,32 @@ TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS = 2.0
 MIN_POSE_DETECTED_FRACTION = 0.5
 GAME_WIN_SCORE = 25
 GAME_WIN_BY_MARGIN = 2
-REQUIRE_WHISTLE_FOR_SCORING = False
 
+SEEK_SMALL_SECONDS = 5
+SEEK_LARGE_SECONDS = 30
+
+# CHANGED: True for this test, so the new decision_engine.py's two-whistle
+# enforcement (service_authorization consumes whistle #1, team_to_serve
+# needs a genuine distinct whistle #2) actually gets exercised during
+# replay instead of being silently bypassed. Press W twice per cycle,
+# once before service_authorization, once before team_to_serve.
+REQUIRE_WHISTLE_FOR_SCORING = True
+
+# NOTE: display text is flipped relative to the model's literal class
+# names. The gesture classes are named after the REFEREE's own
+# left/right (how the data was filmed/labeled), but what's shown on
+# screen -- and what actually gets scored, see decision_engine.py's
+# GESTURE_TO_SCORE_SIDE -- should reflect the audience/court-facing
+# side instead, so what you see on the gesture history bar matches
+# which side of the scoreboard just moved.
 DISPLAY_NAME = {
-    "team_to_serve_left": "Team to Serve Left",
-    "team_to_serve_right": "Team to Serve Right",
+    "team_to_serve_left": "Team to Serve Right",
+    "team_to_serve_right": "Team to Serve Left",
     "ball_out": "Ball Out",
     "double_contact": "Double Contact",
     "end_of_set": "End of Set",
-    "service_authorization_left": "Service Auth. Left",
-    "service_authorization_right": "Service Auth. Right",
+    "service_authorization_left": "Service Auth. Right",
+    "service_authorization_right": "Service Auth. Left",
     "ball_in": "Ball In",
     "ball_touched": "Ball Touched",
 }
@@ -183,6 +248,58 @@ def draw_gesture_history_bar(frame, history, frame_width, frame_height):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
 
+def parse_session_start_from_filename(video_path):
+    """
+    raw_<timestamp>.mp4 / fullwindow_<timestamp>.mp4 -- both written by
+    live_deployment.py using the SAME session_start_time (an epoch
+    seconds int). If this replay's filename matches that pattern,
+    returns the original session's start epoch as a float; otherwise
+    None. Lets the clock overlay show the frame's ORIGINAL absolute
+    timestamp (matching deployment_<session>.csv's "timestamp" column
+    directly), instead of only a relative video-elapsed time.
+    """
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    for prefix in ("raw_", "fullwindow_"):
+        if base.startswith(prefix):
+            digits = base[len(prefix):]
+            if digits.isdigit():
+                return float(digits)
+    return None
+
+
+def draw_realtime_clock(frame, frame_width, original_start, elapsed_video_seconds):
+    """
+    Small, unobtrusive clock overlay. If the original session's start
+    epoch could be parsed from the filename, shows the frame's ORIGINAL
+    absolute timestamp -- directly comparable to a row's "timestamp"
+    column in the deployment_<session>.csv this recording came from,
+    with no manual arithmetic needed. Otherwise falls back to a plain
+    video-elapsed counter, clearly labeled as such.
+    """
+    if original_start is not None:
+        absolute_ts = original_start + elapsed_video_seconds
+        text = f"orig T={absolute_ts:.2f}"
+    else:
+        text = f"video T+{elapsed_video_seconds:07.2f}s"
+    cv2.putText(frame, text, (frame_width - 190, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1, cv2.LINE_AA)
+
+
+def seek_relative(cap, seconds, video_fps):
+    """
+    Jump the video position forward/backward by `seconds`. Precision
+    depends on how far the nearest keyframe is on this particular mp4 --
+    may land a little before/after the exact target; use the small 5s
+    seek to fine-tune once you're close to the moment you want.
+    """
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    current_frame = cap.get(cv2.CAP_PROP_POS_FRAMES)
+    target_frame = max(0.0, current_frame + seconds * video_fps)
+    if total_frames > 0:  # some codecs don't report a reliable count -- don't clamp in that case
+        target_frame = min(target_frame, total_frames - 1)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+    return target_frame / video_fps if video_fps else 0.0
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python replay_recorded_footage.py <path_to_raw_recording.mp4>")
@@ -204,6 +321,21 @@ def main():
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 10.0
     frame_interval = 1.0 / video_fps
     print(f"Replaying {video_path} at {video_fps:.1f} fps (paced to match real timing).")
+
+    original_start = parse_session_start_from_filename(video_path)
+    if original_start is not None:
+        print(f"Recognized original session start ({original_start:.0f}) from filename -- "
+              f"clock overlay will show the ORIGINAL absolute timestamp, directly comparable "
+              f"to deployment_<session>.csv's 'timestamp' column.")
+    else:
+        print("Could not parse an original session timestamp from the filename -- "
+              "clock overlay will show video-relative elapsed time instead.")
+
+    if REQUIRE_WHISTLE_FOR_SCORING:
+        print("REQUIRE_WHISTLE_FOR_SCORING is True for this replay -- press W to whistle. "
+              "You need TWO distinct W presses per cycle: once before service_authorization, "
+              "once before team_to_serve.")
+    print("Controls: SPACE=pause/resume  A/D=seek 5s  J/L=seek 30s  W=whistle  Q/ESC=quit")
 
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, f"replay_{int(time.time())}.csv")
@@ -276,7 +408,39 @@ def main():
                 engine_event_this_frame = ""
                 engine_reason_this_frame = ""
 
-                if pending_scoring_label is not None and (now - pending_scoring_since) >= TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS:
+                # --------------------------------------------------
+                # RACE-CONDITION FIX (ported from live_deployment.py):
+                # check cancellation FIRST, with top priority, before
+                # the pending-timeout check below -- regardless of
+                # whether the timeout has also elapsed in this same
+                # instant. Previously this script checked the timeout
+                # first, which structurally let a slow, genuine
+                # service_authorization hold get misread as
+                # team_to_serve almost every time.
+                # --------------------------------------------------
+                cancel_check_triggered = False
+                if (pending_scoring_label is not None and streak_label is not None
+                        and streak_count >= FAULT_STREAK_NEEDED_TO_COMMIT):
+                    pending_side = SCORING_SIDE_MAP[pending_scoring_label]
+                    pending_same_side_auth = f"service_authorization_{pending_side}"
+                    if streak_label == pending_same_side_auth:
+                        # CHANGED: actually commit the authorization now,
+                        # instead of only clearing state -- the new
+                        # decision_engine.py needs this call to register
+                        # Phase 1 (service_authorization) and consume its
+                        # whistle.
+                        result = do_commit(streak_label, now)
+                        committed_label_this_frame = streak_label
+                        engine_event_this_frame = result["event"]
+                        engine_reason_this_frame = result.get("reason", "")
+                        pending_scoring_label = None
+                        streak_label, streak_count = None, 0
+                        cancel_check_triggered = True
+
+                if cancel_check_triggered:
+                    pass
+
+                elif pending_scoring_label is not None and (now - pending_scoring_since) >= TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS:
                     result = do_commit(pending_scoring_label, now)
                     committed_label_this_frame = pending_scoring_label
                     engine_event_this_frame = result["event"]
@@ -299,6 +463,12 @@ def main():
                             pending_side = SCORING_SIDE_MAP[pending_scoring_label]
                             pending_same_side_auth = f"service_authorization_{pending_side}"
                             if top_label == pending_same_side_auth:
+                                # CHANGED: same fix as above -- commit the
+                                # authorization instead of only clearing.
+                                result = do_commit(top_label, now)
+                                committed_label_this_frame = top_label
+                                engine_event_this_frame = result["event"]
+                                engine_reason_this_frame = result.get("reason", "")
                                 pending_scoring_label = None
                                 streak_label, streak_count = None, 0
                             else:
@@ -331,18 +501,45 @@ def main():
         if last_probs is not None:
             draw_probability_bars(frame, last_probs, real_labels)
         draw_gesture_history_bar(frame, list(gesture_history), frame_width, frame_height)
+        draw_realtime_clock(frame, frame_width, original_start, frame_counter / video_fps)
 
         cv2.imshow("REPLAY", frame)
 
         elapsed = time.time() - loop_start
         wait_ms = max(1, int((frame_interval - elapsed) * 1000))
         key = cv2.waitKey(wait_ms) & 0xFF
+
+        def clear_stream_state(reason):
+            nonlocal rolling_window, streak_label, streak_count, pending_scoring_label, frame_counter
+            rolling_window.clear()
+            streak_label, streak_count = None, 0
+            pending_scoring_label = None
+            frame_counter = 0
+            print(f"  -> cleared streak/rolling-window state ({reason})")
+
         if key == ord('q') or key == 27:
             break
         elif key == ord(' '):
             paused = not paused
+            if not paused:
+                # FIX: clear stale timing/stream state on resume, same as
+                # live_deployment.py's P key -- otherwise old wall-clock
+                # timestamps (pending_scoring_since, etc.) look like they
+                # elapsed instantly the moment you unpause, causing
+                # phantom timeouts unrelated to the actual footage.
+                clear_stream_state("resumed from pause")
         elif key == ord('w'):
             engine.on_whistle_detected(time.time())
+            print(f"  -> manual whistle at {time.time():.3f}")
+        elif key in (ord('a'), ord('d'), ord('j'), ord('l')):
+            seconds = {
+                ord('a'): -SEEK_SMALL_SECONDS,
+                ord('d'): SEEK_SMALL_SECONDS,
+                ord('j'): -SEEK_LARGE_SECONDS,
+                ord('l'): SEEK_LARGE_SECONDS,
+            }[key]
+            new_pos_seconds = seek_relative(cap, seconds, video_fps)
+            clear_stream_state(f"seeked to ~{new_pos_seconds:.1f}s")
 
     cap.release()
     cv2.destroyAllWindows()

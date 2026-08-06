@@ -4,27 +4,58 @@ live_deployment.py
 REAL DEPLOYMENT SCRIPT -- built directly on simulate_game_test.py's proven
 foundation (streak-based commit, pending-confirmation for team_to_serve vs
 service_authorization, pose-detection gate, settle window via
-decision_engine.py). Differences from the practice/simulation version:
+decision_engine.py).
 
-  1. REAL win condition: first to 25, win by 2 (not the shortened 7-point
-     practice target).
-  2. REAL whistle detection: tries to load whistle_detector.py's trained
-     model automatically. If the .pkl file isn't available yet (audio
-     teammate hasn't sent it), this FALLS BACK to the manual W-key
-     placeholder automatically and tells you clearly on-screen/console
-     which mode you're in -- you don't need to remember to flip a flag
-     under game-day pressure.
-  3. No guided-practice countdown/instruction scaffolding -- runs
-     continuously from the start, same instruction banner (whistle /
-     scoring_gesture / reason_gesture) as a live status indicator instead
-     of a practice guide.
+RECORDS TWO VIDEOS every session: a pure RAW feed (no overlay), and a FULL
+WINDOW recording (everything the BACKSTAGE window shows -- skeleton,
+probability bars, score, banners, gesture history -- pixel-exact match to
+what you saw live).
 
-ALL TUNABLE SETTINGS ARE MARKED BELOW, SAME AS simulate_game_test.py.
+--------------------------------------------------------------------
+SYNC PASS (this version) -- brings this in line with the new
+decision_engine.py (two-phase service_authorization design + the
+left/right scoring fix):
+
+1. CANCELLATION NOW COMMITS THE AUTHORIZATION: previously, cancelling
+   a pending team_to_serve because a same-side service_authorization
+   streak took over just cleared local state -- it never told
+   decision_engine.py about the authorization at all. The new engine
+   needs that on_gesture_detected() call to register Phase 1
+   (service_authorization) and consume its whistle. Both cancellation
+   sites (the top-priority race-condition-fixed check, and the
+   mirrored check inside the streak-commit branch) now call
+   do_commit() for the authorization gesture instead of only clearing
+   state.
+
+2. do_commit()'s expected_step LOGIC now handles the new
+   "authorization_acknowledged" event -- previously it fell through to
+   the generic else-branch (still logged/colored correctly, but the
+   on-screen banner never explicitly transitioned to "waiting for
+   whistle #2"). Now sets expected_step = "whistle" so the banner is
+   accurate.
+
+3. DISPLAY_NAME flipped (and ball_in/ball_touched added, matching
+   replay_recorded_footage.py). The gesture class names are tied to
+   the REFEREE's own left/right -- how the training data was filmed
+   and labeled -- but decision_engine.py's GESTURE_TO_SCORE_SIDE now
+   deliberately scores the OPPOSITE (audience/court-facing) side. This
+   dict's KEYS still match the real model class names (lookups still
+   work); only the printed VALUES changed, so what's shown on the
+   gesture history bar matches which side of the scoreboard just moved
+   instead of contradicting it.
+
+REQUIRE_WHISTLE_FOR_SCORING is still False by default here (informational
+whistle, matching the documented reason: detection isn't yet validated
+during actual gesture motion, only standing still). Flip to True only
+after that validation -- see replay_recorded_footage.py's version of
+this flag for how to test the new two-whistle enforcement without
+touching this default.
 
 Controls:
   W - manual whistle (only matters if real whistle detection isn't active)
   Q / ESC - quit
   S - toggle skeleton overlay
+  P - pause/resume (nothing gets processed while paused)
   [ / ] - manually adjust LEFT score down/up (mistake-correction safety net)
   - / + - manually adjust RIGHT score down/up
   R - manually clear the last-attached reason for the current point
@@ -71,86 +102,69 @@ LOG_DIR = "data/live_test_logs"
 # TUNABLE SETTINGS
 # ============================================================
 
-ROLLING_WINDOW_FRAMES = 24          # TUNABLE. Frames of context per classification.
-INFERENCE_EVERY_N_FRAMES = 3        # TUNABLE. Classify every Nth camera frame.
-STREAK_NEEDED_TO_COMMIT = 5         # TUNABLE. Consecutive confident hits needed for a SCORING
-# gesture (team_to_serve) specifically -- kept strict since being wrong here means an
-# incorrectly awarded point.
-FAULT_STREAK_NEEDED_TO_COMMIT = 3   # TUNABLE. Consecutive hits needed for a FAULT/reason
-# gesture (ball_out, double_contact, service_authorization_left/right, end_of_set) to commit,
-# AND for a same-side service_authorization to CANCEL a pending team_to_serve. Lower than the
-# scoring threshold on purpose -- real deployment logs showed genuine attempts often only
-# sustain 3-4 consecutive hits before naturally shifting to another label or ending, and a
-# wrong fault-reason is much lower-stakes than a wrong point.
-COMMIT_COOLDOWN_SECONDS = 2.0       # TUNABLE. Must stay ABOVE decision_engine.py's SETTLE_WINDOW_SECONDS.
-STALE_VOTE_SECONDS = 3.0            # TUNABLE. Old streak entries expire after this long.
-TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS = 2.0   # TUNABLE. Wait before confirming a scoring gesture.
-MIN_POSE_DETECTED_FRACTION = 0.5    # TUNABLE. Below this, force "nothing".
-HISTORY_CLEAR_AFTER_IDLE_SECONDS = 6.0  # TUNABLE. Gesture history bar clears itself after this
-# long with nothing new committed, instead of just capping at 8 entries and lingering forever.
+ROLLING_WINDOW_FRAMES = 24
+INFERENCE_EVERY_N_FRAMES = 3
+STREAK_NEEDED_TO_COMMIT = 5
+FAULT_STREAK_NEEDED_TO_COMMIT = 3
+COMMIT_COOLDOWN_SECONDS = 2.0
+STALE_VOTE_SECONDS = 3.0
+TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS = 2.0
+MIN_POSE_DETECTED_FRACTION = 0.5
+HISTORY_CLEAR_AFTER_IDLE_SECONDS = 6.0
+CONSOLE_REFRESH_AFTER_IDLE_SECONDS = 8.0
 
-CONSOLE_REFRESH_AFTER_IDLE_SECONDS = 8.0   # TUNABLE. Clears the terminal after
-# this many seconds of continuous "nothing" (no streak building, no manual key
-# presses) since the last real activity -- keeps the console from endlessly
-# stacking prints. The CSV log still records everything regardless of this --
-# only the on-screen terminal history is cleared, not the actual data.
-
-# REAL game win condition -- NOT the shortened practice target.
 GAME_WIN_SCORE = 25
 GAME_WIN_BY_MARGIN = 2
 
-# FAST_HAND_CROP_MODE: forces extract_keypoints.py's LIVE_FAST_MODE, capping
-# hand detection to ONE MediaPipe Hands call per frame instead of up to two.
-# UNTESTED as of writing -- only enable this if you've verified it doesn't
-# hurt accuracy with a real test tonight. Leave False if you haven't.
 FAST_HAND_CROP_MODE = False
 
 # RECORD_RAW_FOOTAGE: saves the pure camera feed (no skeleton, no UI text,
 # no overlays -- exactly what the camera captured) to a video file, so you
 # can later replay that EXACT real session through the pipeline via
 # replay_recorded_footage.py to test code changes against real, previously-
-# observed footage -- stronger validation than isolated reference clips,
-# since it preserves real continuous timing/transitions/motion.
+# observed footage.
 RECORD_RAW_FOOTAGE = True  # TUNABLE
 RECORDINGS_DIR = "data/raw_recordings"
-RAW_RECORD_FPS = 10  # TUNABLE. Matches your measured real live throughput,
-# not the camera's nominal rate -- keeps replay pacing close to how the
-# session actually felt live. Re-check against your own measured_fps
-# readout if your setup changes.
+RAW_RECORD_FPS = 10  # TUNABLE. Matches your measured real live throughput.
 
-# WHISTLE_DEVICE_INDEX: which mic sounddevice should actually use. None =
-# OS default -- NOT recommended, since the OS default silently picked the
-# wrong device (a virtual Camo mic channel) during earlier testing, with no
-# error, just total silence. Set this to whatever index you confirmed
-# working when testing whistle_detector.py directly (run
-# `python -c "import sounddevice as sd; print(sd.query_devices())"` to see
-# the list again if you need to re-check it on game day, in case Windows
-# picks a different default after a reboot/reconnect).
+# RECORD_FULL_WINDOW_FOOTAGE: saves a SECOND video -- exactly what the
+# BACKSTAGE window shows live: skeleton, probability bars, score bar,
+# instruction banner, gesture history, everything. Captured from the same
+# fully-overlaid frame right before it's displayed, so it's a pixel-exact
+# recording of what you saw during the session.
+RECORD_FULL_WINDOW_FOOTAGE = True  # TUNABLE
+FULL_WINDOW_RECORD_FPS = RAW_RECORD_FPS  # kept identical so both videos stay frame-synced
+
 WHISTLE_DEVICE_INDEX = None  # TUNABLE -- set to your confirmed-working index, e.g. 3
 
-# REQUIRE_WHISTLE_FOR_SCORING: set True to make a real detected whistle
-# GATE scoring (decision_engine.py's normal, strict behavior). Default
-# False given a real, demonstrated risk: whistle detection was only
-# validated standing still, close to the mic, blowing cleanly -- during
-# actual gesture performance (movement, distance, breathing, ambient
-# noise) it may not fire reliably, and a missed detection would silently
-# cost a real point. With this False, the real detector still runs, still
-# shows the on-screen "WHISTLE!" flash, and still logs every detection --
-# it's purely informational and does not block scoring. Flip to True only
-# once you've validated whistle detection holds up during actual gesture
-# performance, not just standing still.
 REQUIRE_WHISTLE_FOR_SCORING = False  # TUNABLE
 
+# NOTE: display text is flipped relative to the model's literal class
+# names. The gesture classes are named after the REFEREE's own
+# left/right (how the data was filmed/labeled), but what's shown on
+# screen -- and what actually gets scored, see decision_engine.py's
+# GESTURE_TO_SCORE_SIDE -- should reflect the audience/court-facing
+# side instead, so what you see on the gesture history bar matches
+# which side of the scoreboard just moved.
 DISPLAY_NAME = {
-    "team_to_serve_left": "Team to Serve Left",
-    "team_to_serve_right": "Team to Serve Right",
+    "team_to_serve_left": "Team to Serve Right",
+    "team_to_serve_right": "Team to Serve Left",
     "ball_out": "Ball Out",
     "double_contact": "Double Contact",
     "end_of_set": "End of Set",
-    "service_authorization_left": "Service Auth. Left",
-    "service_authorization_right": "Service Auth. Right",
+    "service_authorization_left": "Service Auth. Right",
+    "service_authorization_right": "Service Auth. Left",
+    "ball_in": "Ball In",
+    "ball_touched": "Ball Touched",
 }
 
+# NOTE: this map is INTERNAL bookkeeping only -- it pairs a pending
+# team_to_serve gesture with its same-side service_authorization
+# cancellation partner (both tied to the model's own literal class-name
+# suffix, i.e. the REFEREE's side, not the scored side). It must NOT be
+# flipped -- the actual score-side flip lives entirely in
+# decision_engine.py's GESTURE_TO_SCORE_SIDE, applied only once
+# do_commit() calls into the engine.
 SCORING_SIDE_MAP = {"team_to_serve_left": "left", "team_to_serve_right": "right"}
 
 mp_pose = mp.solutions.pose
@@ -174,8 +188,6 @@ def load_model():
 
 
 def try_load_whistle_detector(on_whistle):
-    """Returns a started WhistleDetector, or None if the model file isn't
-    available yet -- caller falls back to manual W-key mode either way."""
     try:
         from whistle_detector import WhistleDetector
     except ImportError:
@@ -241,7 +253,6 @@ def extract_frame_features(frame_rgb, pose_model, hands_model):
 
 
 def draw_skeleton_overlay(frame, draw_info):
-    frame_height, frame_width = frame.shape[:2]
     pose_results = draw_info["pose_results"]
     if pose_results.pose_landmarks is not None:
         mp_drawing.draw_landmarks(
@@ -316,12 +327,6 @@ SCOREBOARD_HEIGHT = 400
 
 
 def build_scoreboard_canvas(engine, paused):
-    """
-    Builds a clean, audience-facing scoreboard image -- NOT the camera feed,
-    a separate blank canvas, big and legible from a distance (second
-    monitor/projector). Shown in its own window, separate from the
-    behind-the-scenes control window.
-    """
     canvas = np.zeros((SCOREBOARD_HEIGHT, SCOREBOARD_WIDTH, 3), dtype=np.uint8)
     canvas[:] = (25, 25, 25)
 
@@ -356,8 +361,6 @@ def build_scoreboard_canvas(engine, paused):
 
 
 def draw_strict_score_small(frame, strict_engine, frame_width):
-    """Small, unobtrusive readout of the background strict (whistle-required)
-    engine -- not the real/displayed score, just comparison data."""
     text = f"[if whistle required] L {strict_engine.score['left']} - {strict_engine.score['right']} R"
     cv2.putText(frame, text, (frame_width - 260, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
 
@@ -375,15 +378,6 @@ def draw_gesture_history_bar(frame, history, frame_width, frame_height):
 def main():
     model, idx_to_real_label, real_labels = load_model()
     engine = DecisionEngine(win_score=GAME_WIN_SCORE, win_by_margin=GAME_WIN_BY_MARGIN)
-    # PARALLEL STRICT ENGINE: same real gesture commits, same real whistle
-    # detections, but requires the whistle for scoring (decision_engine.py's
-    # normal, unmodified behavior). Runs entirely in the background -- never
-    # displayed as the primary score, never affects expected_step/gesture
-    # flow, purely for comparison data on whether strict whistle-gating
-    # would have worked, without betting the actual live score on it.
-    # TEMPORAL_WINDOW (10.0s) is shared from decision_engine.py's module
-    # constant for both engines -- already generous enough for real
-    # gesture/whistle timing mismatches.
     strict_engine = DecisionEngine(win_score=GAME_WIN_SCORE, win_by_margin=GAME_WIN_BY_MARGIN)
 
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -396,9 +390,6 @@ def main():
                           "score_left", "score_right",
                           "strict_score_left", "strict_score_right"])
 
-    # SEPARATE dedicated log for the background strict (whistle-required)
-    # engine -- its own file, own events, so it can be reviewed and
-    # compared independently against a full match recording afterward.
     strict_log_path = os.path.join(LOG_DIR, f"deployment_strict_{int(session_start_time)}.csv")
     strict_log_file = open(strict_log_path, "w", newline="")
     strict_log_writer = csv.writer(strict_log_file)
@@ -408,22 +399,14 @@ def main():
     print(f"Logging to: {log_path}")
     print(f"Strict (whistle-required) log: {strict_log_path}")
     print(f"SESSION START (epoch seconds): {session_start_time:.3f}")
-    print("If you're recording the whole match on video, note this number (or when the "
-          "recording actually starts) -- every row's timestamp is a real epoch second, so "
-          "elapsed_video_time = row_timestamp - session_start_time lets you find the exact "
-          "moment in the recording that corresponds to any logged event.")
     print(f"REAL GAME: first to {GAME_WIN_SCORE}, win by {GAME_WIN_BY_MARGIN}.\n")
 
     whistle_mode = {"value": "manual"}
     whistle_flash_until_holder = {"value": 0.0}
 
     def on_whistle(timestamp, confidence=None):
-        # Always feeds the engine (harmless either way) and always shows/logs
-        # the flash -- when REQUIRE_WHISTLE_FOR_SCORING is False, this isn't
-        # what's actually gating scoring (see the per-frame auto-refresh
-        # below), it's purely the visible/logged "a whistle was heard" record.
         engine.on_whistle_detected(timestamp)
-        strict_engine.on_whistle_detected(timestamp)  # ONLY real detections feed strict_engine -- no auto-refresh for this one
+        strict_engine.on_whistle_detected(timestamp)
         strict_log_writer.writerow([f"{timestamp:.3f}", "whistle", "", "", "",
                                      strict_engine.score["left"], strict_engine.score["right"]])
         strict_log_file.flush()
@@ -454,15 +437,20 @@ def main():
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         os.makedirs(RECORDINGS_DIR, exist_ok=True)
         raw_recording_path = os.path.join(RECORDINGS_DIR, f"raw_{int(session_start_time)}.mp4")
-        # RAW_RECORD_FPS: the fps we WRITE the file at, not necessarily what
-        # the camera delivers -- since your measured live throughput is
-        # ~10fps (not the camera's nominal rate), writing one frame per real
-        # loop iteration at this fps keeps playback pacing close to how it
-        # was actually experienced live. See replay_recorded_footage.py,
-        # which paces itself off the file's own fps for exactly this reason.
         raw_writer = cv2.VideoWriter(raw_recording_path, cv2.VideoWriter_fourcc(*"mp4v"),
                                       RAW_RECORD_FPS, (frame_w, frame_h))
         print(f"Recording RAW (no overlay) footage to: {raw_recording_path}")
+
+    full_window_writer = None
+    full_window_recording_path = None
+    if RECORD_FULL_WINDOW_FOOTAGE:
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        os.makedirs(RECORDINGS_DIR, exist_ok=True)
+        full_window_recording_path = os.path.join(RECORDINGS_DIR, f"fullwindow_{int(session_start_time)}.mp4")
+        full_window_writer = cv2.VideoWriter(full_window_recording_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                              FULL_WINDOW_RECORD_FPS, (frame_w, frame_h))
+        print(f"Recording FULL WINDOW (everything shown live) footage to: {full_window_recording_path}")
 
     rolling_window = deque(maxlen=ROLLING_WINDOW_FRAMES)
     streak_label = None
@@ -482,7 +470,7 @@ def main():
     pending_scoring_since = 0.0
 
     expected_step = "whistle"
-    paused = True  # START paused -- gives you time to position/arrange both windows before anything gets processed
+    paused = True
     last_scoreboard_state = [None]
     last_scoreboard_canvas = [build_scoreboard_canvas(engine, paused)]
     fps_frame_times = deque(maxlen=30)
@@ -493,7 +481,7 @@ def main():
         nonlocal last_decision_text, last_decision_color, last_decision_time
         nonlocal last_committed_label, last_commit_time, expected_step
         result = engine.on_gesture_detected(label, now)
-        strict_result = strict_engine.on_gesture_detected(label, now)  # same real event, background-only, never affects display/flow
+        strict_result = strict_engine.on_gesture_detected(label, now)
         strict_log_writer.writerow([f"{now:.3f}", "gesture", label, strict_result["event"],
                                      strict_result.get("reason", ""),
                                      strict_engine.score["left"], strict_engine.score["right"]])
@@ -509,6 +497,13 @@ def main():
                 expected_step = "reason_gesture"
             elif result["event"] == "reason_attached":
                 expected_step = "whistle"
+            elif result["event"] == "authorization_acknowledged":
+                # CHANGED: previously fell through unhandled -- now
+                # correctly shows "waiting for whistle #2" next, since
+                # the engine just consumed whistle #1 for this
+                # authorization and needs a genuine second whistle
+                # before team_to_serve can be accepted.
+                expected_step = "whistle"
         last_decision_time = now
         last_committed_label = label
         last_commit_time = now
@@ -520,7 +515,7 @@ def main():
             break
 
         if raw_writer is not None:
-            raw_writer.write(frame)  # RAW frame, before any overlay drawing happens below
+            raw_writer.write(frame)
 
         frame_height, frame_width = frame.shape[:2]
         fps_frame_times.append(time.time())
@@ -561,7 +556,30 @@ def main():
             engine_event_this_frame = ""
             engine_reason_this_frame = ""
 
-            if pending_scoring_label is not None and (now - pending_scoring_since) >= TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS:
+            cancel_check_triggered = False
+            if (pending_scoring_label is not None and streak_label is not None
+                    and streak_count >= FAULT_STREAK_NEEDED_TO_COMMIT):
+                pending_side = SCORING_SIDE_MAP[pending_scoring_label]
+                pending_same_side_auth = f"service_authorization_{pending_side}"
+                if streak_label == pending_same_side_auth:
+                    # CHANGED: actually commit the authorization to the
+                    # engine now, instead of only clearing local state.
+                    # The new decision_engine.py needs this call to
+                    # register Phase 1 (service_authorization) and
+                    # consume its whistle.
+                    result = do_commit(streak_label, now)
+                    committed_label_this_frame = streak_label
+                    engine_event_this_frame = result["event"]
+                    engine_reason_this_frame = result.get("reason", "")
+                    pending_scoring_label = None
+                    streak_label = None
+                    streak_count = 0
+                    cancel_check_triggered = True
+
+            if cancel_check_triggered:
+                pass
+
+            elif pending_scoring_label is not None and (now - pending_scoring_since) >= TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS:
                 result = do_commit(pending_scoring_label, now)
                 committed_label_this_frame = pending_scoring_label
                 engine_event_this_frame = result["event"]
@@ -570,14 +588,6 @@ def main():
                 streak_label = None
                 streak_count = 0
                 rolling_window.clear()
-                # FIX: this path (plain confirmation-delay timeout, most common
-                # when team_to_serve is performed slowly) never bypassed the
-                # settle window -- meaning whatever fault gesture came next
-                # almost always got rejected as "settle window active" too,
-                # same root cause as the fault-arrives-early path fixed
-                # earlier. Bypassing here too, since the streak requirement +
-                # elbow-angle check + pose gate already substantially cover
-                # what the settle window was originally protecting against.
                 engine.last_settle_start_time = None
                 strict_engine.last_settle_start_time = None
 
@@ -596,9 +606,12 @@ def main():
                         pending_same_side_auth = f"service_authorization_{pending_side}"
 
                         if top_label == pending_same_side_auth:
-                            last_decision_text = f"{pending_scoring_label} cancelled -> was {top_label}"
-                            last_decision_color = (0, 165, 255)
-                            last_decision_time = now
+                            # CHANGED: same fix as above -- commit the
+                            # authorization instead of only clearing.
+                            result = do_commit(top_label, now)
+                            committed_label_this_frame = top_label
+                            engine_event_this_frame = result["event"]
+                            engine_reason_this_frame = result.get("reason", "")
                             pending_scoring_label = None
                             streak_label = None
                             streak_count = 0
@@ -608,17 +621,6 @@ def main():
                             engine_event_this_frame = result["event"]
                             engine_reason_this_frame = result.get("reason", "")
                             pending_scoring_label = None
-
-                            # FIX: without this, the fault gesture (top_label)
-                            # would need its OWN separate commit attempt on the
-                            # NEXT cycle -- landing well within
-                            # decision_engine.py's SETTLE_WINDOW_SECONDS (1.5s),
-                            # which was rejecting it as "settle window active"
-                            # every single time. This isn't a spurious tail-end
-                            # spike the settle window is meant to catch -- it's
-                            # the deliberate fast-confirm mechanism -- so bypass
-                            # the settle window just this once and commit the
-                            # fault gesture as the reason in the SAME instant.
                             engine.last_settle_start_time = None
                             strict_engine.last_settle_start_time = None
                             fault_result = do_commit(top_label, now)
@@ -687,12 +689,10 @@ def main():
         cv2.putText(frame, "(click this window: Q/ESC=quit  P=pause/resume  W=manual whistle  [/]=left score  -/+=right score  R=clear reason)",
                     (10, frame_height - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
 
+        if full_window_writer is not None:
+            full_window_writer.write(frame)
+
         cv2.imshow("BACKSTAGE (control)", frame)
-        # OPTIMIZATION: only rebuild the scoreboard canvas when something on
-        # it actually changed -- rebuilding a fresh image with several
-        # cv2.putText calls every single frame (most of which the score is
-        # unchanged) was real, avoidable per-frame overhead on top of an
-        # already fps-sensitive pipeline.
         current_scoreboard_state = (engine.score["left"], engine.score["right"], paused, engine.set_over)
         if current_scoreboard_state != last_scoreboard_state[0]:
             last_scoreboard_canvas[0] = build_scoreboard_canvas(engine, paused)
@@ -705,9 +705,6 @@ def main():
         elif key == ord('p'):
             paused = not paused
             if not paused:
-                # Clear anything that accumulated before/around the pause --
-                # don't let stale frames from the referee moving out of
-                # position feed into the next real classification.
                 rolling_window.clear()
                 streak_label = None
                 streak_count = 0
@@ -741,6 +738,8 @@ def main():
     cap.release()
     if raw_writer is not None:
         raw_writer.release()
+    if full_window_writer is not None:
+        full_window_writer.release()
     cv2.destroyAllWindows()
     pose_model.close()
     hands_model.close()
@@ -753,6 +752,8 @@ def main():
     print(f"Strict log saved to: {strict_log_path}")
     if raw_recording_path is not None:
         print(f"Raw footage saved to: {raw_recording_path}")
+    if full_window_recording_path is not None:
+        print(f"Full-window footage saved to: {full_window_recording_path}")
     print(f"Final score (informational whistle): LEFT {engine.score['left']} - {engine.score['right']} RIGHT")
     print(f"Final score (strict, whistle-required): LEFT {strict_engine.score['left']} - {strict_engine.score['right']} RIGHT")
 

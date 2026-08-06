@@ -7,7 +7,7 @@ to a fixed length, trains the CNN-LSTM model, and evaluates on the
 held-out test set.
 
 --------------------------------------------------------------------
-ARCHITECTURE CHANGE (this version): switched from single-label
+ARCHITECTURE CHANGE (earlier version): switched from single-label
 CrossEntropyLoss/softmax (8-way mutually-exclusive classification,
 "nothing" as its own competing output neuron) to multi-label
 BCEWithLogitsLoss/sigmoid (7-way INDEPENDENT per-class detection,
@@ -20,12 +20,44 @@ ambiguity (idle standing, mid-gesture transitions), the model is
 FORCED to push relative confidence toward SOME class, and an
 underrepresented "nothing" class's inflated weight could win that
 competition and steal confidence from real gestures. Under
-independent sigmoid outputs, each of the 7 REAL gesture classes gets
+independent sigmoid outputs, each of the real gesture classes gets
 its own yes/no confidence, with no shared budget -- so during genuine
-non-gesture content, ALL 7 outputs can genuinely be low simultaneously,
+non-gesture content, ALL outputs can genuinely be low simultaneously,
 and "nothing" naturally falls out as "no class was confident enough,"
 rather than needing to be predicted by a dedicated neuron competing
 against everything else.
+
+--------------------------------------------------------------------
+TIE-BREAKER FIX (this version): both elbow-angle safety checks in
+apply_tie_breaker() are now UNCONDITIONAL -- previously gated behind
+a confidence-margin check (top1_prob - top2_prob <= some threshold),
+which meant the check only ran when the model's top two guesses were
+CLOSE in confidence. Real observed confusions were the opposite: the
+model was CONFIDENTLY (not narrowly) misreading one gesture as
+another, so the margin gate silently skipped the safety check almost
+every time it actually mattered -- confirmed by tie_breaker_overrides
+staying at 0 (or near-0) across multiple real training/test runs where
+the confusion was clearly still happening in the confusion matrix.
+Removing the margin gate means the check ALWAYS runs whenever the
+top1/top2 pair matches a known confusable pair, regardless of how
+confident the model was.
+
+Also NEW this version: BALL_IN_VS_AUTH_PAIRS, a second elbow-angle
+disambiguator for ball_in vs service_authorization_left/right --
+distinct from the existing team_to_serve vs service_authorization
+pair. Observed in real deployment: after team_to_serve, when the
+referee performs ball_in (pointing to show where the ball landed),
+the model sometimes misreads this as service_authorization_{side},
+which (at the decision layer) incorrectly triggers the pending-
+confirmation cancellation path and wrongly cancels a real point.
+Same underlying disambiguating signal applies: service_authorization
+is a bent-elbow beckoning motion; ball_in is a fully extended straight
+arm pointing down. ball_in itself isn't side-specific (filmed on both
+arm-sides under one label), so when it's confused with a SPECIFIC
+side's service_authorization, that side's elbow angle is the one
+checked -- a real service_authorization on that side should show a
+bent elbow; a real ball_in performed with that arm should show it
+straight.
 
 Run order (full pipeline, UNCHANGED):
     1. build_manifest.py
@@ -69,7 +101,7 @@ ABLATED_FEATURE_COUNT = POSE_FEATURES + HAND_FLAG_FEATURES + FINGER_FEATURES + E
 
 # "nothing" is a real label in the manifest/data (used for filtering
 # training clips), but it is NOT one of the model's output neurons --
-# it's represented as an all-zero prediction across the 7 real classes.
+# it's represented as an all-zero prediction across the real classes.
 NOTHING_LABEL = "nothing"
 
 # Column ranges for the tie-breaker logic (unchanged from before)
@@ -84,28 +116,35 @@ CONFUSABLE_CLASSES = {"double_contact", "service_authorization_left", "service_a
 TIE_BREAKER_PROB_MARGIN = 0.20
 PEACE_SIGN_THRESHOLD = 0.5
 
-# NEW: elbow-angle offsets, for the team_to_serve vs. service_authorization
-# safety check below. Layout: [...110 fingers...][120: left_elbow][121: right_elbow]
+# Elbow-angle offsets. Layout: [...110 fingers...][120: left_elbow][121: right_elbow]
 LEFT_ELBOW_ANGLE_IDX = POSE_FEATURES + HAND_COORD_FEATURES + HAND_FLAG_FEATURES + FINGER_FEATURES        # 120
 RIGHT_ELBOW_ANGLE_IDX = LEFT_ELBOW_ANGLE_IDX + 1                                                          # 121
 
-# NEW SAFETY CHECK: team_to_serve_X (a SCORING gesture) vs.
-# service_authorization_X (a non-scoring gesture) on the SAME side. A
-# slow/deliberate service_authorization performance risks being read as
-# team_to_serve, which would incorrectly award a real point -- a genuine
-# scoring-integrity risk, not just a display glitch, since
-# service_authorization legitimately happens right after a whistle in
-# real play too (whistle-gating does NOT protect against this specific
-# confusion). team_to_serve is a straight, extended-arm point;
-# service_authorization involves bending the elbow -- elbow_angle
-# (already a real feature, 0=fully bent, 1=fully straight) is the
-# natural signal to disambiguate them.
+# team_to_serve_X (a SCORING gesture) vs. service_authorization_X (a
+# non-scoring gesture) on the SAME side. A slow/deliberate
+# service_authorization performance risks being read as team_to_serve,
+# which would incorrectly award a real point -- a genuine scoring-
+# integrity risk, not just a display glitch, since service_authorization
+# legitimately happens right after a whistle in real play too
+# (whistle-gating does NOT protect against this specific confusion).
+# team_to_serve is a straight, extended-arm point; service_authorization
+# involves bending the elbow -- elbow_angle (0=fully bent, 1=fully
+# straight) is the natural signal to disambiguate them.
 SAME_SIDE_SCORE_AUTH_PAIRS = {
     frozenset({"team_to_serve_left", "service_authorization_left"}): "left",
     frozenset({"team_to_serve_right", "service_authorization_right"}): "right",
 }
-SCORE_AUTH_TIE_BREAKER_PROB_MARGIN = 0.25  # slightly wider than the double_contact one -- err toward caution given this affects real scoring
-STRAIGHT_ARM_ELBOW_THRESHOLD = 0.5  # elbow_angle above this = leaning "straight arm" (team_to_serve); below = "bent" (service_authorization). STARTING VALUE -- tune with real data if it misfires.
+
+# NEW: ball_in vs service_authorization_X. Same disambiguating signal as
+# above (straight arm = ball_in, bent elbow = service_authorization).
+# ball_in has no side of its own, so when it's confused with a specific
+# side's service_authorization, THAT side's elbow angle is checked.
+BALL_IN_VS_AUTH_PAIRS = {
+    frozenset({"ball_in", "service_authorization_left"}): "left",
+    frozenset({"ball_in", "service_authorization_right"}): "right",
+}
+
+STRAIGHT_ARM_ELBOW_THRESHOLD = 0.5  # elbow_angle above this = leaning "straight arm"; below = "bent". STARTING VALUE -- tune with real data if it misfires.
 
 # DECISION_THRESHOLD: a class's sigmoid output must clear this to be
 # considered a confident detection at all. If NO class clears it,
@@ -223,10 +262,10 @@ def augment_sequence(seq):
 
 class GestureDataset(Dataset):
     """
-    CHANGED: y is now a multi-hot FLOAT vector of length
-    len(real_labels) (7), not a single class index. A "nothing" clip
-    gets an all-zero vector; a real gesture clip gets a single 1 at
-    its own index -- everything else 0.
+    y is a multi-hot FLOAT vector of length len(real_labels), not a
+    single class index. A "nothing" clip gets an all-zero vector; a
+    real gesture clip gets a single 1 at its own index -- everything
+    else 0.
     """
     def __init__(self, rows, real_label_to_idx, augment=False):
         self.rows = rows
@@ -270,25 +309,28 @@ def is_peace_sign(finger_block_avg):
 
 def apply_tie_breaker(raw_sequence, top1_label, top2_label, top1_prob, top2_prob):
     """
-    Two independent tie-breaker checks, tried in order:
+    Tie-breaker checks, tried in order:
 
-    1. NEW SAFETY CHECK: team_to_serve_X vs. service_authorization_X
-       (same side) -- uses elbow angle (straight arm = team_to_serve,
-       bent elbow = service_authorization) to prevent a slow/deliberate
-       service_authorization from being misread as a SCORING gesture.
-       This is checked FIRST and with its own (wider) margin, since a
-       wrong call here means an incorrectly awarded point, not just a
-       display mixup.
+    1. team_to_serve_X vs. service_authorization_X (same side) --
+       elbow angle (straight arm = team_to_serve, bent elbow =
+       service_authorization). UNCONDITIONAL (see module docstring for
+       why the previous margin-gated version missed real confusions).
 
-    2. UNCHANGED: double_contact vs. service_authorization_left/right,
+    2. NEW: ball_in vs. service_authorization_X -- same elbow-angle
+       logic (straight arm = ball_in, bent elbow =
+       service_authorization). Also UNCONDITIONAL.
+
+    3. UNCHANGED: double_contact vs. service_authorization_left/right,
        using peace-sign finger detection. Only fires when BOTH top1 and
-       top2 are in CONFUSABLE_CLASSES and close in score.
+       top2 are in CONFUSABLE_CLASSES and close in score -- this one
+       stays margin-gated since no confident-misread problem has been
+       observed for this pair (unlike the two above).
 
-    Neither ever fires when the predicted label is "nothing" -- nothing
-    to break a tie against.
+    Returns top1_label unchanged if none of these apply.
     """
     label_pair = frozenset({top1_label, top2_label})
-    if label_pair in SAME_SIDE_SCORE_AUTH_PAIRS and (top1_prob - top2_prob) <= SCORE_AUTH_TIE_BREAKER_PROB_MARGIN:
+
+    if label_pair in SAME_SIDE_SCORE_AUTH_PAIRS:
         side = SAME_SIDE_SCORE_AUTH_PAIRS[label_pair]
         elbow_idx = LEFT_ELBOW_ANGLE_IDX if side == "left" else RIGHT_ELBOW_ANGLE_IDX
         avg_elbow_angle = raw_sequence[:, elbow_idx].mean()
@@ -296,10 +338,16 @@ def apply_tie_breaker(raw_sequence, top1_label, top2_label, top1_prob, top2_prob
         scoring_label = f"team_to_serve_{side}"
         auth_label = f"service_authorization_{side}"
 
-        if avg_elbow_angle >= STRAIGHT_ARM_ELBOW_THRESHOLD:
-            return scoring_label
-        else:
-            return auth_label
+        return scoring_label if avg_elbow_angle >= STRAIGHT_ARM_ELBOW_THRESHOLD else auth_label
+
+    if label_pair in BALL_IN_VS_AUTH_PAIRS:
+        side = BALL_IN_VS_AUTH_PAIRS[label_pair]
+        elbow_idx = LEFT_ELBOW_ANGLE_IDX if side == "left" else RIGHT_ELBOW_ANGLE_IDX
+        avg_elbow_angle = raw_sequence[:, elbow_idx].mean()
+
+        auth_label = f"service_authorization_{side}"
+
+        return "ball_in" if avg_elbow_angle >= STRAIGHT_ARM_ELBOW_THRESHOLD else auth_label
 
     if top1_label not in CONFUSABLE_CLASSES or top2_label not in CONFUSABLE_CLASSES:
         return top1_label
@@ -322,8 +370,8 @@ def apply_tie_breaker(raw_sequence, top1_label, top2_label, top1_prob, top2_prob
 
 def decide_label(sigmoid_probs, idx_to_real_label):
     """
-    NEW: the core multi-label decision rule, mirroring MaxLSB's
-    backend.py (`predicted_label = argmax; if proba > threshold: ...`).
+    The core multi-label decision rule, mirroring MaxLSB's backend.py
+    (`predicted_label = argmax; if proba > threshold: ...`).
 
     Returns (predicted_label, top1_label, top2_label, top1_prob, top2_prob)
     -- predicted_label is "nothing" if no class cleared DECISION_THRESHOLD,
@@ -348,14 +396,10 @@ def train():
     rows = load_manifest_rows()
 
     all_labels = sorted(set(r["gesture_label"] for r in rows))          # includes "nothing", for reporting only
-    real_labels = sorted(l for l in all_labels if l != NOTHING_LABEL)    # 7 real gestures -- these are the model's outputs
+    real_labels = sorted(l for l in all_labels if l != NOTHING_LABEL)    # real gestures -- these are the model's outputs
     real_label_to_idx = {label: i for i, label in enumerate(real_labels)}
     idx_to_real_label = {i: label for label, i in real_label_to_idx.items()}
 
-    # Save the FULL label set (including "nothing") for downstream
-    # scripts that need to know all possible labels for reporting --
-    # but also save which ones are real model outputs, since that's
-    # what determines the model's actual output layer size now.
     with open(LABEL_MAP_SAVE_PATH, "w") as f:
         json.dump({"real_label_to_idx": real_label_to_idx, "nothing_label": NOTHING_LABEL}, f, indent=2)
 
@@ -378,18 +422,13 @@ def train():
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
     input_size = ABLATED_FEATURE_COUNT if ABLATE_HAND_COORDS else TOTAL_FEATURES
-    num_real_classes = len(real_labels)   # 7, NOT 8 -- "nothing" is not an output neuron
+    num_real_classes = len(real_labels)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GestureCNNLSTM(input_size=input_size, num_classes=num_real_classes).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    # CHANGED: pos_weight for BCEWithLogitsLoss, one value PER REAL
-    # CLASS ONLY -- there is no "nothing" weight to worry about
-    # anymore, since nothing isn't a competing output neuron. This
-    # structurally eliminates the whole "nothing's weight got
-    # cranked up and stole confidence from real classes" failure mode.
     class_counts = np.array([sum(1 for r in train_rows if r["gesture_label"] == label) for label in real_labels])
     pos_weight = torch.tensor(
         np.sqrt(len(train_rows) / np.maximum(class_counts, 1)), dtype=torch.float32
@@ -458,17 +497,12 @@ def train():
             x = torch.tensor(resampled, dtype=torch.float32).unsqueeze(0).to(device)
 
             logits = model(x)
-            # CHANGED: sigmoid instead of softmax -- each class's score
-            # is INDEPENDENT, doesn't have to sum to 1 with the others.
             probs = torch.sigmoid(logits).cpu().numpy()[0]
 
             predicted_label, top1_label, top2_label, top1_prob, top2_prob = decide_label(probs, idx_to_real_label)
 
             raw_resampled_for_tiebreak = resample_sequence(raw, SEQUENCE_LENGTH)
             final_label = apply_tie_breaker(raw_resampled_for_tiebreak, top1_label, top2_label, top1_prob, top2_prob)
-            # Only apply the tie-breaker's override if we actually predicted
-            # a real class -- if predicted_label came back "nothing", there's
-            # no tie to break.
             if predicted_label != NOTHING_LABEL:
                 if final_label != top1_label:
                     tie_breaker_overrides += 1
