@@ -59,6 +59,34 @@ checked -- a real service_authorization on that side should show a
 bent elbow; a real ball_in performed with that arm should show it
 straight.
 
+--------------------------------------------------------------------
+THRESHOLD RECALIBRATION (this version): STRAIGHT_ARM_ELBOW_THRESHOLD
+changed from 0.5 (an untested starting guess) to 0.786, computed
+directly from real measured data. A diagnostic check on the actual
+extracted dataset found:
+    team_to_serve_left          range 0.801-0.953 (mean 0.916)
+    service_authorization_left  range 0.581-0.771 (mean 0.680)
+Zero overlap between the two ranges -- 0.786 is the midpoint of that
+gap, the safest possible cutoff given the real data.
+
+IMPORTANT CAVEAT, confirmed via the same diagnostic session: this
+threshold fix alone does NOT resolve the full service_authorization_left
+vs team_to_serve_left confusion (49/49 service_authorization_left test
+clips misclassified as team_to_serve_left in the run that surfaced
+this). The elbow-angle signal is clean, well-separated, AND has a
+healthy numeric scale relative to the model's other input features
+(confirmed: elbow-angle std was the LARGEST of the four feature
+groups checked -- pose/hand-flags/fingers/elbow -- not "drowned out"
+by scale). Also confirmed the underlying training clips are correctly
+labeled (visually reviewed). Despite all three of those checks coming
+back clean, the base model still isn't learning to use this signal on
+its own -- only 9/421 test predictions in that run ever reached a
+top1/top2 pair where this tie-breaker got a chance to fire at all.
+This threshold fix is still correct and worth keeping, but the
+deeper question (why isn't the base model using an available, clean,
+well-scaled signal) is a real, UNRESOLVED, separate issue -- likely a
+training dynamics or model-capacity question, not a data problem.
+
 Run order (full pipeline, UNCHANGED):
     1. build_manifest.py
     2. extract_keypoints.py
@@ -144,7 +172,19 @@ BALL_IN_VS_AUTH_PAIRS = {
     frozenset({"ball_in", "service_authorization_right"}): "right",
 }
 
-STRAIGHT_ARM_ELBOW_THRESHOLD = 0.5  # elbow_angle above this = leaning "straight arm"; below = "bent". STARTING VALUE -- tune with real data if it misfires.
+STRAIGHT_ARM_ELBOW_THRESHOLD = 0.786  # RECALIBRATED from real measured data (was 0.5,
+# an untested starting guess). Diagnostic check on the actual dataset found:
+#   team_to_serve_left          range 0.801-0.953 (mean 0.916)
+#   service_authorization_left  range 0.581-0.771 (mean 0.680)
+# Zero overlap between the two ranges -- 0.786 is the midpoint of the gap,
+# the safest possible cutoff. Note: this threshold alone does NOT fully fix
+# the underlying confusion between these two classes -- diagnosis showed the
+# BASE model rarely even reaches a top1/top2 pair where this tie-breaker
+# gets a chance to run (only 9/421 test predictions triggered any tie-breaker
+# override in the run that surfaced this). The model failing to use a clean,
+# well-scaled, separable signal on its own is a separate, larger issue --
+# see module docstring above. This fix is still correct and worth keeping
+# regardless of that larger open question.
 
 # DECISION_THRESHOLD: a class's sigmoid output must clear this to be
 # considered a confident detection at all. If NO class clears it,
