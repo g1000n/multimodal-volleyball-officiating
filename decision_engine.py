@@ -18,9 +18,9 @@ testing):
   4. Whistle #2 (end of play -- fault or end of rally)
   5. team_to_serve_left/right (point/team-to-serve signal) -> THIS is
      what awards the point and sets the next server.
-  6. (optional) fault/nature-of-fault gesture (ball_out, double_contact)
-     -> attached as the reason for the point just awarded. Does NOT
-     change score itself.
+  6. (optional) fault/nature-of-fault gesture (ball_out, double_contact,
+     ball_in) -> attached as the reason for the point just awarded.
+     Does NOT change score itself.
   7. A real PAUSE before the next cycle -- confirmed directly from the
      FIVB guidelines' "pause" before the next signal. This project's
      live testing observed sustained (multi-second) spurious spikes of
@@ -30,13 +30,38 @@ testing):
      underlying model/data.
 
 --------------------------------------------------------------------
-CHANGED (previous version): service_authorization now has its OWN
-bucket (SERVICE_AUTHORIZATION_GESTURES), separate from
-FAULT_REASON_GESTURES, and is validated against last_whistle_time
-(whistle #1), exactly like team_to_serve is validated against its own
-whistle (whistle #2) -- NOT against last_point_time (the old, buggy
-anchor). Accepting a service_authorization gesture CONSUMES that
-whistle, forcing a genuine SECOND, distinct whistle before
+CHANGED (this version): AUTOMATIC SET-ENDING REMOVED. This project's
+core purpose is automating POINT-ADDING -- fault/reason gestures
+(ball_out, double_contact, ball_in, end_of_set) are informational only,
+not the thing being validated for correctness. Previously, EVERY
+team_to_serve commit auto-checked the win condition and could silently
+set self.set_over = True the moment score crossed the win threshold --
+this happened purely from the SCORING gesture, with no dependency on
+end_of_set ever being detected. Confirmed via a real live session:
+this caused scoring to freeze while a real rally was still ongoing,
+because the model isn't perfect and the automatic win-condition check
+doesn't know that.
+
+Now: score is tracked with NO cap and NO automatic stop, regardless of
+value. end_of_set, if detected, is logged as an informational reason
+attached to the current point (same as ball_out/double_contact/ball_in)
+but does NOT set self.set_over and does NOT block further scoring.
+self.set_over still EXISTS as an attribute (for any future manual-only
+end-of-set control, e.g. an operator explicitly ending a set), but
+nothing in this file sets it automatically anymore. _check_set_over()
+is kept as a plain query method (still useful for external code that
+wants to know "has the win condition technically been met"), it's just
+no longer wired to actually stop anything.
+
+--------------------------------------------------------------------
+PREVIOUS CHANGES (still in effect):
+
+service_authorization has its OWN bucket (SERVICE_AUTHORIZATION_GESTURES),
+separate from FAULT_REASON_GESTURES, and is validated against
+last_whistle_time (whistle #1), exactly like team_to_serve is validated
+against its own whistle (whistle #2) -- NOT against last_point_time (the
+old, buggy anchor). Accepting a service_authorization gesture CONSUMES
+that whistle, forcing a genuine SECOND, distinct whistle before
 team_to_serve can be accepted -- structurally enforcing the real
 two-whistle cycle instead of letting one whistle silently authorize
 both steps. The authorized side is tracked and compared against the
@@ -44,20 +69,19 @@ eventual scoring side, returned as `authorization_side` /
 `authorization_match` in the point_awarded event -- purely
 informational, doesn't gate or block scoring.
 
-CHANGED (this version): LEFT/RIGHT FIX. The gesture class names
-(team_to_serve_left, service_authorization_left, etc.) are tied to the
-REFEREE's own left/right -- how the training data was filmed and
-labeled. That's confusing to watch live: the referee's left-arm
-gesture would score/display as "left," which is actually the wrong
-side from the audience/court-facing perspective everyone is actually
-watching from. GESTURE_TO_SCORE_SIDE below is the single place that
-translates a recognized gesture's label into the side that actually
-gets scored -- deliberately flipped (referee-left -> scored-right and
-vice versa) so what's on the scoreboard matches what a spectator
-watching the match would expect. This does NOT touch the model, the
-training data, or any class names -- those stay exactly as filmed and
-labeled; only the meaning assigned to "which side scored" changes,
-in this one table.
+LEFT/RIGHT FIX: the gesture class names (team_to_serve_left,
+service_authorization_left, etc.) are tied to the REFEREE's own
+left/right -- how the training data was filmed and labeled. That's
+confusing to watch live: the referee's left-arm gesture would
+score/display as "left," which is actually the wrong side from the
+audience/court-facing perspective everyone is actually watching from.
+GESTURE_TO_SCORE_SIDE below is the single place that translates a
+recognized gesture's label into the side that actually gets scored --
+deliberately flipped (referee-left -> scored-right and vice versa) so
+what's on the scoreboard matches what a spectator watching the match
+would expect. This does NOT touch the model, the training data, or any
+class names -- those stay exactly as filmed and labeled; only the
+meaning assigned to "which side scored" changes, in this one table.
 --------------------------------------------------------------------
 
 SETTLE WINDOW: after ANY accepted event (authorization, point, or
@@ -82,7 +106,7 @@ TEMPORAL_WINDOW = 10.0  # seconds -- how long a whistle stays "valid" for the
 # streak-build time) plus normal human repositioning/reaction time easily
 # approaches 4-6s even when nothing is going wrong.
 
-# NEW: separate, SHORTER window for how long a just-awarded point stays open for
+# Separate, SHORTER window for how long a just-awarded point stays open for
 # a fault-reason gesture (ball_out, double_contact, ball_in) or end_of_set to
 # attach to. Previously this reused TEMPORAL_WINDOW (10.0s), which was
 # deliberately widened for whistle-to-gesture timing tolerance -- but a real
@@ -101,11 +125,13 @@ SETTLE_WINDOW_SECONDS = 1.5
 
 SERVICE_AUTHORIZATION_GESTURES = {"service_authorization_left", "service_authorization_right"}
 SCORING_GESTURES = {"team_to_serve_left", "team_to_serve_right"}
-# FIX: ball_in is a real, trained, deployed model class now -- without it
-# here, a genuine ball_in recognition fell through every branch of
-# on_gesture_detected() and was silently rejected as "unrecognized label".
+# ball_in is a real, trained, deployed model class -- without it here, a
+# genuine ball_in recognition would fall through every branch of
+# on_gesture_detected() and be silently rejected as "unrecognized label".
 FAULT_REASON_GESTURES = {"ball_out", "double_contact", "ball_in"}
-# end_of_set handled separately below since it needs the win-condition check
+# end_of_set handled separately below -- informational only now, see
+# module docstring (no longer gates on win condition, no longer stops
+# scoring).
 
 # LEFT/RIGHT FIX: the gesture class names are tied to the REFEREE's own
 # left/right (how the data was filmed and labeled). This table
@@ -121,16 +147,17 @@ GESTURE_TO_SCORE_SIDE = {
     "service_authorization_right": "left",
 }
 
-WIN_SCORE = 25          # DEFAULT for the real game -- can be overridden per-instance (see __init__)
-WIN_BY_MARGIN = 2        # win by 2, no cap (deuce continues past WIN_SCORE)
+WIN_SCORE = 25          # kept for reference / any future manual-only win check.
+WIN_BY_MARGIN = 2        # No longer used to automatically stop scoring -- see
+# module docstring. _check_set_over() still uses these if called directly.
 
 
 class DecisionEngine:
     def __init__(self, win_score=WIN_SCORE, win_by_margin=WIN_BY_MARGIN):
         # win_score/win_by_margin are per-instance, not fixed module
-        # constants -- lets a shorter practice simulation (e.g. first
-        # to 7) share this exact same engine/logic as the real
-        # 25-point game, instead of needing a separate copy of the file.
+        # constants -- kept for any future manual/optional win-condition
+        # querying, even though nothing in this class auto-triggers on
+        # them anymore.
         self.win_score = win_score
         self.win_by_margin = win_by_margin
         self.score = {"left": 0, "right": 0}
@@ -139,7 +166,9 @@ class DecisionEngine:
         self.last_point_time = None
         self.last_point_side = None
         self.last_reason = None
-        self.set_over = False
+        self.set_over = False  # NEVER set automatically anymore -- see
+        # module docstring. Left in place for potential future manual
+        # end-of-set control (e.g. an operator explicitly calling it).
         self.last_settle_start_time = None
 
         # Authorization-phase tracking
@@ -151,11 +180,11 @@ class DecisionEngine:
         Lets a human operator correct the score directly if the
         automated system gets something wrong live -- a necessary
         safety net for any real deployed officiating aid, not just a
-        demo. Re-checks the win condition after the edit so a manual
-        correction can also end (or un-end) the set correctly.
+        demo. No longer touches self.set_over -- score can be corrected
+        freely regardless of value, matching the "no automatic
+        stopping" design.
         """
         self.score[side] = max(0, self.score[side] + delta)
-        self.set_over = self._check_set_over()
         return dict(self.score)
 
     def manual_clear_reason(self):
@@ -163,11 +192,30 @@ class DecisionEngine:
         reason for the current point, so a new one can be attached."""
         self.last_reason = None
 
+    def manual_end_set(self):
+        """
+        NEW: the only remaining way self.set_over becomes True -- an
+        explicit, deliberate call, e.g. a human operator pressing an
+        "end set" control. Nothing in on_gesture_detected() calls this
+        automatically anymore.
+        """
+        self.set_over = True
+        return self.set_over
+
     def on_whistle_detected(self, timestamp=None):
+        # Whistles are never blocked by the settle window -- they're
+        # the deliberate start of the next step, not tail-end noise.
         self.last_whistle_time = timestamp if timestamp is not None else time.time()
 
     def _check_set_over(self):
-        """Returns True if the current score satisfies the win condition."""
+        """
+        Returns True if the current score WOULD satisfy a standard win
+        condition (score >= win_score, margin >= win_by_margin). This
+        is a plain query only -- nothing in this class calls it to
+        automatically set self.set_over anymore. Kept available for
+        any external code (e.g. a UI) that wants to show "win condition
+        met" as an informational hint without it forcing a stop.
+        """
         left, right = self.score["left"], self.score["right"]
         if left >= self.win_score and (left - right) >= self.win_by_margin:
             return True
@@ -197,6 +245,8 @@ class DecisionEngine:
         timestamp = timestamp if timestamp is not None else time.time()
 
         if self.set_over:
+            # Only reachable now via manual_end_set() -- nothing in
+            # this method sets self.set_over automatically anymore.
             return {"event": "ignored", "reason": "set already over -- call reset_for_new_set() to continue"}
 
         # Settle window check -- applies to ALL gesture types (not
@@ -256,13 +306,14 @@ class DecisionEngine:
             self.last_settle_start_time = timestamp
 
             self.last_whistle_time = None
-            self.set_over = self._check_set_over()
+            # CHANGED: no longer auto-checks/sets self.set_over here --
+            # see module docstring. Score just keeps counting, no cap.
 
             result = {
                 "event": "point_awarded",
                 "side": side,
                 "score": dict(self.score),
-                "set_over": self.set_over,
+                "set_over": self.set_over,  # will simply stay False unless manual_end_set() was called
                 "authorization_side": self.last_authorization_side,
                 "authorization_match": authorization_match,
             }
@@ -275,16 +326,11 @@ class DecisionEngine:
             return result
 
         # --------------------------------------------------------
-        # end_of_set -- same win-condition-gated handling as before
+        # end_of_set -- CHANGED: now purely informational, like any
+        # other fault/reason gesture. No longer requires the win
+        # condition to be met, no longer forces self.set_over = True.
         # --------------------------------------------------------
         elif label == "end_of_set":
-            if not self._check_set_over():
-                return {
-                    "event": "ignored",
-                    "reason": f"end_of_set predicted but score ({self.score['left']}-{self.score['right']}) "
-                              f"doesn't satisfy the win condition -- likely a misclassification, discarding",
-                }
-
             if self.last_point_time is None or (timestamp - self.last_point_time) > REASON_ATTACH_WINDOW:
                 return {"event": "ignored", "reason": "no recent point to attach end_of_set reason to"}
 
@@ -293,8 +339,8 @@ class DecisionEngine:
 
             self.last_reason = label
             self.last_settle_start_time = timestamp
-            self.set_over = True
-            return {"event": "reason_attached", "reason": label, "side": self.last_point_side, "set_over": True}
+            # CHANGED: no longer sets self.set_over = True here.
+            return {"event": "reason_attached", "reason": label, "side": self.last_point_side}
 
         # --------------------------------------------------------
         # PHASE 3 (optional): fault/nature-of-fault gesture -> reason

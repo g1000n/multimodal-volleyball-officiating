@@ -12,7 +12,7 @@ probability bars, score, banners, gesture history -- pixel-exact match to
 what you saw live).
 
 --------------------------------------------------------------------
-SYNC PASS (this version) -- brings this in line with the new
+SYNC PASS (earlier version) -- brings this in line with the new
 decision_engine.py (two-phase service_authorization design + the
 left/right scoring fix):
 
@@ -21,35 +21,75 @@ left/right scoring fix):
    streak took over just cleared local state -- it never told
    decision_engine.py about the authorization at all. The new engine
    needs that on_gesture_detected() call to register Phase 1
-   (service_authorization) and consume its whistle. Both cancellation
-   sites (the top-priority race-condition-fixed check, and the
-   mirrored check inside the streak-commit branch) now call
-   do_commit() for the authorization gesture instead of only clearing
-   state.
+   (service_authorization) and consume its whistle.
 
 2. do_commit()'s expected_step LOGIC now handles the new
-   "authorization_acknowledged" event -- previously it fell through to
-   the generic else-branch (still logged/colored correctly, but the
-   on-screen banner never explicitly transitioned to "waiting for
-   whistle #2"). Now sets expected_step = "whistle" so the banner is
-   accurate.
+   "authorization_acknowledged" event.
 
-3. DISPLAY_NAME flipped (and ball_in/ball_touched added, matching
-   replay_recorded_footage.py). The gesture class names are tied to
-   the REFEREE's own left/right -- how the training data was filmed
-   and labeled -- but decision_engine.py's GESTURE_TO_SCORE_SIDE now
-   deliberately scores the OPPOSITE (audience/court-facing) side. This
-   dict's KEYS still match the real model class names (lookups still
-   work); only the printed VALUES changed, so what's shown on the
-   gesture history bar matches which side of the scoreboard just moved
-   instead of contradicting it.
+3. DISPLAY_NAME flipped (and ball_in/ball_touched added).
+
+--------------------------------------------------------------------
+FIXES (earlier version this session):
+
+4. PROBABILITY BARS NOW USE DISPLAY_NAME.
+
+5. Duplicate service_authorization commits fixed via an
+   idle-since-last-commit guard, replacing pure time-based cooldown.
+
+6. TOLERANT STREAK COUNTER: a differing raw prediction decrements
+   streak_count by 1 instead of resetting it to 0, so a single stray
+   frame (e.g. ball_in briefly showing up mid-team_to_serve) doesn't
+   wipe out real progress.
+
+--------------------------------------------------------------------
+FIX THIS VERSION -- the tolerant counter (#6) broke cancellation:
+
+Confirmed via a real session log: a referee held team_to_serve_right
+(pending, streak pinned at 5), then performed service_authorization_
+right -- which is SUPPOSED to cancel the pending point (per FIVB
+sequence: authorization comes BEFORE the rally, not after a point).
+Instead, the point committed anyway, and this repeated THREE times in
+one session (10 point_awarded events total, most of them this same
+false pattern).
+
+ROOT CAUSE: fix #6's tolerant/decrement logic applies to streak_label
+UNCONDITIONALLY -- including while pending_scoring_label is already
+set and waiting on cancellation. Once team_to_serve_right's streak
+hits 5 and pins there, a later run of service_authorization_right
+predictions doesn't switch streak_label immediately anymore -- it has
+to decrement the OLD pinned count (5->4->3->2->1) before it can even
+START counting up as service_authorization_right, then needs
+FAULT_STREAK_NEEDED_TO_COMMIT (3) MORE matching frames on top of that.
+That's up to 8 consecutive service_authorization frames needed before
+cancellation could ever fire -- far slower than
+TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS (1.5s, ~5 inference cycles), so the
+confirm-delay commits the pending point first, every time, before
+cancellation gets a chance.
+
+FIX: cancellation now uses its OWN dedicated, FAST, non-tolerant
+counter (cancellation_streak_count) -- strict reset to 0 on any
+non-matching frame, completely independent of the tolerant scoring
+streak_label/streak_count. This restores the original fast reaction
+time for cancellation (3 consecutive matching frames, same as before
+fix #6 was ever added) while KEEPING fix #6's tolerance for its
+original, different purpose (surviving a brief ball_in interruption
+DURING team_to_serve's own streak-building, before anything is
+pending yet). The two streaks now serve genuinely different jobs and
+no longer interfere with each other.
+
+ALSO FIXED (same session, reported as "service_authorization lingers
+too long"): the cancellation commit path was not clearing
+rolling_window -- so the 24-frame buffer kept holding several
+seconds' worth of the just-committed gesture's frames, causing the
+probability bars and streak display to keep showing elevated
+service_authorization readings for a while after the real gesture had
+already ended and committed. rolling_window.clear() is now called on
+the cancellation path too, matching what the other commit paths
+already did.
 
 REQUIRE_WHISTLE_FOR_SCORING is still False by default here (informational
-whistle, matching the documented reason: detection isn't yet validated
-during actual gesture motion, only standing still). Flip to True only
-after that validation -- see replay_recorded_footage.py's version of
-this flag for how to test the new two-whistle enforcement without
-touching this default.
+whistle). Flip to True only after real whistle detection during motion
+is validated -- see replay_recorded_footage.py.
 
 Controls:
   W - manual whistle (only matters if real whistle detection isn't active)
@@ -106,9 +146,17 @@ ROLLING_WINDOW_FRAMES = 24
 INFERENCE_EVERY_N_FRAMES = 3
 STREAK_NEEDED_TO_COMMIT = 5
 FAULT_STREAK_NEEDED_TO_COMMIT = 3
-COMMIT_COOLDOWN_SECONDS = 2.0
+# CANCELLATION_STREAK_NEEDED: how many consecutive matching frames the
+# same-side service_authorization needs to actually cancel a pending
+# team_to_serve point. Deliberately SEPARATE from FAULT_STREAK_NEEDED_TO_COMMIT
+# so it can be tuned independently if needed, even though it currently
+# uses the same value.
+CANCELLATION_STREAK_NEEDED = 3
+COMMIT_COOLDOWN_SECONDS = 2.0  # NOTE: no longer the primary guard against
+# duplicate same-label commits -- see fix #5. Still present as a constant
+# but the idle-since-last-commit check is what actually prevents that bug.
 STALE_VOTE_SECONDS = 3.0
-TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS = 2.0
+TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS = 1.5
 MIN_POSE_DETECTED_FRACTION = 0.5
 HISTORY_CLEAR_AFTER_IDLE_SECONDS = 6.0
 CONSOLE_REFRESH_AFTER_IDLE_SECONDS = 8.0
@@ -116,22 +164,12 @@ CONSOLE_REFRESH_AFTER_IDLE_SECONDS = 8.0
 GAME_WIN_SCORE = 25
 GAME_WIN_BY_MARGIN = 2
 
-FAST_HAND_CROP_MODE = False
+FAST_HAND_CROP_MODE = True
 
-# RECORD_RAW_FOOTAGE: saves the pure camera feed (no skeleton, no UI text,
-# no overlays -- exactly what the camera captured) to a video file, so you
-# can later replay that EXACT real session through the pipeline via
-# replay_recorded_footage.py to test code changes against real, previously-
-# observed footage.
 RECORD_RAW_FOOTAGE = True  # TUNABLE
 RECORDINGS_DIR = "data/raw_recordings"
 RAW_RECORD_FPS = 10  # TUNABLE. Matches your measured real live throughput.
 
-# RECORD_FULL_WINDOW_FOOTAGE: saves a SECOND video -- exactly what the
-# BACKSTAGE window shows live: skeleton, probability bars, score bar,
-# instruction banner, gesture history, everything. Captured from the same
-# fully-overlaid frame right before it's displayed, so it's a pixel-exact
-# recording of what you saw during the session.
 RECORD_FULL_WINDOW_FOOTAGE = True  # TUNABLE
 FULL_WINDOW_RECORD_FPS = RAW_RECORD_FPS  # kept identical so both videos stay frame-synced
 
@@ -139,13 +177,6 @@ WHISTLE_DEVICE_INDEX = None  # TUNABLE -- set to your confirmed-working index, e
 
 REQUIRE_WHISTLE_FOR_SCORING = False  # TUNABLE
 
-# NOTE: display text is flipped relative to the model's literal class
-# names. The gesture classes are named after the REFEREE's own
-# left/right (how the data was filmed/labeled), but what's shown on
-# screen -- and what actually gets scored, see decision_engine.py's
-# GESTURE_TO_SCORE_SIDE -- should reflect the audience/court-facing
-# side instead, so what you see on the gesture history bar matches
-# which side of the scoreboard just moved.
 DISPLAY_NAME = {
     "team_to_serve_left": "Team to Serve Right",
     "team_to_serve_right": "Team to Serve Left",
@@ -158,13 +189,10 @@ DISPLAY_NAME = {
     "ball_touched": "Ball Touched",
 }
 
-# NOTE: this map is INTERNAL bookkeeping only -- it pairs a pending
-# team_to_serve gesture with its same-side service_authorization
-# cancellation partner (both tied to the model's own literal class-name
-# suffix, i.e. the REFEREE's side, not the scored side). It must NOT be
-# flipped -- the actual score-side flip lives entirely in
-# decision_engine.py's GESTURE_TO_SCORE_SIDE, applied only once
-# do_commit() calls into the engine.
+# NOTE: this map is INTERNAL bookkeeping only -- tied to the model's own
+# literal class-name suffix (the REFEREE's side), NOT the scored side.
+# The actual score-side flip lives entirely in decision_engine.py's
+# GESTURE_TO_SCORE_SIDE, applied only once do_commit() calls the engine.
 SCORING_SIDE_MAP = {"team_to_serve_left": "left", "team_to_serve_right": "right"}
 
 mp_pose = mp.solutions.pose
@@ -262,7 +290,7 @@ def draw_skeleton_overlay(frame, draw_info):
         )
 
 
-def draw_instruction_banner(frame, expected_step, frame_width, pending_label=None, pending_remaining=None, whistle_mode="manual"):
+def draw_instruction_banner(frame, expected_step, frame_width, pending_label=None, pending_remaining=None, whistle_mode="manual", cancellation_progress=None):
     if whistle_mode == "auto" and not REQUIRE_WHISTLE_FOR_SCORING:
         mode_text = "WHISTLE (info only)"
         mode_color = (0, 200, 255)
@@ -279,6 +307,12 @@ def draw_instruction_banner(frame, expected_step, frame_width, pending_label=Non
         cv2.rectangle(frame, (0, 0), (frame_width, 60), (30, 30, 30), -1)
         cv2.putText(frame, text, (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2, cv2.LINE_AA)
         cv2.putText(frame, mode_text, (frame_width - 220, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, mode_color, 2)
+        # NEW: show cancellation progress so it's visible on screen that
+        # a same-side authorization is actively racing to cancel this.
+        if cancellation_progress is not None and cancellation_progress[0] > 0:
+            count, needed = cancellation_progress
+            cancel_text = f"cancellation building: {count}/{needed}"
+            cv2.putText(frame, cancel_text, (15, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1, cv2.LINE_AA)
         return
 
     messages = {
@@ -296,7 +330,8 @@ def draw_probability_bars(frame, probs, real_labels, origin_y=190):
     for i, label in enumerate(real_labels):
         score = probs[i]
         bar_color = (0, 255, 0) if score > 0.5 else (255, 255, 255)
-        text = f"{label:<28} {score:.2f}"
+        pretty_label = DISPLAY_NAME.get(label, label)
+        text = f"{pretty_label:<28} {score:.2f}"
         cv2.putText(frame, text, (10, origin_y + i * 28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, bar_color, 2, cv2.LINE_AA)
         bar_x1 = 320
@@ -458,6 +493,7 @@ def main():
     last_confident_append_time = 0.0
     last_committed_label = None
     last_commit_time = 0
+    seen_different_since_last_commit = True
     frame_counter = 0
     show_skeleton = True
     gesture_history = deque(maxlen=8)
@@ -468,6 +504,14 @@ def main():
 
     pending_scoring_label = None
     pending_scoring_since = 0.0
+
+    # NEW: dedicated, FAST, non-tolerant cancellation counter -- see
+    # module docstring "FIX THIS VERSION" for why this had to be
+    # separated from the tolerant streak_label/streak_count. Strict
+    # reset to 0 on any non-matching frame (no decrement tolerance),
+    # by design -- cancellation needs to be fast and reliable, not
+    # forgiving of interruptions.
+    cancellation_streak_count = 0
 
     expected_step = "whistle"
     paused = True
@@ -480,6 +524,7 @@ def main():
     def do_commit(label, now):
         nonlocal last_decision_text, last_decision_color, last_decision_time
         nonlocal last_committed_label, last_commit_time, expected_step
+        nonlocal seen_different_since_last_commit
         result = engine.on_gesture_detected(label, now)
         strict_result = strict_engine.on_gesture_detected(label, now)
         strict_log_writer.writerow([f"{now:.3f}", "gesture", label, strict_result["event"],
@@ -498,15 +543,11 @@ def main():
             elif result["event"] == "reason_attached":
                 expected_step = "whistle"
             elif result["event"] == "authorization_acknowledged":
-                # CHANGED: previously fell through unhandled -- now
-                # correctly shows "waiting for whistle #2" next, since
-                # the engine just consumed whistle #1 for this
-                # authorization and needs a genuine second whistle
-                # before team_to_serve can be accepted.
                 expected_step = "whistle"
         last_decision_time = now
         last_committed_label = label
         last_commit_time = now
+        seen_different_since_last_commit = False
         return result
 
     while True:
@@ -537,12 +578,40 @@ def main():
             current_label, current_conf, full_probs = classify_window(list(rolling_window), model, idx_to_real_label)
             last_probs = full_probs
 
+            if current_label != last_committed_label:
+                seen_different_since_last_commit = True
+
+            # NEW: update the fast, independent cancellation counter
+            # EVERY cycle, regardless of what the tolerant streak_label
+            # is doing. Only relevant/meaningful while a scoring point
+            # is actually pending -- reset to 0 whenever nothing is
+            # pending, so it never carries stale progress into a later,
+            # unrelated pending point.
+            if pending_scoring_label is not None:
+                pending_side = SCORING_SIDE_MAP[pending_scoring_label]
+                pending_same_side_auth = f"service_authorization_{pending_side}"
+                if current_label == pending_same_side_auth:
+                    cancellation_streak_count += 1
+                else:
+                    cancellation_streak_count = 0  # strict reset -- fast reaction, no tolerance
+            else:
+                cancellation_streak_count = 0
+
             if current_label != NOTHING_LABEL:
                 if current_label == streak_label:
                     streak_count += 1
                 else:
-                    streak_label = current_label
-                    streak_count = 1
+                    # Tolerant/decrement logic -- UNCHANGED, still serves
+                    # its original purpose (surviving a brief interruption
+                    # while team_to_serve's OWN streak is still building,
+                    # before anything is pending). No longer relied upon
+                    # for cancellation speed -- see cancellation_streak_count
+                    # above for that.
+                    if streak_label is not None and streak_count > 1:
+                        streak_count -= 1
+                    else:
+                        streak_label = current_label
+                        streak_count = 1
                 last_confident_append_time = time.time()
             elif streak_label is not None and (time.time() - last_confident_append_time) > STALE_VOTE_SECONDS:
                 streak_label = None
@@ -557,24 +626,34 @@ def main():
             engine_reason_this_frame = ""
 
             cancel_check_triggered = False
-            if (pending_scoring_label is not None and streak_label is not None
-                    and streak_count >= FAULT_STREAK_NEEDED_TO_COMMIT):
+            # CHANGED: now gated on the fast, independent
+            # cancellation_streak_count instead of the tolerant
+            # streak_label/streak_count -- this is the actual fix for
+            # the repeated-point-award bug. Reacts in
+            # CANCELLATION_STREAK_NEEDED (3) consecutive matching
+            # frames, same speed as before fix #6 was ever introduced,
+            # regardless of what the tolerant streak is doing.
+            if pending_scoring_label is not None and cancellation_streak_count >= CANCELLATION_STREAK_NEEDED:
                 pending_side = SCORING_SIDE_MAP[pending_scoring_label]
                 pending_same_side_auth = f"service_authorization_{pending_side}"
-                if streak_label == pending_same_side_auth:
-                    # CHANGED: actually commit the authorization to the
-                    # engine now, instead of only clearing local state.
-                    # The new decision_engine.py needs this call to
-                    # register Phase 1 (service_authorization) and
-                    # consume its whistle.
-                    result = do_commit(streak_label, now)
-                    committed_label_this_frame = streak_label
-                    engine_event_this_frame = result["event"]
-                    engine_reason_this_frame = result.get("reason", "")
-                    pending_scoring_label = None
-                    streak_label = None
-                    streak_count = 0
-                    cancel_check_triggered = True
+
+                result = do_commit(pending_same_side_auth, now)
+                committed_label_this_frame = pending_same_side_auth
+                engine_event_this_frame = result["event"]
+                engine_reason_this_frame = result.get("reason", "")
+                pending_scoring_label = None
+                streak_label = None
+                streak_count = 0
+                cancellation_streak_count = 0
+                # FIX (lingering): clear the rolling window on
+                # cancellation too, same as every other real commit --
+                # previously this branch did NOT clear it, so the
+                # buffer kept holding several seconds of the
+                # just-committed gesture's frames, making probability
+                # bars/streak display keep showing elevated readings
+                # for a while after the gesture had already ended.
+                rolling_window.clear()
+                cancel_check_triggered = True
 
             if cancel_check_triggered:
                 pass
@@ -587,6 +666,7 @@ def main():
                 pending_scoring_label = None
                 streak_label = None
                 streak_count = 0
+                cancellation_streak_count = 0
                 rolling_window.clear()
                 engine.last_settle_start_time = None
                 strict_engine.last_settle_start_time = None
@@ -598,16 +678,20 @@ def main():
                     if pending_scoring_label != top_label:
                         pending_scoring_label = top_label
                         pending_scoring_since = now
+                        cancellation_streak_count = 0  # fresh pending point, fresh cancellation tracking
                     streak_count = STREAK_NEEDED_TO_COMMIT
 
                 else:
+                    # NOTE: pending_scoring_label should essentially never
+                    # be non-None here anymore for the same-side-auth case
+                    # specifically -- the top-priority cancellation check
+                    # above now catches that faster, every cycle. This
+                    # branch is kept as a safety fallback only.
                     if pending_scoring_label is not None:
                         pending_side = SCORING_SIDE_MAP[pending_scoring_label]
                         pending_same_side_auth = f"service_authorization_{pending_side}"
 
                         if top_label == pending_same_side_auth:
-                            # CHANGED: same fix as above -- commit the
-                            # authorization instead of only clearing.
                             result = do_commit(top_label, now)
                             committed_label_this_frame = top_label
                             engine_event_this_frame = result["event"]
@@ -615,12 +699,15 @@ def main():
                             pending_scoring_label = None
                             streak_label = None
                             streak_count = 0
+                            cancellation_streak_count = 0
+                            rolling_window.clear()
                         else:
                             result = do_commit(pending_scoring_label, now)
                             committed_label_this_frame = pending_scoring_label
                             engine_event_this_frame = result["event"]
                             engine_reason_this_frame = result.get("reason", "")
                             pending_scoring_label = None
+                            cancellation_streak_count = 0
                             engine.last_settle_start_time = None
                             strict_engine.last_settle_start_time = None
                             fault_result = do_commit(top_label, now)
@@ -632,9 +719,9 @@ def main():
                             rolling_window.clear()
                     else:
                         is_new_gesture = (top_label != last_committed_label)
-                        cooldown_passed = (now - last_commit_time) >= COMMIT_COOLDOWN_SECONDS
+                        repeat_allowed = seen_different_since_last_commit
 
-                        if is_new_gesture or cooldown_passed:
+                        if is_new_gesture or repeat_allowed:
                             result = do_commit(top_label, now)
                             committed_label_this_frame = top_label
                             engine_event_this_frame = result["event"]
@@ -656,9 +743,11 @@ def main():
                         (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 3, cv2.LINE_AA)
         else:
             pending_remaining = None
+            cancellation_progress = None
             if pending_scoring_label is not None:
                 pending_remaining = max(0.0, TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS - (time.time() - pending_scoring_since))
-            draw_instruction_banner(frame, expected_step, frame_width, pending_scoring_label, pending_remaining, whistle_mode["value"])
+                cancellation_progress = (cancellation_streak_count, CANCELLATION_STREAK_NEEDED)
+            draw_instruction_banner(frame, expected_step, frame_width, pending_scoring_label, pending_remaining, whistle_mode["value"], cancellation_progress)
             draw_score_bar(frame, engine, frame_width, frame_height)
             draw_strict_score_small(frame, strict_engine, frame_width)
             draw_vote_progress(frame, streak_label, streak_count, frame_width)
@@ -709,6 +798,7 @@ def main():
                 streak_label = None
                 streak_count = 0
                 pending_scoring_label = None
+                cancellation_streak_count = 0
                 frame_counter = 0
                 print("  -> RESUMED (cleared stale buffer)")
             else:

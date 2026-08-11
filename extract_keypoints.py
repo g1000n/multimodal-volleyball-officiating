@@ -1,5 +1,6 @@
 """
 extract_keypoints.py (v6 — Pose + COMBINED-CROP two-hand detection + finger extension)
+
 [OPTIMIZED: multiprocessing + auto warm-up fix + timer + alarm]
 [INCREMENTAL: process_manifest() now skips already-extracted clips, only
  processes new ones — e.g. after adding a new "nothing" class, this turns
@@ -46,10 +47,21 @@ SPEED:
   _init_worker() below).
 - Wall-clock time printed at the end.
 - 3 beeps (Windows only) when extraction finishes.
+
+--------------------------------------------------------------------
+AUTO-LOGGING (this version): every run automatically saves its full
+console output (per-clip progress, low-pose-detection warnings, the
+hand-detection-rate-per-class diagnostic table, elapsed time) to
+training_logs/extract_<timestamp>.log, matching the same pattern
+already used by train.py and dataset_split.py. All the prints in
+process_manifest() happen in the MAIN process (workers themselves
+never print), so wrapping just the main process's stdout is enough --
+no changes needed to the multiprocessing Pool/worker setup itself.
 """
 
 import os
 import csv
+import sys
 import time
 import cv2
 import numpy as np
@@ -60,6 +72,26 @@ from multiprocessing import Pool, cpu_count
 
 MANIFEST_PATH = "data/dataset_manifest.csv"
 KEYPOINTS_DIR = "data/keypoints"
+
+# --- AUTO-LOGGING (new) -- see module docstring for why this exists. ---
+TRAINING_LOGS_DIR = "training_logs"
+
+
+class _Tee:
+    """Writes to both the real console and a log file at once, so you
+    still see normal output live while it's also being saved."""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
 
 mp_pose = mp.solutions.pose
 mp_hands = mp.solutions.hands
@@ -93,7 +125,9 @@ CROP_MARGIN_MULTIPLIER = 1.5
 # almost always concluded "would overlap," silently forcing the
 # combined (lower-resolution) branch even for widely spread arms.
 SINGLE_CROP_MARGIN_MULTIPLIER = 0.9
+
 MIN_VISIBILITY_FOR_CROP = 0.18
+
 # If the wrists are farther apart than this (relative to shoulder width),
 # use two separate high-resolution crops instead of one wide combined
 # crop. Close together = combined crop (avoids double-detecting the same
@@ -152,17 +186,13 @@ def compute_elbow_angles(pose_landmarks):
         shoulder = pose_landmarks[shoulder_id]
         elbow = pose_landmarks[elbow_id]
         wrist = pose_landmarks[wrist_id]
-
         if elbow.visibility < 0.3:
             return 0.5
-
         v1 = np.array([shoulder.x - elbow.x, shoulder.y - elbow.y])
         v2 = np.array([wrist.x - elbow.x, wrist.y - elbow.y])
         norm1, norm2 = np.linalg.norm(v1), np.linalg.norm(v2)
-
         if norm1 < 1e-6 or norm2 < 1e-6:
             return 0.5
-
         cos_angle = np.clip(np.dot(v1, v2) / (norm1 * norm2), -1.0, 1.0)
         angle_radians = np.arccos(cos_angle)
         return angle_radians / np.pi
@@ -184,7 +214,6 @@ def get_combined_hand_crop_box(left_wrist, right_wrist, shoulder_width_px, frame
     which can cause a clearly-visible hand to go undetected.
     """
     margin = shoulder_width_px * CROP_MARGIN_MULTIPLIER
-
     xs, ys = [], []
     if left_wrist.visibility >= MIN_VISIBILITY_FOR_CROP:
         xs.append(left_wrist.x * frame_width)
@@ -192,15 +221,12 @@ def get_combined_hand_crop_box(left_wrist, right_wrist, shoulder_width_px, frame
     if right_wrist.visibility >= MIN_VISIBILITY_FOR_CROP:
         xs.append(right_wrist.x * frame_width)
         ys.append(right_wrist.y * frame_height)
-
     if not xs:
         return None
-
     x1 = int(max(0, min(xs) - margin))
     x2 = int(min(frame_width, max(xs) + margin))
     y1 = int(max(0, min(ys) - margin))
     y2 = int(min(frame_height, max(ys) + margin))
-
     if x2 - x1 < 20 or y2 - y1 < 20:
         return None
     return (x1, y1, x2, y2)
@@ -216,16 +242,13 @@ def get_single_wrist_crop_box(wrist_landmark, shoulder_width_px, frame_width, fr
     """
     if wrist_landmark.visibility < MIN_VISIBILITY_FOR_CROP:
         return None
-
     cx = wrist_landmark.x * frame_width
     cy = wrist_landmark.y * frame_height
     half_size = max(shoulder_width_px * SINGLE_CROP_MARGIN_MULTIPLIER, 35)
-
     x1 = int(max(0, cx - half_size))
     x2 = int(min(frame_width, cx + half_size))
     y1 = int(max(0, cy - half_size))
     y2 = int(min(frame_height, cy + half_size))
-
     if x2 - x1 < 20 or y2 - y1 < 20:
         return None
     return (x1, y1, x2, y2)
@@ -235,14 +258,11 @@ def detect_hands_in_combined_crop(frame_rgb, crop_box, hands_model):
     """Returns a list of (hand_landmarks, full_frame_coords) — 0, 1, or 2 hands."""
     x1, y1, x2, y2 = crop_box
     crop = frame_rgb[y1:y2, x1:x2]
-
     results = hands_model.process(crop)
     if not results.multi_hand_landmarks:
         return []
-
     crop_width, crop_height = x2 - x1, y2 - y1
     frame_height, frame_width = frame_rgb.shape[:2]
-
     detected = []
     for hand_landmarks in results.multi_hand_landmarks:
         converted_coords = []
@@ -251,7 +271,6 @@ def detect_hands_in_combined_crop(frame_rgb, crop_box, hands_model):
             full_y = (lm.y * crop_height + y1) / frame_height
             converted_coords.append((full_x, full_y))
         detected.append((hand_landmarks, converted_coords))
-
     return detected
 
 
@@ -266,7 +285,6 @@ def debug_get_crop_info(pose_landmarks, frame_width, frame_height):
     """
     if pose_landmarks is None:
         return "none", []
-
     left_shoulder = pose_landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER]
     right_shoulder = pose_landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER]
     shoulder_width_px = abs(left_shoulder.x - right_shoulder.x) * frame_width
@@ -357,12 +375,10 @@ def extract_hand_features(frame_rgb, pose_landmarks, hands_model):
         dx = (left_wrist_lm.x - right_wrist_lm.x) * frame_width
         dy = (left_wrist_lm.y - right_wrist_lm.y) * frame_height
         wrist_dist_px = np.sqrt(dx * dx + dy * dy)
-
         single_crop_half_size = max(shoulder_width_px * SINGLE_CROP_MARGIN_MULTIPLIER, 35)
         # Two crops of this half-size, centered on each wrist, would
         # touch/overlap once the wrists are closer than 2x half-size.
         crops_would_overlap = wrist_dist_px < (2 * single_crop_half_size)
-
         use_combined_crop = crops_would_overlap
     # NEW: LIVE_FAST_MODE skips the distance check entirely and always
     # uses the combined crop -- caps hand detection to ONE MediaPipe
@@ -379,6 +395,7 @@ def extract_hand_features(frame_rgb, pose_landmarks, hands_model):
 
         left_wrist_full = np.array([left_wrist_lm.x, left_wrist_lm.y])
         right_wrist_full = np.array([right_wrist_lm.x, right_wrist_lm.y])
+
         hand_centroids = [np.array(coords).mean(axis=0) for _, coords in detected_hands]
 
         assignments = {}
@@ -448,7 +465,6 @@ def extract_keypoints_from_video(video_path, pose_model, hands_model):
             break
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
         pose_results = pose_model.process(frame_rgb)
         pose_features, pose_landmarks = extract_pose_features(pose_results)
 
@@ -561,12 +577,13 @@ def _process_one_clip(row):
         "left_hand_rate": hand_stats["left_hand_rate"],
         "right_hand_rate": hand_stats["right_hand_rate"],
     }
+
     return row, diagnostic
 
 
 def process_manifest():
     """
-    NEW: incremental extraction. Skips any row that already has a
+    Incremental extraction. Skips any row that already has a
     keypoint_path pointing to a .npy file that STILL EXISTS on disk --
     only genuinely new rows (e.g. a newly added "nothing" class, or any
     other freshly added clips) get processed. Turns a ~50-60 min full
@@ -646,7 +663,6 @@ def process_manifest():
     # done and skipped, so the manifest written back out still contains
     # every clip, not just the ones processed in this run.
     all_final_rows = already_done_rows + updated_rows
-
     fieldnames = list(all_final_rows[0].keys())
     with open(MANIFEST_PATH, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -682,4 +698,21 @@ def process_manifest():
 
 
 if __name__ == "__main__":
-    process_manifest()
+    # --- AUTO-LOGGING SETUP: everything printed during this run also
+    # gets saved to training_logs/extract_<timestamp>.log. All prints
+    # in process_manifest() happen in the main process (workers
+    # themselves never print), so wrapping just this process's stdout
+    # is enough to capture everything. ---
+    os.makedirs(TRAINING_LOGS_DIR, exist_ok=True)
+    run_timestamp = time.strftime("%Y-%m-%d_%H%M%S")
+    log_path = os.path.join(TRAINING_LOGS_DIR, f"extract_{run_timestamp}.log")
+    log_file = open(log_path, "w")
+    original_stdout = sys.stdout
+    sys.stdout = _Tee(original_stdout, log_file)
+
+    try:
+        process_manifest()
+    finally:
+        sys.stdout = original_stdout
+        log_file.close()
+        print(f"Full run log saved to: {log_path}")

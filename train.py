@@ -87,6 +87,23 @@ deeper question (why isn't the base model using an available, clean,
 well-scaled signal) is a real, UNRESOLVED, separate issue -- likely a
 training dynamics or model-capacity question, not a data problem.
 
+--------------------------------------------------------------------
+AUTO-LOGGING (this version): every run now automatically saves its
+full console output to training_logs/train_<timestamp>.log, with a
+manifest snapshot (per-class/per-person clip counts at that exact
+moment) written at the top of the log. Also archives the resulting
+model + label map to model_checkpoints/<timestamp>/ after every run.
+This exists because this project has repeatedly hit confusing
+situations where two people got very different results from what
+looked like "the same" run -- turned out to be silent manifest/data
+differences between machines, only caught after painstaking manual
+comparison. A saved log + manifest snapshot per run makes that
+immediately checkable afterward, and the archived checkpoint means a
+worse retrain never silently destroys the only copy of a better
+model (models/final_model.pt itself is overwritten every run and is
+NOT tracked in git). See _Tee, _manifest_snapshot_text, and the
+__main__ block at the bottom.
+
 Run order (full pipeline, UNCHANGED):
     1. build_manifest.py
     2. extract_keypoints.py
@@ -96,10 +113,18 @@ Run order (full pipeline, UNCHANGED):
 
 import csv
 import json
+import os
+import shutil
+import sys
+import time
 import numpy as np
 import torch
 import torch.nn as nn
 import random
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend -- saves to file, doesn't try to open a window
+import matplotlib.pyplot as plt
+from collections import Counter
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 
@@ -163,13 +188,35 @@ SAME_SIDE_SCORE_AUTH_PAIRS = {
     frozenset({"team_to_serve_right", "service_authorization_right"}): "right",
 }
 
-# NEW: ball_in vs service_authorization_X. Same disambiguating signal as
+# ball_in vs service_authorization_X. Same disambiguating signal as
 # above (straight arm = ball_in, bent elbow = service_authorization).
 # ball_in has no side of its own, so when it's confused with a specific
 # side's service_authorization, THAT side's elbow angle is checked.
 BALL_IN_VS_AUTH_PAIRS = {
     frozenset({"ball_in", "service_authorization_left"}): "left",
     frozenset({"ball_in", "service_authorization_right"}): "right",
+}
+
+# NEW: ball_in vs team_to_serve_left/right. DIFFERENT signal than the
+# pairs above -- both ball_in and team_to_serve are fairly straight-
+# armed gestures, so elbow angle can't tell them apart (that's WHY this
+# confusion persisted even after removing pmax clips visually flagged
+# as "looking ambiguous" -- the real disambiguating feature was never
+# tested). The actual separating signal, measured directly from real
+# data via check_elevation_separation.py: WRIST ELEVATION relative to
+# shoulder (a DIFFERENT metric than elbow angle -- how HIGH the arm is
+# raised, not how BENT it is). ball_in points lower/more downward;
+# team_to_serve points higher. Confirmed clean, zero-overlap separation:
+#   team_to_serve_left   range -1.685 to -0.325 (mean -0.955)
+#   team_to_serve_right  range -1.762 to -0.701 (mean -1.244)
+#   ball_in               range -2.567 to -1.957 (mean -2.285)
+BALL_IN_VS_TTS_PAIRS = {
+    frozenset({"ball_in", "team_to_serve_left"}): "left",
+    frozenset({"ball_in", "team_to_serve_right"}): "right",
+}
+BALL_IN_TTS_ELEVATION_THRESHOLD = {
+    "left": -1.821,   # midpoint of gap between ball_in max (-1.957) and team_to_serve_left min (-1.685)
+    "right": -1.860,  # midpoint of gap between ball_in max (-1.957) and team_to_serve_right min (-1.762)
 }
 
 STRAIGHT_ARM_ELBOW_THRESHOLD = 0.786  # RECALIBRATED from real measured data (was 0.5,
@@ -198,6 +245,47 @@ LEARNING_RATE = 5e-4
 GRAD_CLIP_NORM = 1.0
 MODEL_SAVE_PATH = "models/final_model.pt"
 LABEL_MAP_SAVE_PATH = "models/label_map.json"
+CONFUSION_MATRIX_SAVE_PATH = "models/confusion_matrix.png"  # overwritten every run,
+# archived into model_checkpoints/<timestamp>/ alongside the model -- same pattern.
+
+# --- AUTO-LOGGING (new) -- see module docstring for why this exists. ---
+TRAINING_LOGS_DIR = "training_logs"
+CHECKPOINTS_DIR = "model_checkpoints"
+
+
+class _Tee:
+    """Writes to both the real console and a log file at once, so you
+    still see normal output live while it's also being saved."""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
+def _manifest_snapshot_text():
+    """Returns a short, human-readable summary of the CURRENT manifest
+    state (total rows, per-class counts, per-person counts) -- the
+    exact numbers that mattered when this project's pmax/data-sync
+    confusion got debugged. Safe to call even if the manifest is
+    missing/empty."""
+    if not os.path.exists(MANIFEST_PATH):
+        return "MANIFEST SNAPSHOT: no manifest file found."
+    with open(MANIFEST_PATH, "r") as f:
+        rows = list(csv.DictReader(f))
+    lines = ["MANIFEST SNAPSHOT AT TIME OF THIS RUN:", f"  Total rows: {len(rows)}", "  Per gesture_label:"]
+    for label, count in sorted(Counter(r["gesture_label"] for r in rows).items()):
+        lines.append(f"    {label}: {count}")
+    lines.append("  Per person_id:")
+    for person, count in sorted(Counter(r["person_id"] for r in rows).items()):
+        lines.append(f"    {person}: {count}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------
@@ -347,6 +435,39 @@ def is_peace_sign(finger_block_avg):
     return index_extended and middle_extended and ring_curled and pinky_curled
 
 
+def get_wrist_elevation(raw_sequence, side):
+    """
+    NEW: computes (shoulder_y - wrist_y) / shoulder_width, averaged
+    across the clip -- POSITIVE and LARGE means the wrist sits well
+    ABOVE the shoulder (a high point, like team_to_serve); near zero
+    or negative means the wrist is at or below shoulder height (a
+    lower point, like ball_in). Uses the RAW pose columns directly
+    (columns 0-23, before any normalization/ablation), same layout as
+    the elbow-angle checks above.
+
+    Raw pose column layout (each landmark = 3 consecutive columns:
+    x, y, visibility): LEFT_SHOULDER=0 (cols 0-2), RIGHT_SHOULDER=1
+    (cols 3-5), LEFT_ELBOW=2 (cols 6-8), RIGHT_ELBOW=3 (cols 9-11),
+    LEFT_WRIST=4 (cols 12-14), RIGHT_WRIST=5 (cols 15-17).
+    """
+    if side == "left":
+        sh_y_col, wr_y_col = 1, 13
+    else:
+        sh_y_col, wr_y_col = 4, 16
+
+    left_sh_x = raw_sequence[:, 0]
+    right_sh_x = raw_sequence[:, 3]
+    shoulder_width = np.abs(left_sh_x - right_sh_x)
+    valid = shoulder_width > 1e-6
+    if not np.any(valid):
+        return 0.0
+
+    sh_y = raw_sequence[valid, sh_y_col]
+    wr_y = raw_sequence[valid, wr_y_col]
+    elevation = (sh_y - wr_y) / shoulder_width[valid]
+    return float(elevation.mean())
+
+
 def apply_tie_breaker(raw_sequence, top1_label, top2_label, top1_prob, top2_prob):
     """
     Tie-breaker checks, tried in order:
@@ -356,9 +477,9 @@ def apply_tie_breaker(raw_sequence, top1_label, top2_label, top1_prob, top2_prob
        service_authorization). UNCONDITIONAL (see module docstring for
        why the previous margin-gated version missed real confusions).
 
-    2. NEW: ball_in vs. service_authorization_X -- same elbow-angle
-       logic (straight arm = ball_in, bent elbow =
-       service_authorization). Also UNCONDITIONAL.
+    2. ball_in vs. service_authorization_X -- same elbow-angle logic
+       (straight arm = ball_in, bent elbow = service_authorization).
+       Also UNCONDITIONAL.
 
     3. UNCHANGED: double_contact vs. service_authorization_left/right,
        using peace-sign finger detection. Only fires when BOTH top1 and
@@ -388,6 +509,17 @@ def apply_tie_breaker(raw_sequence, top1_label, top2_label, top1_prob, top2_prob
         auth_label = f"service_authorization_{side}"
 
         return "ball_in" if avg_elbow_angle >= STRAIGHT_ARM_ELBOW_THRESHOLD else auth_label
+
+    if label_pair in BALL_IN_VS_TTS_PAIRS:
+        side = BALL_IN_VS_TTS_PAIRS[label_pair]
+        elevation = get_wrist_elevation(raw_sequence, side)
+        threshold = BALL_IN_TTS_ELEVATION_THRESHOLD[side]
+
+        scoring_label = f"team_to_serve_{side}"
+
+        # Higher (less negative) elevation = wrist raised higher = team_to_serve.
+        # Lower (more negative) elevation = wrist at/below shoulder = ball_in.
+        return scoring_label if elevation >= threshold else "ball_in"
 
     if top1_label not in CONFUSABLE_CLASSES or top2_label not in CONFUSABLE_CLASSES:
         return top1_label
@@ -432,7 +564,7 @@ def decide_label(sigmoid_probs, idx_to_real_label):
     return top1_label, top1_label, top2_label, top1_prob, top2_prob
 
 
-def train():
+def train(run_timestamp="unspecified_run"):
     rows = load_manifest_rows()
 
     all_labels = sorted(set(r["gesture_label"] for r in rows))          # includes "nothing", for reporting only
@@ -560,7 +692,33 @@ def train():
     print(classification_report(all_true, all_preds, labels=all_labels, zero_division=0))
     print("Confusion matrix (rows=true, cols=predicted):")
     print(f"Labels order: {all_labels}")
-    print(confusion_matrix(all_true, all_preds, labels=all_labels))
+    cm = confusion_matrix(all_true, all_preds, labels=all_labels)
+    print(cm)
+
+    # --- NEW: save the confusion matrix as an actual image (PNG heatmap),
+    # not just printed text -- for direct use in the thesis Results
+    # chapter, and easier to scan at a glance than a wall of numbers.
+    # Uses matplotlib only (no seaborn dependency, to avoid an extra
+    # install requirement) -- annotates each cell with its raw count. ---
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_xticks(range(len(all_labels)))
+    ax.set_yticks(range(len(all_labels)))
+    ax.set_xticklabels(all_labels, rotation=45, ha="right")
+    ax.set_yticklabels(all_labels)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(f"Confusion Matrix -- {run_timestamp}")
+    max_val = cm.max() if cm.max() > 0 else 1
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            text_color = "white" if cm[i, j] > max_val / 2 else "black"
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center", color=text_color, fontsize=9)
+    fig.colorbar(im, ax=ax)
+    fig.tight_layout()
+    fig.savefig(CONFUSION_MATRIX_SAVE_PATH, dpi=150)
+    plt.close(fig)
+    print(f"Confusion matrix image saved to: {CONFUSION_MATRIX_SAVE_PATH}")
 
     print(f"\nModel saved to: {MODEL_SAVE_PATH}")
     print(f"Label map saved to: {LABEL_MAP_SAVE_PATH}")
@@ -568,4 +726,39 @@ def train():
 
 
 if __name__ == "__main__":
-    train()
+    # --- AUTO-LOGGING SETUP: everything printed during this run also
+    # gets saved to training_logs/train_<timestamp>.log, and the
+    # current manifest state is written into that same file so you
+    # always know exactly what data produced these results. ---
+    os.makedirs(TRAINING_LOGS_DIR, exist_ok=True)
+    run_timestamp = time.strftime("%Y-%m-%d_%H%M%S")
+    log_path = os.path.join(TRAINING_LOGS_DIR, f"train_{run_timestamp}.log")
+    log_file = open(log_path, "w")
+    original_stdout = sys.stdout
+    sys.stdout = _Tee(original_stdout, log_file)
+
+    print(_manifest_snapshot_text())
+    print()
+
+    try:
+        train(run_timestamp)
+    finally:
+        # --- AUTO-ARCHIVE: copy the resulting model + label map + confusion
+        # matrix image into a dated checkpoint folder, so a later retrain
+        # that turns out worse doesn't silently destroy the only copy of a
+        # good model (models/final_model.pt itself gets overwritten every
+        # run and is NOT tracked in git). Only archives if a model was
+        # actually produced this run. ---
+        if os.path.exists(MODEL_SAVE_PATH):
+            checkpoint_dir = os.path.join(CHECKPOINTS_DIR, run_timestamp)
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            shutil.copy(MODEL_SAVE_PATH, checkpoint_dir)
+            if os.path.exists(LABEL_MAP_SAVE_PATH):
+                shutil.copy(LABEL_MAP_SAVE_PATH, checkpoint_dir)
+            if os.path.exists(CONFUSION_MATRIX_SAVE_PATH):
+                shutil.copy(CONFUSION_MATRIX_SAVE_PATH, checkpoint_dir)
+            print(f"\nCheckpoint archived to: {checkpoint_dir}")
+
+        sys.stdout = original_stdout
+        log_file.close()
+        print(f"Full run log saved to: {log_path}")

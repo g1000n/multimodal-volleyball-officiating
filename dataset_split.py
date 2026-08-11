@@ -13,13 +13,13 @@ Handles real-world messiness automatically:
   test, 1 different person for val, rest go to train.
 - If a gesture class has only 2-3 people: hold out 1 person for test,
   no separate val person (val is carved from the train people's clips
-  instead) — printed as a notice, not silently done.
+  instead) -- printed as a notice, not silently done.
 - If a gesture class has only 1 person: true subject-holdout isn't
   possible. Falls back to a clip-level split for that class only, and
   prints a clear warning so you can mention this as a known limitation.
 
 --------------------------------------------------------------------
-FIX (this version): previously, ONE random.seed(SEED) call at the top
+FIX (earlier version): previously, ONE random.seed(SEED) call at the top
 seeded a single shared random stream, and every class's shuffle drew
 from that same stream sequentially. That meant adding/removing people
 from ONE class (e.g. adding new volunteers to ball_out) changed how
@@ -34,19 +34,51 @@ Fixed by giving each class its OWN independent random.Random() instance,
 seeded deterministically from (SEED, gesture_label). Adding data to one
 class can now only ever affect that class's own held-out assignment --
 never any other class's.
---------------------------------------------------------------------
 
-Safe to re-run any time you add more clips — it recalculates from
+--------------------------------------------------------------------
+AUTO-LOGGING (this version): every run automatically saves its full
+console output (per-class split decisions, warnings, final summary
+table) to training_logs/split_<timestamp>.log, matching the same
+pattern already used by train.py. This exists because this project has
+repeatedly hit confusing situations where a class's test accuracy
+changed between two runs, and the actual cause turned out to be that
+which person got held out for test/val for that class had silently
+shifted -- something that's only visible if this console output is
+actually saved, not just scrolled past in a terminal.
+
+Safe to re-run any time you add more clips -- it recalculates from
 scratch based on whatever is currently in the manifest.
 """
 
 import csv
+import os
 import random
+import sys
+import time
 from collections import defaultdict
 
 MANIFEST_PATH = "data/dataset_manifest.csv"
 SEED = 42
 VAL_FRACTION_OF_TRAIN_CLIPS = 0.15   # only used in the clip-level fallback
+
+# --- AUTO-LOGGING (new) -- see module docstring for why this exists. ---
+TRAINING_LOGS_DIR = "training_logs"
+
+
+class _Tee:
+    """Writes to both the real console and a log file at once, so you
+    still see normal output live while it's also being saved."""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
 
 
 def load_manifest():
@@ -74,6 +106,7 @@ def assign_splits(rows):
         row["split"] = ""  # will fill in below
 
     print("=" * 60)
+
     # sorted() so class processing order is always the same regardless
     # of manifest row order or dict iteration order
     for gesture_label, people in sorted(class_to_people.items()):
@@ -118,6 +151,7 @@ def assign_splits(rows):
             for p in train_people:
                 train_indices.extend(people[p])
             class_rng.shuffle(train_indices)  # FIX: was random.shuffle(...)
+
             num_val = max(1, int(len(train_indices) * VAL_FRACTION_OF_TRAIN_CLIPS))
             val_indices = train_indices[:num_val]
             train_only_indices = train_indices[num_val:]
@@ -140,7 +174,6 @@ def assign_splits(rows):
             n = len(indices)
             n_test = max(1, int(n * 0.15))
             n_val = max(1, int(n * 0.15))
-
             test_indices = indices[:n_test]
             val_indices = indices[n_test:n_test + n_val]
             train_indices = indices[n_test + n_val:]
@@ -174,15 +207,28 @@ def print_summary(rows):
 
 
 if __name__ == "__main__":
-    rows = load_manifest()
-    if not rows:
-        print("Manifest is empty — run build_manifest.py first.")
-        exit()
+    # --- AUTO-LOGGING SETUP: everything printed during this run also
+    # gets saved to training_logs/split_<timestamp>.log -- see module
+    # docstring for why this matters (silently shifted test/val
+    # assignments have caused real, confusing accuracy swings before). ---
+    os.makedirs(TRAINING_LOGS_DIR, exist_ok=True)
+    run_timestamp = time.strftime("%Y-%m-%d_%H%M%S")
+    log_path = os.path.join(TRAINING_LOGS_DIR, f"split_{run_timestamp}.log")
+    log_file = open(log_path, "w")
+    original_stdout = sys.stdout
+    sys.stdout = _Tee(original_stdout, log_file)
 
-    rows = assign_splits(rows)
-
-    fieldnames = list(rows[0].keys())
-    save_manifest(rows, fieldnames)
-
-    print_summary(rows)
-    print(f"\nManifest updated with 'split' column: {MANIFEST_PATH}")
+    try:
+        rows = load_manifest()
+        if not rows:
+            print("Manifest is empty — run build_manifest.py first.")
+        else:
+            rows = assign_splits(rows)
+            fieldnames = list(rows[0].keys())
+            save_manifest(rows, fieldnames)
+            print_summary(rows)
+            print(f"\nManifest updated with 'split' column: {MANIFEST_PATH}")
+    finally:
+        sys.stdout = original_stdout
+        log_file.close()
+        print(f"Full run log saved to: {log_path}")
