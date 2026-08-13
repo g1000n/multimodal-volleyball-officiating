@@ -1,46 +1,39 @@
 from pathlib import Path
 import uuid
 
-ROOT = Path(r"C:\Users\notgi\Downloads\drive-download-20260803T105039Z-1-001")
+FOLDER = Path(
+    r"C:\Users\notgi\Downloads\drive-download-20260810T173103Z-1-001\steady_liam_"
+)
 
-PERSON = "p08"
-PREFIX = "ball_in"
+PERSON = "p09"
+PREFIX = "nothing"
 
-FOLDERS = [
-    "ball_in_right_dwayne_",
-    "ball_in_right_version2_dwayne",
-    "ball_in_left_dwayne",
-    "ball_in_left_ver2_dwayne",
-]
+files = sorted(
+    f for f in FOLDER.iterdir()
+    if f.is_file()
+)
 
-next_number = 1
+print(f"Found {len(files)} files.")
 
-for folder_name in FOLDERS:
+# PASS 1: temporary names
+temp_files = []
 
-    folder = ROOT / folder_name
+for file in files:
+    temp_name = f"__tmp__{uuid.uuid4().hex}{file.suffix.lower()}"
+    temp_path = FOLDER / temp_name
 
-    if not folder.exists():
-        print(f"Skipping {folder_name}")
-        continue
+    file.rename(temp_path)
+    temp_files.append(temp_path)
 
-    files = sorted(f for f in folder.iterdir() if f.is_file())
+# PASS 2: final names
+for i, temp_file in enumerate(temp_files, start=1):
 
-    # PASS 1: rename to temporary names
-    temp_files = []
+    new_name = f"{PREFIX}_{PERSON}_{i}{temp_file.suffix.lower()}"
 
-    for file in files:
-        temp = folder / f"__tmp__{uuid.uuid4().hex}{file.suffix.lower()}"
-        file.rename(temp)
-        temp_files.append(temp)
+    temp_file.rename(FOLDER / new_name)
 
-    # PASS 2: rename to final names
-    start = next_number
+print(f"Renamed {len(files)} files.")
 
-    for temp in temp_files:
-        final = folder / f"{PREFIX}_{PERSON}_{next_number}{temp.suffix.lower()}"
-        temp.rename(final)
-        next_number += 1
-
-    print(f"{folder_name}: {start} -> {next_number - 1}")
-
-print(f"\nTotal renamed: {next_number - 1}")
+if files:
+    print(f"First: {PREFIX}_{PERSON}_1{files[0].suffix.lower()}")
+    print(f"Last:  {PREFIX}_{PERSON}_{len(files)}{files[-1].suffix.lower()}")
