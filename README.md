@@ -1,149 +1,130 @@
-# multimodal-volleyball-officiating
+# Multimodal Volleyball Officiating System
 
-## Whistle Detection Pipeline
+An automated volleyball officiating assistant that watches a referee through a camera
+and listens for their whistle, then uses that to keep score automatically. It recognizes
+the referee's official hand signals in real time (using MediaPipe pose tracking and a
+CNN-LSTM gesture classifier), listens for whistle blasts, and runs both through a decision
+engine that follows the real FIVB officiating sequence — so a point is only added when a
+recognized "team to serve" signal happens at the right point in that sequence, not just
+whenever a gesture looks similar to one.
 
-Audio whistle-detection module for the Multimodal Real-Time Officiating System
-(gesture recognition + whistle detection + automated scoring).
+Built as a BS Computer Science thesis project at Holy Angel University.
 
-**Scope note:** whistle detection is binary (Whistle / No Whistle) only. It does
-NOT classify blast duration or call type -- that distinction is not reliable from
-audio alone and isn't needed, since the gesture recognition module determines what
-the call means. The whistle's only job is to trigger/validate that a call happened.
+## Quick Start
 
-## Getting the latest code (for groupmates)
+```bash
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+pip install -r requirements.txt
 
-```powershell
-git pull origin audio
+python main.py                # starts the system directly
 ```
 
-## Environment setup (one-time)
+That's the whole interface — `python main.py` with no arguments launches the live camera
+system immediately. See `HOW_TO_RUN.md` for a plain-language walkthrough (including on-screen
+controls) if you're running a demo for someone unfamiliar with the codebase.
 
-Use **Python 3.12** -- Python 3.14 has known DLL compatibility issues with
-numba/librosa on Windows.
+For the two-iPhone camera/microphone hardware setup specifically, see `HardwareSetup.md`.
 
-```powershell
-py -3.12 -m venv whistle_env
-whistle_env\Scripts\activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+
+## Project Structure
+
+```
+.
+├── main.py                          # interactive menu -- run this first
+├── train.py                         # trains the gesture classifier
+├── decision_engine.py               # sequences gestures into scoring events (FIVB rules)
+├── model.py                         # CNN-LSTM architecture
+├── extract_keypoints.py             # video -> MediaPipe keypoints
+├── build_manifest.py                # scans data/raw_clips/ -> dataset_manifest.csv
+├── dataset_split.py                 # person-based (subject-holdout) train/val/test split
+├── convert_maxlsb_nothing_data.py   # converts MaxLSB/volley-judge's external dataset
+├── whistle_detector.py              # real-time whistle detection (audio)
+├── scoreboard_gui.py                # scoreboard display
+├── live_deployment.py               # real-time deployment (camera + live inference)
+├── replay_recorded_footage.py       # replays a saved recording through the same pipeline
+│
+├── diagnostics/                     # standalone data-quality / model-behavior checks
+├── tools/                           # one-off data-fix / maintenance scripts
+├── tests/                           # decision_engine unit tests, reference-clip validation
+│
+├── data/                            # NOT fully in git -- see Data section below
+├── models/                          # active model files (final_model.pt, etc.) -- gitignored
+├── model_checkpoints/                # archived model snapshot per training run -- gitignored
+└── training_logs/                    # full console output per pipeline run -- gitignored
 ```
 
-Every new terminal session needs `whistle_env\Scripts\activate` run again first.
+## Full Training Pipeline
 
-## Data setup (one-time)
+Run in this order (or use `python main.py train`, which runs them for you):
 
-**Volleylitics (public match audio):**
-```powershell
-python -m pip install -U huggingface_hub
-hf download GYdevy/volleyball-whistles --repo-type dataset --local-dir raw_data/volleylitics
-```
-If `hf` isn't recognized as a command, try one of these instead:
-```powershell
-huggingface-cli download GYdevy/volleyball-whistles --repo-type dataset --local-dir raw_data/volleylitics
-```
-or, as a fallback that should always work:
-```powershell
-python -m huggingface_hub download GYdevy/volleyball-whistles --repo-type dataset --local-dir raw_data/volleylitics
+```bash
+python build_manifest.py               # scans data/raw_clips/, rebuilds the manifest
+python convert_maxlsb_nothing_data.py  # re-adds pmax's converted external data
+python extract_keypoints.py            # extracts MediaPipe keypoints for any new clips
+python dataset_split.py                # assigns train/val/test (person-based holdout)
+python train.py                        # trains the model, saves models/final_model.pt
 ```
 
-**iPhone recordings (co-primary source, private -- not on Hugging Face):**
-1. Download from this shared Drive folder:
-   https://drive.google.com/drive/folders/1QsFHW6hpkjNp6-fj4D7KCkzXxZdK81Wn?usp=sharing
-2. Place the folders into these exact paths:
+**Important:** `build_manifest.py` does a full rescan of `data/raw_clips/`, which wipes
+`pmax`'s converted rows (they point at external paths, not files under `raw_clips/`).
+**Always run `convert_maxlsb_nothing_data.py` again immediately after `build_manifest.py`**,
+before `dataset_split.py` — otherwise `pmax`'s contribution to `nothing`, `ball_out`,
+`double_contact`, and `team_to_serve_left/right` silently disappears from that run.
 
-raw_data/iphone_recordings/
-├── positive_audio/ <- clean whistle-only session(s), .m4a or .wav
-├── positive_negative_audio/ <- noisy session(s), whistles + background noise mixed in
-└── negative_audio/ <- pure ambient noise, NO whistles at all
+## Live Usage
 
-Do not mix whistle-containing and whistle-free audio in the same file --
-`04_process_iphone_negatives.py` has no whistle-location awareness and would
-mislabel whistle audio as negative if they're combined.
-
-## Full pipeline (run in order)
-
-```powershell
-python scripts/01_audit_json.py
-python scripts/09_sample_calibration_timestamps.py     # manual QC listening pass
-python scripts/02_extract_whistle_clips.py              # Volleylitics whistle clips
-python scripts/03_extract_match_negatives.py            # Volleylitics negative clips
-
-# iPhone data:
-python scripts/04a_detect_iphone_whistle_candidates.py    # auto-detect candidates in positive_audio/ + positive_negative_audio/
-#  -> open processed/iphone_whistle_candidates.csv, confirm each row y/n in VLC (Ctrl+T to jump to vlc_jump_time), save
-python scripts/04b_extract_iphone_whistles.py             # extracts confirmed whistle clips -> iphone_whistle_index.csv
-python scripts/04_process_iphone_negatives.py             # only reads negative_audio/ -> iphone_negative_index.csv
-python scripts/04c_synthetic_hard_negatives.py             # synthetic squeak/bounce hard negatives -> synthetic_negative_index.csv
-
-python scripts/05_extract_features.py                     # combines ALL sources -> features.csv
-python scripts/06_train_model.py                          # edit TEST_MATCHES first, see below
-python scripts/07_evaluate.py                              # run once, don't re-tune on this result
-
-python scripts/08_realtime_ui.py                           # live mic test -- GUI: confidence bar, live mic energy, adjustable threshold
+```bash
+python live_deployment.py              # real-time camera + decision engine + scoreboard
+python replay_recorded_footage.py <path>   # re-run a saved session through the same pipeline
 ```
 
-## Important settings to check before training
+`live_deployment.py` records two videos every session into `data/raw_recordings/`
+(`raw_<timestamp>.mp4`, no overlay; `fullwindow_<timestamp>.mp4`, everything shown live) —
+useful for later replaying a real session against a code change via `replay_recorded_footage.py`.
 
-- **`TEST_MATCHES` appears in BOTH `05_extract_features.py` and `06_train_model.py`
-  and must match in both files.** `05` uses it to decide which clips get skipped
-  from data augmentation (time-shift/noise variants); `06` uses it to hold out the
-  actual test split. If they don't match, augmented copies of your "held-out" data
-  leak into training, quietly inflating your reported accuracy.
-  Current setting (once iPhone data is included):
-```python
-  TEST_MATCHES = ["match9", "match7", "match13", "iphone_positive_audio"]
-```
-  Check `processed/features.csv` `match_id` counts to confirm exact group names
-  before setting this -- they must match exactly (e.g. `iphone_positive_audio`,
-  not `iphone_positive_audio_wav` or similar). Note iPhone `match_id`s come from
-  the recording's filename stem, not its subfolder name.
+## Data
 
-- **`02_extract_whistle_clips.py` → `PRE`/`POST`/`TARGET_LEN`**: `0.3s` / `1.2s` /
-  `1.5s`, set from manual listening QC (`processed/calibration_sample.csv`).
-  `04b_extract_iphone_whistles.py` and `08_realtime_ui.py`'s `WINDOW_SEC` must
-  match `TARGET_LEN` exactly -- a mismatch here previously caused a single long
-  whistle to be reported as 2-3 separate triggers in real-time testing.
+`data/raw_clips/` (original video) and `data/maxlsb_source/` (external MaxLSB source data) are
+**not** tracked in git. `models/*.pt`, `models/*.pkl`, and `data/keypoints/` **are** tracked —
+small enough to commit directly, and having them means you can run the system or retrain
+without needing a camera, re-extracting from video, or re-downloading external data.
 
-- **`04_process_iphone_negatives.py` → `TARGET_PER_FILE`**: currently `120`
-  (increased from `30`). This is a **per-recording-file** target, not a total
-  across all recordings -- if you add more negative recordings, total clip count
-  scales up. Check the script's console output (`kept N clips after filtering/
-  subsampling`) per file to see actual totals, since `MIN_GAP_SEC` spacing can
-  cap shorter recordings below the target anyway.
+`data/dataset_manifest.csv` is gitignored (rebuilt by `build_manifest.py`) — run the pipeline
+above to regenerate it locally.
 
-## Data notes
+**Attribution:** some training data for `nothing`, `ball_out`, `double_contact`, and
+`team_to_serve_left/right` was supplemented from [MaxLSB/volley-judge](https://github.com/MaxLSB/volley-judge)
+(MIT licensed), converted via `convert_maxlsb_nothing_data.py`. The already-converted keypoints
+are included in this repo's `data/keypoints/` — you don't need to re-run the conversion or
+download his source data unless extending the dataset further.
 
-- Audio loading uses `soundfile` + `scipy` resampling, not `librosa` -- avoids
-  Windows DLL import failures (numba/soxr). Don't reintroduce `librosa.load`.
-- iPhone data is co-primary alongside Volleylitics, not merely supplementary.
-- Negative clips come from three sources: Volleylitics hard negatives (`03`),
-  real iPhone ambient recordings (`04`), and synthetic squeak/bounce clips
-  (`04c`, 300 total: 150 squeak + 150 bounce) -- synthetic clips are a
-  supplementary hard-negative source, not a replacement for real court-noise
-  recordings.
-- Latest held-out evaluation (`match9`, `match7`, `match13`, and one held-out
-  iPhone recording; 555 test samples): **98.2% accuracy**, 0.96-0.99
-  precision/recall across both classes (non_whistle: 0.96 precision / 0.98
-  recall; whistle: 0.99 precision / 0.98 recall). Note in the paper that
-  iPhone test performance reflects close-mic recording conditions, not
-  broadcast match audio -- avoid overstating this as a strict like-for-like
-  improvement over the Volleylitics-only baseline.
-- Real-time detection (`08_realtime_ui.py`) is intentionally binary
-  (whistle / no whistle trigger only). No blast-duration or call-type
-  classification is done here -- that logic was removed to match the thesis's
-  stated scope; call interpretation is the gesture recognition module's job.
-- Note: `06_train_model.py`'s printed "Individual Validation Scores" (SVM/RF/GB)
-  use leave-one-group-out cross-validation, where some groups (e.g. purely
-  synthetic or single-class recordings) can produce artificially low/undefined
-  F1 scores for a single fold -- this is a known quirk of that CV setup, not a
-  sign of a broken model. Trust `07_evaluate.py`'s held-out test numbers above,
-  not the CV scores printed during training.
+## Current Model Status
 
-## Utility scripts
+8 real gesture classes: `ball_in`, `ball_out`, `double_contact`, `end_of_set`,
+`service_authorization_left`, `service_authorization_right`, `team_to_serve_left`,
+`team_to_serve_right`. `nothing` is used in training (as an all-zero label) but is not a
+model output class.
 
-- `scripts/force_rebuild.py` -- deletes `processed/features.csv`,
-  `processed/test_set.csv`, and `models/whistle_svm_model.pkl`, then reruns `05`
-  and `06` from scratch. Use after changing feature-extraction code to guarantee
-  no stale cached features leak into a new model. Does **not** regenerate
-  clip/index files -- rerun `02`-`04c` first if raw data or extraction windows
-  changed.
+Internal held-out (subject-holdout) test accuracy has ranged 86–99% depending on exact
+manifest composition — see `training_logs/` for the manifest snapshot + full results of
+any specific run. External reference-clip accuracy (`tests/test_reference_clips.py`,
+real out-of-domain footage) is meaningfully lower — a known, documented generalization gap,
+not a bug.
+
+Known open items and design decisions are tracked in the team's handoff notes — check with
+the team for the latest status before assuming any particular metric is current.
+
+## Controls (live_deployment.py)
+
+| Key | Action |
+|---|---|
+| `Q` / `ESC` | Quit |
+| `P` | Pause/resume (nothing processed while paused) |
+| `S` | Toggle skeleton overlay |
+| `W` | Manual whistle |
+| `[` / `]` | Left score −1 / +1 |
+| `-` / `+` | Right score −1 / +1 |
+| `R` | Clear the last-attached reason for the current point |
+
+`replay_recorded_footage.py` adds: `SPACE` pause/resume, `A`/`D` seek ±5s, `J`/`L` seek ±30s.

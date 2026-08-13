@@ -1,0 +1,13 @@
+{
+  "real_label_to_idx": {
+    "ball_in": 0,
+    "ball_out": 1,
+    "double_contact": 2,
+    "end_of_set": 3,
+    "service_authorization_left": 4,
+    "service_authorization_right": 5,
+    "team_to_serve_left": 6,
+    "team_to_serve_right": 7
+  },
+  "nothing_label": "nothing"
+}
