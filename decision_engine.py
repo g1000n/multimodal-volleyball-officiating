@@ -30,17 +30,65 @@ testing):
      underlying model/data.
 
 --------------------------------------------------------------------
-CHANGED (this version): AUTOMATIC SET-ENDING REMOVED. This project's
-core purpose is automating POINT-ADDING -- fault/reason gestures
-(ball_out, double_contact, ball_in, end_of_set) are informational only,
-not the thing being validated for correctness. Previously, EVERY
-team_to_serve commit auto-checked the win condition and could silently
-set self.set_over = True the moment score crossed the win threshold --
-this happened purely from the SCORING gesture, with no dependency on
-end_of_set ever being detected. Confirmed via a real live session:
-this caused scoring to freeze while a real rally was still ongoing,
-because the model isn't perfect and the automatic win-condition check
-doesn't know that.
+NEW THIS VERSION -- PENDING WHISTLE CONFIRMATION:
+
+Previously, a service_authorization or team_to_serve gesture arriving
+with no valid recent whistle was rejected outright ("no recent
+whistle" / "no recent whistle for service authorization"). That
+turned out to be too rigid for how referees actually perform the
+sequence in real match footage: sometimes the gesture is HELD and the
+whistle is blown a moment AFTER the gesture starts, not strictly
+before it. A strict "the whistle must already exist" check would
+wrongly reject a completely genuine call just because of that
+ordering.
+
+FIX: a gesture that arrives with no valid recent whistle is no longer
+instantly rejected. It's parked as `self.pending_gesture` (its label
+plus its OWN original timestamp) and the caller gets back
+`{"event": "awaiting_whistle_confirmation", ...}` instead of
+`"ignored"`. If a whistle then arrives within
+WHISTLE_CONFIRMATION_GRACE_SECONDS, `on_whistle_detected()`
+retroactively confirms it -- it runs the EXACT SAME commit logic
+(`_commit_authorization` / `_commit_scoring`) that the immediate path
+uses, using the GESTURE's own original timestamp (not the whistle's)
+for the actual commit. This matters: it means `last_point_time`, the
+settle-window start, etc. all reflect when the gesture itself
+happened, not when the whistle happened to arrive -- so downstream
+timing behaves identically to the immediate-whistle-first case. If the
+grace window passes with no whistle arriving, the pending gesture is
+simply discarded -- the same end result as the old immediate
+rejection, just delayed instead of instant, so a referee who never
+actually blows the whistle still doesn't get a false commit.
+
+Only one gesture can be pending confirmation at a time -- a new,
+different unconfirmed gesture arriving replaces whatever was pending
+before (the previous one presumably either already timed out or was
+superseded by whatever's happening now).
+
+Deliberately NOT implemented as a simple bidirectional time window
+(`abs(gesture_time - whistle_time) <= window`), because that would let
+ANY whistle within a loose window validate ANY gesture, including ones
+they had nothing to do with -- e.g. a whistle blown for an unrelated
+reason seconds earlier could wrongly confirm a totally different
+gesture that happens to land nearby in time. The pending-state design
+keeps a tight, one-to-one pairing instead: THIS specific gesture is
+waiting on THIS specific upcoming whistle, and nothing else can
+satisfy it. A whistle that arrives with nothing pending just behaves
+exactly as it always did -- an ordinary whistle, refreshing
+last_whistle_time for whatever gesture comes next.
+
+--------------------------------------------------------------------
+CHANGED (previous version): AUTOMATIC SET-ENDING REMOVED. This
+project's core purpose is automating POINT-ADDING -- fault/reason
+gestures (ball_out, double_contact, ball_in, end_of_set) are
+informational only, not the thing being validated for correctness.
+Previously, EVERY team_to_serve commit auto-checked the win condition
+and could silently set self.set_over = True the moment score crossed
+the win threshold -- this happened purely from the SCORING gesture,
+with no dependency on end_of_set ever being detected. Confirmed via a
+real live session: this caused scoring to freeze while a real rally
+was still ongoing, because the model isn't perfect and the automatic
+win-condition check doesn't know that.
 
 Now: score is tracked with NO cap and NO automatic stop, regardless of
 value. end_of_set, if detected, is logged as an informational reason
@@ -123,6 +171,21 @@ REASON_ATTACH_WINDOW = 4.0
 # NEVER blocked by this.
 SETTLE_WINDOW_SECONDS = 1.5
 
+# NEW: how long a gesture with no valid recent whistle stays "pending,"
+# waiting for a whistle to arrive AFTER the fact, before being
+# discarded. This is deliberately a SEPARATE constant from
+# TEMPORAL_WINDOW -- TEMPORAL_WINDOW governs whistle-THEN-gesture
+# ordering (how long a whistle stays valid for a gesture that follows
+# it); this one governs the opposite ordering, gesture-THEN-whistle.
+# They don't have to be the same value, and starting narrower here is
+# deliberate -- a "waiting on a whistle that might never come" state
+# should time out faster than an already-heard whistle stays valid.
+# Starting value -- tune against real match logs the same way
+# TEMPORAL_WINDOW was calibrated (see above), if this ever misfires by
+# being too eager (unrelated whistle confirms a stale gesture) or too
+# easily missed (a real, slightly slow whistle doesn't make it in time).
+WHISTLE_CONFIRMATION_GRACE_SECONDS = 3.0
+
 SERVICE_AUTHORIZATION_GESTURES = {"service_authorization_left", "service_authorization_right"}
 SCORING_GESTURES = {"team_to_serve_left", "team_to_serve_right"}
 # ball_in is a real, trained, deployed model class -- without it here, a
@@ -175,6 +238,13 @@ class DecisionEngine:
         self.last_authorization_side = None
         self.last_authorization_time = None
 
+        # NEW: the one gesture (if any) currently waiting on a whistle
+        # to arrive after the fact. Either None, or a dict of the shape
+        # {"label": <gesture label>, "timestamp": <when the gesture
+        # itself was detected>}. Only one gesture can be pending at a
+        # time -- see module docstring for why.
+        self.pending_gesture = None
+
     def manual_override_score(self, side, delta):
         """
         Lets a human operator correct the score directly if the
@@ -194,7 +264,7 @@ class DecisionEngine:
 
     def manual_end_set(self):
         """
-        NEW: the only remaining way self.set_over becomes True -- an
+        The only remaining way self.set_over becomes True -- an
         explicit, deliberate call, e.g. a human operator pressing an
         "end set" control. Nothing in on_gesture_detected() calls this
         automatically anymore.
@@ -202,10 +272,64 @@ class DecisionEngine:
         self.set_over = True
         return self.set_over
 
+    def _pending_gesture_expired(self, now):
+        """True if there's no pending gesture at all, OR the one that's
+        pending has sat longer than WHISTLE_CONFIRMATION_GRACE_SECONDS
+        without a whistle arriving to confirm it."""
+        if self.pending_gesture is None:
+            return True
+        return (now - self.pending_gesture["timestamp"]) > WHISTLE_CONFIRMATION_GRACE_SECONDS
+
     def on_whistle_detected(self, timestamp=None):
-        # Whistles are never blocked by the settle window -- they're
-        # the deliberate start of the next step, not tail-end noise.
-        self.last_whistle_time = timestamp if timestamp is not None else time.time()
+        """
+        Whistles are never blocked by the settle window -- they're
+        the deliberate start of the next step, not tail-end noise.
+
+        NEW: also checks whether a gesture is currently sitting in
+        self.pending_gesture waiting for exactly this. If one is, and
+        it hasn't expired, this whistle retroactively confirms it --
+        runs the identical commit logic the immediate-whistle-first
+        path would have run, using the GESTURE's own original
+        timestamp (not this whistle's timestamp) so all downstream
+        timing (last_point_time, the settle window, etc.) reflects
+        when the gesture itself actually happened.
+
+        Returns the confirmation result dict (same shape
+        on_gesture_detected() would have returned for that gesture,
+        plus a `confirmed_by_late_whistle: True` marker) if a pending
+        gesture was just confirmed, or None if this was just an
+        ordinary whistle with nothing pending on it.
+        """
+        timestamp = timestamp if timestamp is not None else time.time()
+
+        if self.pending_gesture is not None and not self._pending_gesture_expired(timestamp):
+            pending_label = self.pending_gesture["label"]
+            pending_timestamp = self.pending_gesture["timestamp"]
+            self.pending_gesture = None
+
+            if pending_label in SERVICE_AUTHORIZATION_GESTURES:
+                confirmation_result = self._commit_authorization(pending_label, pending_timestamp)
+                confirmation_result["confirmed_by_late_whistle"] = True
+                # Consumed by the authorization commit itself (see
+                # _commit_authorization) -- do NOT also fall through to
+                # setting last_whistle_time below, same as the
+                # immediate-path behavior. This still forces a genuine
+                # SECOND, distinct whistle before team_to_serve can be
+                # accepted next.
+                return confirmation_result
+            elif pending_label in SCORING_GESTURES:
+                confirmation_result = self._commit_scoring(pending_label, pending_timestamp)
+                confirmation_result["confirmed_by_late_whistle"] = True
+                return confirmation_result
+        else:
+            # Pending gesture (if any) expired before this whistle
+            # arrived -- discard it. Same end result as the old
+            # immediate rejection used to produce, just delayed by up
+            # to WHISTLE_CONFIRMATION_GRACE_SECONDS instead of instant.
+            self.pending_gesture = None
+
+        self.last_whistle_time = timestamp
+        return None
 
     def _check_set_over(self):
         """
@@ -240,6 +364,74 @@ class DecisionEngine:
         self.last_settle_start_time = None
         self.last_authorization_side = None
         self.last_authorization_time = None
+        self.pending_gesture = None
+
+    def _commit_authorization(self, label, timestamp):
+        """
+        The actual service_authorization commit logic -- factored out
+        into its own method so both the immediate path (a valid whistle
+        was already present when the gesture arrived) and the new
+        confirmed-later path (whistle arrives after the gesture, inside
+        on_whistle_detected()) run EXACTLY the same code, rather than
+        two versions that could quietly drift apart from each other.
+        """
+        side = GESTURE_TO_SCORE_SIDE[label]  # LEFT/RIGHT FIX -- see table above
+        self.last_authorization_side = side
+        self.last_authorization_time = timestamp
+        self.last_settle_start_time = timestamp
+
+        # Consume this whistle -- forces a genuine SECOND, distinct
+        # whistle before team_to_serve can be accepted, enforcing
+        # the real two-whistle cycle instead of one whistle silently
+        # covering both steps.
+        self.last_whistle_time = None
+
+        return {"event": "authorization_acknowledged", "side": side}
+
+    def _commit_scoring(self, label, timestamp):
+        """
+        The actual team_to_serve (point-award) commit logic -- same
+        factoring-out rationale as _commit_authorization above: one
+        shared implementation for both the immediate-whistle-present
+        path and the confirmed-later-via-pending-gesture path.
+        """
+        side = GESTURE_TO_SCORE_SIDE[label]  # LEFT/RIGHT FIX -- see table above
+
+        # Informational only -- compare the beckoned side against the
+        # side that ultimately scored. None if no (recent) authorization
+        # was ever recorded, so this doesn't get compared against a
+        # stale authorization from several points ago.
+        authorization_match = None
+        if (self.last_authorization_time is not None
+                and (timestamp - self.last_authorization_time) <= TEMPORAL_WINDOW):
+            authorization_match = (self.last_authorization_side == side)
+
+        self.score[side] += 1
+        self.server = side
+        self.last_point_time = timestamp
+        self.last_point_side = side
+        self.last_reason = None
+        self.last_settle_start_time = timestamp
+
+        self.last_whistle_time = None
+        # No auto-check/set of self.set_over here -- see module
+        # docstring. Score just keeps counting, no cap.
+
+        result = {
+            "event": "point_awarded",
+            "side": side,
+            "score": dict(self.score),
+            "set_over": self.set_over,  # will simply stay False unless manual_end_set() was called
+            "authorization_side": self.last_authorization_side,
+            "authorization_match": authorization_match,
+        }
+
+        # Clear authorization state now that it's been consumed/reported
+        # for this point -- next point needs its own fresh authorization.
+        self.last_authorization_side = None
+        self.last_authorization_time = None
+
+        return result
 
     def on_gesture_detected(self, label, timestamp=None):
         timestamp = timestamp if timestamp is not None else time.time()
@@ -264,71 +456,45 @@ class DecisionEngine:
         # PHASE 1: service_authorization (whistle #1 -> beckon)
         # --------------------------------------------------------
         if label in SERVICE_AUTHORIZATION_GESTURES:
-            if self.last_whistle_time is None or (timestamp - self.last_whistle_time) > TEMPORAL_WINDOW:
-                return {"event": "ignored", "reason": "no recent whistle for service authorization"}
+            has_valid_whistle = (self.last_whistle_time is not None
+                                  and (timestamp - self.last_whistle_time) <= TEMPORAL_WINDOW)
+            if has_valid_whistle:
+                return self._commit_authorization(label, timestamp)
 
-            side = GESTURE_TO_SCORE_SIDE[label]  # LEFT/RIGHT FIX -- see table above
-            self.last_authorization_side = side
-            self.last_authorization_time = timestamp
-            self.last_settle_start_time = timestamp
-
-            # Consume this whistle -- forces a genuine SECOND, distinct
-            # whistle before team_to_serve can be accepted, enforcing
-            # the real two-whistle cycle instead of one whistle silently
-            # covering both steps.
-            self.last_whistle_time = None
-
-            return {"event": "authorization_acknowledged", "side": side}
+            # NEW: no valid whistle YET -- rather than rejecting
+            # outright, park this as pending in case the whistle
+            # arrives a moment after the gesture (a real ordering
+            # observed in actual match footage -- see module
+            # docstring). on_whistle_detected() will retroactively
+            # confirm this if a whistle shows up within
+            # WHISTLE_CONFIRMATION_GRACE_SECONDS.
+            self.pending_gesture = {"label": label, "timestamp": timestamp}
+            return {"event": "awaiting_whistle_confirmation",
+                    "reason": "gesture recognized, waiting for whistle",
+                    "grace_seconds": WHISTLE_CONFIRMATION_GRACE_SECONDS}
 
         # --------------------------------------------------------
         # PHASE 2: team_to_serve (whistle #2 -> point/team-to-serve signal)
         # --------------------------------------------------------
         if label in SCORING_GESTURES:
-            if self.last_whistle_time is None or (timestamp - self.last_whistle_time) > TEMPORAL_WINDOW:
-                return {"event": "ignored", "reason": "no recent whistle"}
+            has_valid_whistle = (self.last_whistle_time is not None
+                                  and (timestamp - self.last_whistle_time) <= TEMPORAL_WINDOW)
+            if has_valid_whistle:
+                return self._commit_scoring(label, timestamp)
 
-            side = GESTURE_TO_SCORE_SIDE[label]  # LEFT/RIGHT FIX -- see table above
-
-            # Informational only -- compare the beckoned side against the
-            # side that ultimately scored. None if no (recent) authorization
-            # was ever recorded, so this doesn't get compared against a
-            # stale authorization from several points ago.
-            authorization_match = None
-            if (self.last_authorization_time is not None
-                    and (timestamp - self.last_authorization_time) <= TEMPORAL_WINDOW):
-                authorization_match = (self.last_authorization_side == side)
-
-            self.score[side] += 1
-            self.server = side
-            self.last_point_time = timestamp
-            self.last_point_side = side
-            self.last_reason = None
-            self.last_settle_start_time = timestamp
-
-            self.last_whistle_time = None
-            # CHANGED: no longer auto-checks/sets self.set_over here --
-            # see module docstring. Score just keeps counting, no cap.
-
-            result = {
-                "event": "point_awarded",
-                "side": side,
-                "score": dict(self.score),
-                "set_over": self.set_over,  # will simply stay False unless manual_end_set() was called
-                "authorization_side": self.last_authorization_side,
-                "authorization_match": authorization_match,
-            }
-
-            # Clear authorization state now that it's been consumed/reported
-            # for this point -- next point needs its own fresh authorization.
-            self.last_authorization_side = None
-            self.last_authorization_time = None
-
-            return result
+            # NEW: same pending treatment as the authorization branch
+            # above -- see module docstring.
+            self.pending_gesture = {"label": label, "timestamp": timestamp}
+            return {"event": "awaiting_whistle_confirmation",
+                    "reason": "gesture recognized, waiting for whistle",
+                    "grace_seconds": WHISTLE_CONFIRMATION_GRACE_SECONDS}
 
         # --------------------------------------------------------
-        # end_of_set -- CHANGED: now purely informational, like any
-        # other fault/reason gesture. No longer requires the win
-        # condition to be met, no longer forces self.set_over = True.
+        # end_of_set -- purely informational, like any other
+        # fault/reason gesture. No longer requires the win condition
+        # to be met, no longer forces self.set_over = True. Also
+        # unrelated to whistle timing entirely -- no pending-
+        # confirmation behavior applies here.
         # --------------------------------------------------------
         elif label == "end_of_set":
             if self.last_point_time is None or (timestamp - self.last_point_time) > REASON_ATTACH_WINDOW:
@@ -339,7 +505,6 @@ class DecisionEngine:
 
             self.last_reason = label
             self.last_settle_start_time = timestamp
-            # CHANGED: no longer sets self.set_over = True here.
             return {"event": "reason_attached", "reason": label, "side": self.last_point_side}
 
         # --------------------------------------------------------

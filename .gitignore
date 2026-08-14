@@ -12,6 +12,7 @@ data/raw_clips_trimmed/
 data/ab_test_temp_removed/
 data/maxlsb_source/
 data/keypoints/
+data/validation_sample/
 model_checkpoints/
 training_logs/
 *.mov
