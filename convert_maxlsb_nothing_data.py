@@ -48,7 +48,7 @@ import numpy as np
 # Use a raw string (r"...") or forward slashes to avoid backslash
 # escape errors on Windows paths.
 # ---------------------------------------------------------------------
-SOURCE_DATA_ROOT = "data/maxlsb_source"  
+SOURCE_DATA_ROOT = r"C:\Users\anouc\Downloads\data\data"  # EDIT THIS locally to your actual path -- don't commit your real path
 
 # Maps his folder names to YOUR gesture_label names. "Substi" has no
 # equivalent in your 7-class set and is intentionally left out --
@@ -216,8 +216,8 @@ def main():
         with open(MANIFEST_PATH, "r", newline="") as f:
             reader = csv.DictReader(f)
             existing_rows = list(reader)
-            if reader.fieldnames:
-                fieldnames = reader.fieldnames
+            # if reader.fieldnames:
+                # fieldnames = reader.fieldnames
 
     already_converted_paths = {row["keypoint_path"] for row in existing_rows if row.get("keypoint_path")}
 
