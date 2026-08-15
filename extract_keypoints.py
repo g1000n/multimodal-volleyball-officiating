@@ -126,7 +126,7 @@ CROP_MARGIN_MULTIPLIER = 1.5
 # combined (lower-resolution) branch even for widely spread arms.
 SINGLE_CROP_MARGIN_MULTIPLIER = 0.9
 
-MIN_VISIBILITY_FOR_CROP = 0.18
+MIN_VISIBILITY_FOR_CROP = 0.35
 
 # If the wrists are farther apart than this (relative to shoulder width),
 # use two separate high-resolution crops instead of one wide combined
