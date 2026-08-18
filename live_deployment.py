@@ -133,6 +133,32 @@ bugs described above):
   blend on every call -- benchmarked 5.2x speedup on panel-drawing
   alone at 1080p.
 
+--------------------------------------------------------------------
+WIN-CONDITION DISPLAY WIRED IN (this pass): the previous pass fixed
+the banner/scoreboard code so that IF engine.set_over became True, the
+display would keep showing live score updates instead of freezing --
+but nothing ever actually SET set_over, since manual_end_set() is the
+only thing that does that and no key is bound to it. That meant the
+fix was dormant: a real session could sail past 25-0 with no visual
+indicator ever appearing, even though scoring was correctly continuing
+underneath.
+
+FIX: decision_engine.py's engine._check_set_over() -- a pure query,
+explicitly documented as "kept available for any external code (e.g.
+a UI) that wants to show 'win condition met' as an informational hint
+WITHOUT it forcing a stop" -- is now actually called, every inference
+cycle, for both engine and strict_engine. The result is stored locally
+(win_condition_reached) and used to drive the banner/scoreboard
+display AND a new `win_condition_reached` column in the main CSV log
+for documentation purposes. Critically, this NEVER touches
+engine.set_over itself -- on_gesture_detected()'s only stop condition
+is still exclusively manual_end_set() (still unbound to any key, a
+separate, pre-existing open item). This is the actual mechanism for
+"the program thinks a team won, keep scoring anyway, but show it and
+log it" -- previously nothing computed that state at all, so there
+was nothing to show or log even after the display code was fixed to
+handle it.
+
 Controls:
   W - manual whistle (only matters if real whistle detection isn't active)
   Q / ESC - quit
@@ -193,7 +219,16 @@ LOG_DIR = "data/live_test_logs"
 
 ROLLING_WINDOW_FRAMES = 24
 INFERENCE_EVERY_N_FRAMES = 3
-STREAK_NEEDED_TO_COMMIT = 5
+# CHANGED: 5 -> 3, matching FAULT_STREAK_NEEDED_TO_COMMIT. A fast,
+# genuine team_to_serve gesture could finish before 5 consecutive
+# correct inference cycles accumulated, so it never even entered the
+# pending state. Lowered to react faster -- this is safe specifically
+# BECAUSE the existing TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS pending/
+# cancellation window (below) is completely unchanged: a lower streak
+# requirement only affects how fast something enters that still-
+# correctable pending state, not whether a wrong call can still be
+# cancelled or how long it stays open to correction.
+STREAK_NEEDED_TO_COMMIT = 3
 FAULT_STREAK_NEEDED_TO_COMMIT = 3
 CANCELLATION_STREAK_NEEDED = 3
 # RESTORED: fast, non-tolerant streak requirement for fault/reason
@@ -739,12 +774,23 @@ def draw_paused_overlay(frame, frame_width, frame_height):
 
 
 def draw_match_over_banner(frame, engine, frame_width):
+    """CHANGED (this pass): shrunk from its own 70px band down to
+    TOP_STRIP_HEIGHT (56px) so it occupies the SAME slot the top status
+    strip normally does, instead of a taller one -- this lets the score
+    strip keep drawing directly underneath it unconditionally (see
+    main()'s rendering block), rather than the two being mutually
+    exclusive. This banner is now purely an INDICATOR that the win
+    condition was reached; it does not stop anything from continuing to
+    render or from continuing to log/score, since the project now wants
+    a session to keep running and logging past a detected winner for
+    comparison/documentation purposes rather than stopping."""
     winner = "LEFT" if engine.score["left"] > engine.score["right"] else "RIGHT"
     winner_color = COLORS["left_team"] if winner == "LEFT" else COLORS["right_team"]
-    text = f"MATCH OVER -- {winner} WINS {engine.score['left']}-{engine.score['right']}"
-    draw_panel(frame, 0, 0, frame_width, 70, color=COLORS["panel_bg"], alpha=0.9, border=True)
-    w = text_width(text, scale=0.8, thickness=2)
-    draw_text(frame, text, (max(10, (frame_width - w) // 2), 44), scale=0.8, color=winner_color, thickness=2)
+    text = f"WIN CONDITION REACHED -- {winner} WINS {engine.score['left']}-{engine.score['right']} (still logging)"
+    draw_panel(frame, 0, 0, frame_width, TOP_STRIP_HEIGHT, color=COLORS["panel_bg"], alpha=0.9, border=True)
+    w = text_width(text, scale=0.55, thickness=2)
+    draw_text(frame, text, (max(10, (frame_width - w) // 2), TOP_STRIP_HEIGHT // 2 + 7),
+              scale=0.55, color=winner_color, thickness=2)
 
 
 # ------------------------------------------------------------------
@@ -769,13 +815,31 @@ def build_scoreboard_canvas(engine, paused):
                     cv2.FONT_HERSHEY_SIMPLEX, 2.5, COLORS["accent_amber"], 6, cv2.LINE_AA)
         return canvas
 
-    if engine.set_over:
+    # CHANGED (this pass): previously `if engine.set_over:` drew ONLY
+    # the "X WINS" text and returned early, before the actual score
+    # digits below ever got drawn -- meaning the scoreboard visually
+    # froze at whatever it looked like the instant the winner was
+    # detected, even if scoring kept going afterward. Now the win
+    # banner is drawn as a small strip ABOVE the score, and execution
+    # continues through to the normal score-drawing code below instead
+    # of returning early, so the big score digits keep updating live.
+    #
+    # WIN-CONDITION WIRING (this pass): this used to check
+    # engine.set_over, which nothing ever actually set (only
+    # manual_end_set() does, and nothing calls it) -- so this branch
+    # was dead code in practice. Now checks engine._check_set_over()
+    # directly, a pure query already designed for exactly this ("kept
+    # available for any external code... that wants to show 'win
+    # condition met' as an informational hint without it forcing a
+    # stop" -- see its own docstring in decision_engine.py). This
+    # NEVER sets or reads engine.set_over -- scoring is untouched.
+    if engine._check_set_over():
         winner = "LEFT" if engine.score["left"] > engine.score["right"] else "RIGHT"
         winner_color = COLORS["left_team"] if winner == "LEFT" else COLORS["right_team"]
-        text = f"{winner} WINS"
-        w = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 2.0, 6)[0][0]
-        cv2.putText(canvas, text, ((SCOREBOARD_WIDTH - w) // 2, 150),
-                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, winner_color, 6, cv2.LINE_AA)
+        text = f"WIN CONDITION REACHED -- {winner} (still logging)"
+        w = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0][0]
+        cv2.putText(canvas, text, ((SCOREBOARD_WIDTH - w) // 2, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, winner_color, 2, cv2.LINE_AA)
 
     cv2.putText(canvas, "TEAM 1", (100, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.1, COLORS["left_team"], 2, cv2.LINE_AA)
     cv2.putText(canvas, "TEAM 2", (SCOREBOARD_WIDTH - 300, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.1, COLORS["right_team"], 2, cv2.LINE_AA)
@@ -901,6 +965,19 @@ def generate_html_report(log_path, strict_log_path, output_path, session_start_t
         })
     timeline.sort(key=lambda e: e["timestamp"])
 
+    # NEW: whistle detections as their own table, positioned right next
+    # to the Commit Timeline for easy visual comparison -- every whistle
+    # (real detector or manual W press) is unconditionally logged to the
+    # strict CSV, so this is the complete whistle record for the
+    # session, independent of whether any given whistle happened to
+    # confirm a pending gesture.
+    whistle_rows_html = ""
+    for r in strict_whistle_events:
+        whistle_rows_html += (
+            f"<tr><td>{r.get('ph_time', '')}</td><td>{float(r['timestamp']):.3f}</td>"
+            f"<td>{r.get('strict_score_left', '?')} - {r.get('strict_score_right', '?')}</td></tr>\n"
+        )
+
     event_color = {
         "point_awarded": "#2e7d32", "reason_attached": "#1565c0",
         "authorization_acknowledged": "#616161", "awaiting_whistle_confirmation": "#e65100",
@@ -935,12 +1012,14 @@ def generate_html_report(log_path, strict_log_path, output_path, session_start_t
         color = event_color.get(event, "#333") if event else "#999"
         seen_display = DISPLAY_NAME.get(seen_label, seen_label) if seen_label else ""
         committed_display = DISPLAY_NAME.get(committed_label, committed_label) if committed_label else ""
+        win_flag = r.get("win_condition_reached", "")
         recognition_rows_html += (
             f"<tr><td>{r.get('ph_time', '')}</td><td>{seen_display}</td>"
             f"<td>{committed_display}</td>"
             f"<td style='color:{color};font-weight:bold'>{event}</td>"
             f"<td>{r.get('engine_reason', '')}</td>"
-            f"<td>{r.get('score_left', '?')} - {r.get('score_right', '?')}</td></tr>\n"
+            f"<td>{r.get('score_left', '?')} - {r.get('score_right', '?')}</td>"
+            f"<td>{win_flag}</td></tr>\n"
         )
 
     html = f"""<!DOCTYPE html>
@@ -963,7 +1042,7 @@ th {{ background: #eee; }}
   <p><b>Final score (Strict, whistle-required):</b> {final_strict_score.get('strict_score_left', '?')} - {final_strict_score.get('strict_score_right', '?')}</p>
   <p><b>Points awarded -- Informational:</b> {informational_points} &nbsp;|&nbsp; <b>Strict:</b> {strict_points}
      {"<span class='divergence'>&nbsp;&nbsp;(" + str(point_gap) + " point(s) informational scored that strict did not)</span>" if point_gap != 0 else ""}</p>
-  <p><b>Real whistle detections this session:</b> {len(strict_whistle_events)}</p>
+  <p><b>Real whistle detections this session:</b> {len(strict_whistle_events)} (see Whistle Detections table below for the full list)</p>
 </div>
 <h2>Commit Timeline (Informational vs. Strict, side by side)</h2>
 <p>Only rows where something actually committed or was explicitly ignored/pending -- fastest way to scan "what happened."</p>
@@ -971,10 +1050,16 @@ th {{ background: #eee; }}
 <tr><th>PH Time</th><th>Engine</th><th>Event</th><th>Label</th><th>Reason</th><th>Score After</th></tr>
 {commit_rows_html}
 </table>
-<h2>Full Recognition Log (Informational engine, every inference cycle)</h2>
-<p>Every window the model classified this session, whether or not it led to a commit -- shows exactly what was seen alongside what (if anything) actually happened.</p>
+<h2>Whistle Detections</h2>
+<p>Every whistle detected this session (real detector or manual W press) -- the complete whistle record, independent of whether a given whistle happened to confirm a pending gesture. Compare timestamps directly against the Commit Timeline above to check whistle-to-gesture ordering.</p>
 <table>
-<tr><th>PH Time</th><th>Seen (window prediction)</th><th>Committed</th><th>Event</th><th>Reason</th><th>Score</th></tr>
+<tr><th>PH Time</th><th>Timestamp (epoch, sec)</th><th>Score After</th></tr>
+{whistle_rows_html}
+</table>
+<h2>Full Recognition Log (Informational engine, every inference cycle)</h2>
+<p>Every window the model classified this session, whether or not it led to a commit -- shows exactly what was seen alongside what (if anything) actually happened. The last column flags cycles where the win condition (score threshold + margin) was technically already met -- scoring continues regardless, for documentation purposes.</p>
+<table>
+<tr><th>PH Time</th><th>Seen (window prediction)</th><th>Committed</th><th>Event</th><th>Reason</th><th>Score</th><th>Win Condition Reached?</th></tr>
 {recognition_rows_html}
 </table>
 </body></html>"""
@@ -996,10 +1081,15 @@ def main():
     log_writer = csv.writer(log_file)
     # NEW: ph_time column added alongside the existing epoch timestamp --
     # same real-world-cross-referencing reason as the corner readout clock.
+    # NEW (this pass): win_condition_reached column -- see module
+    # docstring's "WIN-CONDITION DISPLAY WIRED IN" section. Reflects
+    # engine._check_set_over() at the moment of this row, purely
+    # informational, never gates anything.
     log_writer.writerow(["timestamp", "ph_time", "expected_step", "window_predicted_label",
                           "vote_committed_label", "engine_event", "engine_reason",
                           "score_left", "score_right",
-                          "strict_score_left", "strict_score_right"])
+                          "strict_score_left", "strict_score_right",
+                          "win_condition_reached"])
 
     strict_log_path = os.path.join(LOG_DIR, f"deployment_strict_{int(session_start_time)}.csv")
     strict_log_file = open(strict_log_path, "w", newline="")
@@ -1060,7 +1150,8 @@ def main():
             log_writer.writerow([f"{timestamp:.3f}", get_ph_time_str(), expected_step, pending_label_before,
                                   pending_label_before, confirmation_result["event"], "confirmed_by_late_whistle",
                                   engine.score["left"], engine.score["right"],
-                                  strict_engine.score["left"], strict_engine.score["right"]])
+                                  strict_engine.score["left"], strict_engine.score["right"],
+                                  engine._check_set_over()])
             log_file.flush()
 
         if confirmation_result_strict is not None and pending_label_before_strict is not None:
@@ -1423,7 +1514,8 @@ def main():
             log_writer.writerow([f"{time.time():.3f}", get_ph_time_str(), expected_step, current_label,
                                   committed_label_this_frame, engine_event_this_frame, engine_reason_this_frame,
                                   engine.score["left"], engine.score["right"],
-                                  strict_engine.score["left"], strict_engine.score["right"]])
+                                  strict_engine.score["left"], strict_engine.score["right"],
+                                  engine._check_set_over()])
             log_file.flush()
 
         # --------------------------------------------------------
@@ -1431,7 +1523,23 @@ def main():
         # docstring "VISUAL REDESIGN" for the reasoning behind each
         # zone. Decision-logic above this point is UNCHANGED.
         # --------------------------------------------------------
-        if engine.set_over:
+        # CHANGED (this pass): the score strip now ALWAYS draws,
+        # regardless of win condition status -- previously it was
+        # hidden entirely once a winner was flagged (only the banner
+        # showed), which visually made it look like the session had
+        # stopped even though the intent is for logging/scoring to
+        # keep going past a detected winner. The top slot still swaps
+        # between the normal status strip and the (now same-height)
+        # win-condition banner, but the score strip underneath is
+        # unconditional.
+        #
+        # WIN-CONDITION WIRING (this pass): this used to check
+        # engine.set_over (dead in practice -- nothing ever sets it).
+        # Now checks engine._check_set_over() directly, computed fresh
+        # each frame -- purely a display decision, never touches
+        # engine.set_over or blocks scoring in any way.
+        win_condition_reached = engine._check_set_over()
+        if win_condition_reached:
             draw_match_over_banner(frame, engine, frame_width)
         else:
             pending_remaining = None
@@ -1441,7 +1549,7 @@ def main():
                 cancellation_progress = (cancellation_streak_count, CANCELLATION_STREAK_NEEDED)
             draw_top_status_strip(frame, expected_step, frame_width, pending_scoring_label,
                                    pending_remaining, whistle_mode["value"], cancellation_progress)
-            draw_score_strip(frame, engine, strict_engine, frame_width)
+        draw_score_strip(frame, engine, strict_engine, frame_width)
 
         if last_probs is not None:
             draw_confidence_panel(frame, last_probs, real_labels, streak_label, streak_count, last_raw_prediction)
@@ -1465,7 +1573,13 @@ def main():
             full_window_writer.write(frame)
 
         show_frame_letterboxed("BACKSTAGE (control)", frame)
-        current_scoreboard_state = (engine.score["left"], engine.score["right"], paused, engine.set_over)
+        # WIN-CONDITION WIRING (this pass): win_condition_reached (computed
+        # above, this frame) is now part of the scoreboard's redraw-trigger
+        # state tuple, replacing the old dead engine.set_over check --
+        # otherwise the scoreboard would never redraw the moment the win
+        # banner should first appear, since score/paused might not change
+        # on that exact frame.
+        current_scoreboard_state = (engine.score["left"], engine.score["right"], paused, win_condition_reached)
         if current_scoreboard_state != last_scoreboard_state[0]:
             last_scoreboard_canvas[0] = build_scoreboard_canvas(engine, paused)
             last_scoreboard_state[0] = current_scoreboard_state

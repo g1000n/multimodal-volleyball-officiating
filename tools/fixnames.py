@@ -1,42 +1,64 @@
-
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pathlib import Path
 import uuid
 
-FOLDER = Path(
-    r"C:\Users\notgi\Downloads\drive-download-20260810T173103Z-1-001\steady_liam_"
+ROOT = Path(
+    r"C:\Users\notgi\Downloads\drive-download-20260817T170623Z-1-001"
 )
 
-PERSON = "p09"
-PREFIX = "nothing"
+PERSON = "p02"
+PREFIX = "ball_in"
 
-files = sorted(
-    f for f in FOLDER.iterdir()
-    if f.is_file()
-)
+FOLDERS = [
+    "ball_in_amare_left",
+    "ball_in_amare_right",
+]
 
-print(f"Found {len(files)} files.")
+next_number = 1
 
-# PASS 1: temporary names
-temp_files = []
+for folder_name in FOLDERS:
 
-for file in files:
-    temp_name = f"__tmp__{uuid.uuid4().hex}{file.suffix.lower()}"
-    temp_path = FOLDER / temp_name
+    folder = ROOT / folder_name
 
-    file.rename(temp_path)
-    temp_files.append(temp_path)
+    if not folder.exists():
+        print(f"Skipping: {folder_name}")
+        continue
 
-# PASS 2: final names
-for i, temp_file in enumerate(temp_files, start=1):
+    files = sorted(
+        f for f in folder.iterdir()
+        if f.is_file()
+    )
 
-    new_name = f"{PREFIX}_{PERSON}_{i}{temp_file.suffix.lower()}"
+    print(f"\n{folder_name}")
+    print(f"Files: {len(files)}")
+    print(f"Starting number: {next_number}")
 
-    temp_file.rename(FOLDER / new_name)
+    # PASS 1: temporary names
+    temp_files = []
 
-print(f"Renamed {len(files)} files.")
+    for file in files:
+        temp_name = f"__tmp__{uuid.uuid4().hex}{file.suffix.lower()}"
+        temp_path = folder / temp_name
 
-if files:
-    print(f"First: {PREFIX}_{PERSON}_1{files[0].suffix.lower()}")
-    print(f"Last:  {PREFIX}_{PERSON}_{len(files)}{files[-1].suffix.lower()}")
+        file.rename(temp_path)
+        temp_files.append(temp_path)
+
+    # PASS 2: final names
+    start = next_number
+
+    for temp_file in temp_files:
+
+        final_name = (
+            f"{PREFIX}_{PERSON}_{next_number}"
+            f"{temp_file.suffix.lower()}"
+        )
+
+        temp_file.rename(folder / final_name)
+
+        next_number += 1
+
+    print(f"Renamed: {start} -> {next_number - 1}")
+
+print("\n" + "=" * 50)
+print(f"TOTAL BALL_IN P02 FILES: {next_number - 1}")
+print("=" * 50)
+print("Done.")

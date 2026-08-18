@@ -163,7 +163,7 @@ TEMPORAL_WINDOW = 10.0  # seconds -- how long a whistle stays "valid" for the
 # gesture (e.g. resting arms on a rail during idle time) could get incorrectly
 # attached as that point's reason. Shrinks the exposure window without touching
 # the whistle-timing tolerance TEMPORAL_WINDOW was calibrated for.
-REASON_ATTACH_WINDOW = 4.0
+REASON_ATTACH_WINDOW = 7.0
 
 # How long to ignore further gesture detections after ANY accepted
 # commit (authorization, point, or reason). Grounded in the FIVB
@@ -184,7 +184,7 @@ SETTLE_WINDOW_SECONDS = 1.5
 # TEMPORAL_WINDOW was calibrated (see above), if this ever misfires by
 # being too eager (unrelated whistle confirms a stale gesture) or too
 # easily missed (a real, slightly slow whistle doesn't make it in time).
-WHISTLE_CONFIRMATION_GRACE_SECONDS = 3.0
+WHISTLE_CONFIRMATION_GRACE_SECONDS = 6.0
 
 SERVICE_AUTHORIZATION_GESTURES = {"service_authorization_left", "service_authorization_right"}
 SCORING_GESTURES = {"team_to_serve_left", "team_to_serve_right"}
