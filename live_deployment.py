@@ -159,6 +159,33 @@ log it" -- previously nothing computed that state at all, so there
 was nothing to show or log even after the display code was fixed to
 handle it.
 
+--------------------------------------------------------------------
+REASON-STREAK RESPONSIVENESS (this pass): REASON_STREAK_NEEDED lowered
+3 -> 2. Real live testing showed a genuine, correctly-performed
+ball_out could still miss commitment before this -- the referee had
+to be coached to hold the gesture artificially longer to get 3
+consecutive clean reads within REASON_ATTACH_WINDOW. Lowered so a
+normally-paced gesture is more likely to register without needing
+that workaround. Same category of change as STREAK_NEEDED_TO_COMMIT's
+earlier 5->3 reduction -- a single tunable constant, no effect on
+decision_engine.py's own REASON_ATTACH_WINDOW timing, which remains
+the real safety bound. Real tradeoff, stated plainly: fewer
+confirmations needed means slightly more sensitive to noise -- but
+this only ever affects WHICH reason gets attached (informational),
+never scoring correctness, since ball_out/ball_in/double_contact never
+award or change points.
+
+WHISTLE SOURCE LABELING (this pass): every whistle logged to the
+strict CSV (and shown in the HTML report's Whistle Detections table)
+now carries an explicit `manual` or `auto` label, based on whether a
+confidence value was passed into on_whistle() (real detector always
+passes one; the W key never does). This is PURELY additive logging
+metadata -- it does not change how a manual whistle behaves in any
+way; a manual W press still runs through the exact same on_whistle()
+code path as a real detection, with no special-cased side effects.
+Previously this distinction only ever showed up in the console print
+(the confidence=X.XX suffix), never in anything saved to disk.
+
 Controls:
   W - manual whistle (only matters if real whistle detection isn't active)
   Q / ESC - quit
@@ -239,7 +266,9 @@ CANCELLATION_STREAK_NEEDED = 3
 # new gesture for several frames after a real gesture was just
 # committed, which was silently starving reason attachment past
 # REASON_ATTACH_WINDOW (decision_engine.py) in real testing.
-REASON_STREAK_NEEDED = 3
+# CHANGED: 3 -> 2. See module docstring's "REASON-STREAK
+# RESPONSIVENESS" section for why.
+REASON_STREAK_NEEDED = 2
 COMMIT_COOLDOWN_SECONDS = 2.0
 STALE_VOTE_SECONDS = 3.0
 TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS = 1.5
@@ -936,6 +965,11 @@ def generate_html_report(log_path, strict_log_path, output_path, session_start_t
     / sanity check rather than the live A/B evidence it was originally
     built for, since that whistle-gating decision is now settled by the
     paper's objectives.
+
+    WHISTLE SOURCE (this pass): the Whistle Detections table and the
+    summary box now show whether each whistle was "auto" (real
+    detector) or "manual" (W key), pulled from the strict CSV's new
+    whistle_source column. See module docstring for why this exists.
     """
     def read_rows(path):
         with open(path, "r", newline="") as f:
@@ -947,6 +981,8 @@ def generate_html_report(log_path, strict_log_path, output_path, session_start_t
     main_events = [r for r in main_rows if r.get("engine_event")]
     strict_gesture_events = [r for r in strict_rows if r.get("event_type") == "gesture" and r.get("engine_event")]
     strict_whistle_events = [r for r in strict_rows if r.get("event_type") == "whistle"]
+    auto_whistle_count = sum(1 for r in strict_whistle_events if r.get("whistle_source") == "auto")
+    manual_whistle_count = sum(1 for r in strict_whistle_events if r.get("whistle_source") == "manual")
 
     timeline = []
     for r in main_events:
@@ -965,7 +1001,7 @@ def generate_html_report(log_path, strict_log_path, output_path, session_start_t
         })
     timeline.sort(key=lambda e: e["timestamp"])
 
-    # NEW: whistle detections as their own table, positioned right next
+    # Whistle detections as their own table, positioned right next
     # to the Commit Timeline for easy visual comparison -- every whistle
     # (real detector or manual W press) is unconditionally logged to the
     # strict CSV, so this is the complete whistle record for the
@@ -973,8 +1009,10 @@ def generate_html_report(log_path, strict_log_path, output_path, session_start_t
     # confirm a pending gesture.
     whistle_rows_html = ""
     for r in strict_whistle_events:
+        source = r.get("whistle_source", "") or "manual"  # older sessions without this column default to blank; treat as unknown
         whistle_rows_html += (
             f"<tr><td>{r.get('ph_time', '')}</td><td>{float(r['timestamp']):.3f}</td>"
+            f"<td>{source}</td>"
             f"<td>{r.get('strict_score_left', '?')} - {r.get('strict_score_right', '?')}</td></tr>\n"
         )
 
@@ -1022,6 +1060,28 @@ def generate_html_report(log_path, strict_log_path, output_path, session_start_t
             f"<td>{win_flag}</td></tr>\n"
         )
 
+    # NEW: condensed events-only summary -- built from main_events
+    # (already computed above), same underlying data as the Commit
+    # Timeline but presented as a single compact table instead of
+    # duplicated per-engine rows, since with REQUIRE_WHISTLE_FOR_SCORING
+    # now True the two engines behave identically anyway. Purpose: let
+    # someone glance at what actually happened this session without
+    # scrolling past every idle inference cycle in the Full
+    # Recognition Log below. Uses the same event_color mapping as the
+    # other tables for visual consistency across the report.
+    events_summary_html = ""
+    for r in main_events:
+        pretty_label = DISPLAY_NAME.get(r.get("vote_committed_label", ""), r.get("vote_committed_label", ""))
+        color = event_color.get(r["engine_event"], "#333")
+        events_summary_html += (
+            f"<tr><td>{r.get('ph_time', '')}</td>"
+            f"<td style='color:{color};font-weight:bold'>{r['engine_event']}</td>"
+            f"<td>{pretty_label}</td><td>{r.get('engine_reason', '')}</td>"
+            f"<td>{r.get('score_left', '?')} - {r.get('score_right', '?')}</td></tr>\n"
+        )
+    if not events_summary_html:
+        events_summary_html = "<tr><td colspan='5'>(no events committed this session)</td></tr>\n"
+
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <title>Session Report -- {get_ph_time_str()}</title>
@@ -1042,8 +1102,14 @@ th {{ background: #eee; }}
   <p><b>Final score (Strict, whistle-required):</b> {final_strict_score.get('strict_score_left', '?')} - {final_strict_score.get('strict_score_right', '?')}</p>
   <p><b>Points awarded -- Informational:</b> {informational_points} &nbsp;|&nbsp; <b>Strict:</b> {strict_points}
      {"<span class='divergence'>&nbsp;&nbsp;(" + str(point_gap) + " point(s) informational scored that strict did not)</span>" if point_gap != 0 else ""}</p>
-  <p><b>Real whistle detections this session:</b> {len(strict_whistle_events)} (see Whistle Detections table below for the full list)</p>
+  <p><b>Whistle detections this session:</b> {len(strict_whistle_events)} total -- {auto_whistle_count} auto-detected, {manual_whistle_count} manual (see Whistle Detections table below for the full list)</p>
 </div>
+<h2>Session Events Summary</h2>
+<p>Every committed event this session, in one compact table -- skip straight here instead of scrolling the Full Recognition Log below for a quick read of what actually happened.</p>
+<table>
+<tr><th>PH Time</th><th>Event</th><th>Label</th><th>Reason</th><th>Score After</th></tr>
+{events_summary_html}
+</table>
 <h2>Commit Timeline (Informational vs. Strict, side by side)</h2>
 <p>Only rows where something actually committed or was explicitly ignored/pending -- fastest way to scan "what happened."</p>
 <table>
@@ -1051,9 +1117,9 @@ th {{ background: #eee; }}
 {commit_rows_html}
 </table>
 <h2>Whistle Detections</h2>
-<p>Every whistle detected this session (real detector or manual W press) -- the complete whistle record, independent of whether a given whistle happened to confirm a pending gesture. Compare timestamps directly against the Commit Timeline above to check whistle-to-gesture ordering.</p>
+<p>Every whistle detected this session (real detector or manual W press) -- the complete whistle record, independent of whether a given whistle happened to confirm a pending gesture. Source column shows whether each whistle came from the real detector ("auto") or a manual W press ("manual"). Compare timestamps directly against the Commit Timeline above to check whistle-to-gesture ordering.</p>
 <table>
-<tr><th>PH Time</th><th>Timestamp (epoch, sec)</th><th>Score After</th></tr>
+<tr><th>PH Time</th><th>Timestamp (epoch, sec)</th><th>Source</th><th>Score After</th></tr>
 {whistle_rows_html}
 </table>
 <h2>Full Recognition Log (Informational engine, every inference cycle)</h2>
@@ -1094,8 +1160,11 @@ def main():
     strict_log_path = os.path.join(LOG_DIR, f"deployment_strict_{int(session_start_time)}.csv")
     strict_log_file = open(strict_log_path, "w", newline="")
     strict_log_writer = csv.writer(strict_log_file)
+    # NEW (this pass): whistle_source column -- see module docstring's
+    # "WHISTLE SOURCE LABELING" section. "auto" or "manual" for whistle
+    # rows; blank for gesture rows (not applicable to those).
     strict_log_writer.writerow(["timestamp", "ph_time", "event_type", "label", "engine_event", "engine_reason",
-                                 "strict_score_left", "strict_score_right"])
+                                 "strict_score_left", "strict_score_right", "whistle_source"])
 
     print(f"Logging to: {log_path}")
     print(f"Strict (whistle-required) log: {strict_log_path}")
@@ -1119,8 +1188,16 @@ def main():
         confirmation_result = engine.on_whistle_detected(timestamp)
         confirmation_result_strict = strict_engine.on_whistle_detected(timestamp)
 
+        # NEW: explicit manual-vs-auto label, replacing the previous
+        # implicit distinction (confidence present = auto, None =
+        # manual) that only ever showed up in the console print, never
+        # in the CSVs or HTML report. Purely additive logging metadata
+        # -- does not affect scoring or decision logic in any way; a
+        # manual whistle still runs through this exact same function,
+        # with no special-cased behavior of its own.
+        whistle_source = "auto" if confidence is not None else "manual"
         strict_log_writer.writerow([f"{timestamp:.3f}", get_ph_time_str(), "whistle", "", "", "",
-                                     strict_engine.score["left"], strict_engine.score["right"]])
+                                     strict_engine.score["left"], strict_engine.score["right"], whistle_source])
         strict_log_file.flush()
         whistle_flash_until_holder["value"] = time.time() + 1.5
         conf_str = f" (confidence={confidence:.2f})" if confidence is not None else ""
@@ -1157,7 +1234,7 @@ def main():
         if confirmation_result_strict is not None and pending_label_before_strict is not None:
             strict_log_writer.writerow([f"{timestamp:.3f}", get_ph_time_str(), "gesture", pending_label_before_strict,
                                          confirmation_result_strict["event"], "confirmed_by_late_whistle",
-                                         strict_engine.score["left"], strict_engine.score["right"]])
+                                         strict_engine.score["left"], strict_engine.score["right"], ""])
             strict_log_file.flush()
 
     detector = try_load_whistle_detector(on_whistle)
@@ -1273,7 +1350,7 @@ def main():
         strict_result = strict_engine.on_gesture_detected(label, now)
         strict_log_writer.writerow([f"{now:.3f}", get_ph_time_str(), "gesture", label, strict_result["event"],
                                      strict_result.get("reason", ""),
-                                     strict_engine.score["left"], strict_engine.score["right"]])
+                                     strict_engine.score["left"], strict_engine.score["right"], ""])
         strict_log_file.flush()
         last_decision_text = f"{label}: {result['event']}"
         if result["event"] == "ignored":
