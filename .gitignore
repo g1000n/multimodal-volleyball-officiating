@@ -1,24 +1,37 @@
-# Raw data audio files (ignored in all subdirectories)
+# =============================================================================
+# LARGE / REGENERABLE FILES ONLY -- everything else (all CSVs, all scripts,
+# README, requirements.txt) is tracked normally, including everything under
+# processed/. This is a deliberate change from ignoring processed/ wholesale --
+# that blanket rule is what made processed/iphone_whistle_candidates.csv (the
+# manually-confirmed y/n whistle labels) unrecoverable when local files were
+# lost. Small structural/index files should never be at that kind of risk
+# again; only the actual audio blobs and the model binary are worth excluding.
+# =============================================================================
+
+# Raw source audio -- see README for download/setup instructions
 raw_data/**/*.wav
 raw_data/**/*.m4a
 
-# Augmented / generated audio living outside raw_data/
+# Augmented/generated audio living outside raw_data/
 data/augmented_dataset/
 data/**/*.wav
 data/**/*.m4a
 
-# Processed feature files & outputs
-processed/
-data/processed/
+# Processed AUDIO CLIPS only (the actual .wav files under processed/clips/).
+# This is the large, regenerable part -- get these from the shared Drive
+# folder instead of regenerating, or rerun the extraction scripts (02-04c)
+# against raw_data/ if Drive isn't available. Everything else under
+# processed/ (whistle_index.csv, match_negative_index.csv,
+# iphone_negative_index.csv, iphone_whistle_index.csv,
+# synthetic_negative_index.csv, iphone_whistle_candidates.csv,
+# calibration_sample.csv, features.csv, test_set.csv) is NOT ignored --
+# those are small and tracked normally.
+processed/clips/**/*.wav
 
-# Model binary weights
+# Trained model binary -- large, and fully reproducible from
+# processed/features.csv + 06_train_model.py's fixed random_state=42.
+# Rerun 06 to regenerate, or grab from Drive.
 models/*.pkl
-
-# Keep directory structure tracked on Git
-!raw_data/**/.gitkeep
-!raw_data/**/.gitattributes
-!processed/.gitkeep
-!models/.gitkeep
 
 # Python
 whistle_env/

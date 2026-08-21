@@ -1,4 +1,3 @@
-markdown
 # Whistle Detection Pipeline
 
 Audio whistle-detection module for the Multimodal Real-Time Officiating System
@@ -14,6 +13,13 @@ the call means. The whistle's only job is to trigger/validate that a call happen
 ```powershell
 git pull origin audio
 ```
+
+This now pulls all the small/structural files too -- scripts, README,
+requirements.txt, and (as of this update) every CSV under `processed/`
+(index files, `features.csv`, `test_set.csv`, and critically
+`iphone_whistle_candidates.csv` with everyone's confirmed y/n labels). Only
+the actual audio `.wav` clips and the trained model `.pkl` are excluded from
+git -- see "Getting the processed audio clips" below for those.
 
 ## Environment setup (one-time)
 
@@ -50,14 +56,43 @@ python -m huggingface_hub download GYdevy/volleyball-whistles --repo-type datase
    https://drive.google.com/drive/folders/1QsFHW6hpkjNp6-fj4D7KCkzXxZdK81Wn?usp=sharing
 2. Place the folders into these exact paths:
 
+```
 raw_data/iphone_recordings/
-├── positive_audio/ <- clean whistle-only session(s), .m4a or .wav
+├── positive_audio/          <- clean whistle-only session(s), .m4a or .wav
 ├── positive_negative_audio/ <- noisy session(s), whistles + background noise mixed in
-└── negative_audio/ <- pure ambient noise, NO whistles at all
+└── negative_audio/          <- pure ambient noise, NO whistles at all
+```
 
 Do not mix whistle-containing and whistle-free audio in the same file --
 `04_process_iphone_negatives.py` has no whistle-location awareness and would
 mislabel whistle audio as negative if they're combined.
+
+## Getting the processed audio clips (skip re-extraction)
+
+`processed/clips/whistle/` and `processed/clips/non_whistle/` (the actual
+`.wav` clips, as opposed to the CSVs that index them) are **not in git** --
+they're large and fully regenerable, so keeping them out of version control
+keeps the repo lightweight. Two ways to get them:
+
+**Option A -- pull from Drive (fastest, recommended for groupmates):**
+1. Download the `processed_clips` folder from the same shared Drive link
+   above.
+2. Place its contents at `processed/clips/whistle/` and
+   `processed/clips/non_whistle/` respectively.
+3. Since the matching index CSVs (`whistle_index.csv`,
+   `match_negative_index.csv`, etc.) are already in git, you now have a
+   complete `processed/` folder without running any extraction scripts.
+   You can jump straight to `05_extract_features.py`.
+
+**Option B -- regenerate from raw_data (if Drive is unavailable or you
+changed extraction settings):**
+Run `02` through `04c` as in "Full pipeline" below. Slower, but always
+produces clips consistent with whatever's currently in the scripts.
+
+**If you generate new/updated clips locally, please re-upload
+`processed/clips/` to the same Drive folder** so the rest of the team stays
+in sync -- git won't do this for you since those files are intentionally
+ignored.
 
 ## Full pipeline (run in order)
 
@@ -70,6 +105,7 @@ python scripts/03_extract_match_negatives.py            # Volleylitics negative 
 # iPhone data:
 python scripts/04a_detect_iphone_whistle_candidates.py    # auto-detect candidates in positive_audio/ + positive_negative_audio/
 #  -> open processed/iphone_whistle_candidates.csv, confirm each row y/n in VLC (Ctrl+T to jump to vlc_jump_time), save
+#  -> this file IS tracked in git now -- commit it once you've filled it in, don't let this work live only on your machine
 python scripts/04b_extract_iphone_whistles.py             # extracts confirmed whistle clips -> iphone_whistle_index.csv
 python scripts/04_process_iphone_negatives.py             # only reads negative_audio/ -> iphone_negative_index.csv
 python scripts/04c_synthetic_hard_negatives.py             # synthetic squeak/bounce hard negatives -> synthetic_negative_index.csv
@@ -137,6 +173,23 @@ python scripts/08_realtime_ui.py                           # live mic test -- GU
   F1 scores for a single fold -- this is a known quirk of that CV setup, not a
   sign of a broken model. Trust `07_evaluate.py`'s held-out test numbers above,
   not the CV scores printed during training.
+
+## Before committing: a quick size sanity check
+
+Now that `processed/*.csv` files are tracked in git (not just ignored), it's
+worth confirming none of them have quietly grown too large for a normal git
+push -- `features.csv` in particular, since it includes the augmented
+variants (6x per training clip).
+
+```powershell
+Get-ChildItem processed\*.csv | Sort-Object Length -Descending | Select-Object Name, @{N='MB';E={[math]::Round($_.Length/1MB,2)}}
+```
+
+If any single file is creeping past ~50MB, flag it before pushing -- either
+it needs Git LFS, or it should join the clips/model on the ignore list and
+get distributed via Drive instead. For a dataset this size it's unlikely to
+be an issue, but worth a 10-second check rather than finding out from a
+failed push.
 
 ## Utility scripts
 
