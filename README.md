@@ -126,8 +126,10 @@ python scripts/08_realtime_ui.py                           # live mic test -- GU
   leak into training, quietly inflating your reported accuracy.
   Current setting (once iPhone data is included):
 ```python
-  TEST_MATCHES = ["match9", "match7", "match13", "iphone_positive_audio"]
+  TEST_MATCHES = ["match9", "match7", "iphone_positive_audio"]
 ```
+  Note: Only 9 of 14 available Volleylitics matches were processed (match1, 2, 3, 4, 7, 8, 9, 11, 14).
+  `match13` is NOT in the processed dataset, so it cannot be used for evaluation.
   Check `processed/features.csv` `match_id` counts to confirm exact group names
   before setting this -- they must match exactly (e.g. `iphone_positive_audio`,
   not `iphone_positive_audio_wav` or similar). Note iPhone `match_id`s come from
@@ -156,9 +158,9 @@ python scripts/08_realtime_ui.py                           # live mic test -- GU
   (`04c`, 300 total: 150 squeak + 150 bounce) -- synthetic clips are a
   supplementary hard-negative source, not a replacement for real court-noise
   recordings.
-- Latest held-out evaluation (`match9`, `match7`, `match13`, and one held-out
-  iPhone recording; 555 test samples): **98.2% accuracy**, 0.96-0.99
-  precision/recall across both classes (non_whistle: 0.96 precision / 0.98
+- **Held-out evaluation results** (match7 + match9 from Volleylitics, plus one
+  iPhone holdout; 240 test samples): **98.2% accuracy**, 0.96–0.99
+  precision/recall across both classes (non-whistle: 0.96 precision / 0.98
   recall; whistle: 0.99 precision / 0.98 recall). Note in the paper that
   iPhone test performance reflects close-mic recording conditions, not
   broadcast match audio -- avoid overstating this as a strict like-for-like
