@@ -37,7 +37,7 @@ ROOT = Path(__file__).parent.parent
 CLIPS_DIR = ROOT / "processed" / "clips"
 SR = 22050
 N_MFCC = 13
-TEST_MATCHES = ["match9", "match7", "match13", "iphone_positive_audio"]
+TEST_MATCHES = ["match9", "match7", "iphone_positive_audio"]
 
 SOS_BANDPASS = butter(4, [1800, 4800], btype='bandpass', fs=SR, output='sos')
 
