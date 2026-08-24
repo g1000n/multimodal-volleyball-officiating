@@ -1,3 +1,36 @@
+Got it. We will completely leave `08_realtime_ui.py` alone.
+
+To answer your question about **`07_evaluate.py`**: **No, there is absolutely nothing to change in that file.** It is already perfectly written to load your 435-row test set and output the metrics you need for your paper.
+
+Here are your final, super simple steps for Option A, followed by the code-ready README.
+
+### Your Exact Steps
+
+**Step 1: Update your README**
+Copy the markdown code block below and paste it directly into your `README.md` file. It updates the test row count to 435 and documents the data overlap so your groupmates are aware.
+
+**Step 2: Get your numbers for the paper**
+Open your terminal and run the evaluation script:
+
+```powershell
+python scripts/07_evaluate.py
+
+```
+
+Just watch the output and take note of the final accuracy, precision, and recall numbers it prints. You will use these numbers in your Results section.
+
+**Step 3: Add the explanation to your Thesis**
+In your Methodology or Limitations section, add a paragraph explaining the real-world behavior based on your group's testing. You can use this exact wording:
+
+> *"During live testing, the model demonstrated robust performance against continuous white noise, such as heavy rain during the August 19 session. However, it occasionally exhibited sensitivity to sudden dynamic noises, such as loud shouting on August 21. This behavior aligns with a known limitation in the dataset configuration: negative ambient iPhone audio (including shouting and court noise) was included in the training set rather than the holdout evaluation set. As a result, while the model evaluates with high accuracy on clean audio, real-world deployment requires careful consideration of sudden background noise."*
+
+---
+
+### Code-Ready README.md
+
+Click the "Copy" button on the top right of this block and paste it directly into your `README.md` file:
+
+```markdown
 # Whistle Detection Pipeline
 
 Audio whistle-detection module for the Multimodal Real-Time Officiating System
@@ -12,6 +45,7 @@ the call means. The whistle's only job is to trigger/validate that a call happen
 
 ```powershell
 git pull origin audio
+
 ```
 
 This now pulls all the small/structural files too -- scripts, README,
@@ -31,6 +65,7 @@ py -3.12 -m venv whistle_env
 whistle_env\Scripts\activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+
 ```
 
 Every new terminal session needs `whistle_env\Scripts\activate` run again first.
@@ -38,29 +73,39 @@ Every new terminal session needs `whistle_env\Scripts\activate` run again first.
 ## Data setup (one-time)
 
 **Volleylitics (public match audio):**
+
 ```powershell
 python -m pip install -U huggingface_hub
 hf download GYdevy/volleyball-whistles --repo-type dataset --local-dir raw_data/volleylitics
+
 ```
+
 If `hf` isn't recognized as a command, try one of these instead:
+
 ```powershell
 huggingface-cli download GYdevy/volleyball-whistles --repo-type dataset --local-dir raw_data/volleylitics
+
 ```
+
 or, as a fallback that should always work:
+
 ```powershell
 python -m huggingface_hub download GYdevy/volleyball-whistles --repo-type dataset --local-dir raw_data/volleylitics
+
 ```
 
 **iPhone recordings (co-primary source, private -- not on Hugging Face):**
+
 1. Download from this shared Drive folder:
-   https://drive.google.com/drive/folders/1QsFHW6hpkjNp6-fj4D7KCkzXxZdK81Wn?usp=sharing
+https://drive.google.com/drive/folders/1QsFHW6hpkjNp6-fj4D7KCkzXxZdK81Wn?usp=sharing
 2. Place the folders into these exact paths:
 
-```
+```text
 raw_data/iphone_recordings/
 ├── positive_audio/          <- clean whistle-only session(s), .m4a or .wav
 ├── positive_negative_audio/ <- noisy session(s), whistles + background noise mixed in
 └── negative_audio/          <- pure ambient noise, NO whistles at all
+
 ```
 
 Do not mix whistle-containing and whistle-free audio in the same file --
@@ -75,14 +120,15 @@ they're large and fully regenerable, so keeping them out of version control
 keeps the repo lightweight. Two ways to get them:
 
 **Option A -- pull from Drive (fastest, recommended for groupmates):**
+
 1. Download the `processed_clips` folder from the same shared Drive link
-   above.
+above.
 2. Place its contents at `processed/clips/whistle/` and
-   `processed/clips/non_whistle/` respectively.
+`processed/clips/non_whistle/` respectively.
 3. Since the matching index CSVs (`whistle_index.csv`,
-   `match_negative_index.csv`, etc.) are already in git, you now have a
-   complete `processed/` folder without running any extraction scripts.
-   You can jump straight to `05_extract_features.py`.
+`match_negative_index.csv`, etc.) are already in git, you now have a
+complete `processed/` folder without running any extraction scripts.
+You can jump straight to `05_extract_features.py`.
 
 **Option B -- regenerate from raw_data (if Drive is unavailable or you
 changed extraction settings):**
@@ -115,66 +161,68 @@ python scripts/06_train_model.py                          # edit TEST_MATCHES fi
 python scripts/07_evaluate.py                              # run once, don't re-tune on this result
 
 python scripts/08_realtime_ui.py                           # live mic test -- GUI: confidence bar, live mic energy, adjustable threshold
+
 ```
 
 ## Important settings to check before training
 
-- **`TEST_MATCHES` appears in BOTH `05_extract_features.py` and `06_train_model.py`
-  and must match in both files.** `05` uses it to decide which clips get skipped
-  from data augmentation (time-shift/noise variants); `06` uses it to hold out the
-  actual test split. If they don't match, augmented copies of your "held-out" data
-  leak into training, quietly inflating your reported accuracy.
-  Current setting (once iPhone data is included):
+* **`TEST_MATCHES` appears in BOTH `05_extract_features.py` and `06_train_model.py`
+and must match in both files.** `05` uses it to decide which clips get skipped
+from data augmentation (time-shift/noise variants); `06` uses it to hold out the
+actual test split. If they don't match, augmented copies of your "held-out" data
+leak into training, quietly inflating your reported accuracy.
+Current setting (once iPhone data is included):
+
 ```python
   TEST_MATCHES = ["match9", "match7", "iphone_positive_audio"]
+
 ```
-  Note: Only 9 of 14 available Volleylitics matches were processed (match1, 2, 3, 4, 7, 8, 9, 11, 14).
-  `match13` is NOT in the processed dataset, so it cannot be used for evaluation.
-  Check `processed/features.csv` `match_id` counts to confirm exact group names
-  before setting this -- they must match exactly (e.g. `iphone_positive_audio`,
-  not `iphone_positive_audio_wav` or similar). Note iPhone `match_id`s come from
-  the recording's filename stem, not its subfolder name.
 
-- **`02_extract_whistle_clips.py` → `PRE`/`POST`/`TARGET_LEN`**: `0.3s` / `1.2s` /
-  `1.5s`, set from manual listening QC (`processed/calibration_sample.csv`).
-  `04b_extract_iphone_whistles.py` and `08_realtime_ui.py`'s `WINDOW_SEC` must
-  match `TARGET_LEN` exactly -- a mismatch here previously caused a single long
-  whistle to be reported as 2-3 separate triggers in real-time testing.
+Note: Only 9 of 14 available Volleylitics matches were processed (match1, 2, 3, 4, 7, 8, 9, 11, 14).
+`match13` is NOT in the processed dataset, so it cannot be used for evaluation.
+Check `processed/features.csv` `match_id` counts to confirm exact group names
+before setting this -- they must match exactly (e.g. `iphone_positive_audio`,
+not `iphone_positive_audio_wav` or similar). Note iPhone `match_id`s come from
+the recording's filename stem, not its subfolder name.
 
-- **`04_process_iphone_negatives.py` → `TARGET_PER_FILE`**: currently `120`
-  (increased from `30`). This is a **per-recording-file** target, not a total
-  across all recordings -- if you add more negative recordings, total clip count
-  scales up. Check the script's console output (`kept N clips after filtering/
-  subsampling`) per file to see actual totals, since `MIN_GAP_SEC` spacing can
-  cap shorter recordings below the target anyway.
+* **`02_extract_whistle_clips.py` → `PRE`/`POST`/`TARGET_LEN**`: `0.3s` / `1.2s` /
+`1.5s`, set from manual listening QC (`processed/calibration_sample.csv`).
+`04b_extract_iphone_whistles.py` and `08_realtime_ui.py`'s `WINDOW_SEC` must
+match `TARGET_LEN` exactly -- a mismatch here previously caused a single long
+whistle to be reported as 2-3 separate triggers in real-time testing.
+* **`04_process_iphone_negatives.py` → `TARGET_PER_FILE**`: currently `120`
+(increased from `30`). This is a **per-recording-file** target, not a total
+across all recordings -- if you add more negative recordings, total clip count
+scales up. Check the script's console output (`kept N clips after filtering/ subsampling`) per file to see actual totals, since `MIN_GAP_SEC` spacing can
+cap shorter recordings below the target anyway.
 
 ## Data notes
 
-- Audio loading uses `soundfile` + `scipy` resampling, not `librosa` -- avoids
-  Windows DLL import failures (numba/soxr). Don't reintroduce `librosa.load`.
-- iPhone data is co-primary alongside Volleylitics, not merely supplementary.
-- Negative clips come from three sources: Volleylitics hard negatives (`03`),
-  real iPhone ambient recordings (`04`), and synthetic squeak/bounce clips
-  (`04c`, 300 total: 150 squeak + 150 bounce) -- synthetic clips are a
-  supplementary hard-negative source, not a replacement for real court-noise
-  recordings.
-- **Held-out evaluation results** (match7 + match9 from Volleylitics, plus one
-  iPhone holdout; 240 test samples): **98.2% accuracy**, 0.96–0.99
-  precision/recall across both classes (non-whistle: 0.96 precision / 0.98
-  recall; whistle: 0.99 precision / 0.98 recall). Note in the paper that
-  iPhone test performance reflects close-mic recording conditions, not
-  broadcast match audio -- avoid overstating this as a strict like-for-like
-  improvement over the Volleylitics-only baseline.
-- Real-time detection (`08_realtime_ui.py`) is intentionally binary
-  (whistle / no whistle trigger only). No blast-duration or call-type
-  classification is done here -- that logic was removed to match the thesis's
-  stated scope; call interpretation is the gesture recognition module's job.
-- Note: `06_train_model.py`'s printed "Individual Validation Scores" (SVM/RF/GB)
-  use leave-one-group-out cross-validation, where some groups (e.g. purely
-  synthetic or single-class recordings) can produce artificially low/undefined
-  F1 scores for a single fold -- this is a known quirk of that CV setup, not a
-  sign of a broken model. Trust `07_evaluate.py`'s held-out test numbers above,
-  not the CV scores printed during training.
+* Audio loading uses `soundfile` + `scipy` resampling, not `librosa` -- avoids
+Windows DLL import failures (numba/soxr). Don't reintroduce `librosa.load`.
+* iPhone data is co-primary alongside Volleylitics, not merely supplementary.
+* Negative clips come from three sources: Volleylitics hard negatives (`03`),
+real iPhone ambient recordings (`04`), and synthetic squeak/bounce clips
+(`04c`, 300 total: 150 squeak + 150 bounce) -- synthetic clips are a
+supplementary hard-negative source, not a replacement for real court-noise
+recordings.
+* **Held-out evaluation results** (match7 + match9 from Volleylitics, plus one
+iPhone holdout; **435 test samples** -- 120 Volleylitics positive, 120 Volleylitics negative, 195 iPhone positive): Accuracy metrics are determined by `07_evaluate.py`.
+* **Known Data Overlap:** The current model was trained with negative iPhone ambient noise included in the training set rather than the test set. Because the test set currently contains 0 negative iPhone samples, false-positive metrics on the current holdout set may be artificially optimistic compared to live performance.
+* Note in the paper that
+iPhone test performance reflects close-mic recording conditions, not
+broadcast match audio -- avoid overstating this as a strict like-for-like
+improvement over the Volleylitics-only baseline.
+* Real-time detection (`08_realtime_ui.py`) is intentionally binary
+(whistle / no whistle trigger only). No blast-duration or call-type
+classification is done here -- that logic was removed to match the thesis's
+stated scope; call interpretation is the gesture recognition module's job.
+* Note: `06_train_model.py`'s printed "Individual Validation Scores" (SVM/RF/GB)
+use leave-one-group-out cross-validation, where some groups (e.g. purely
+synthetic or single-class recordings) can produce artificially low/undefined
+F1 scores for a single fold -- this is a known quirk of that CV setup, not a
+sign of a broken model. Trust `07_evaluate.py`'s held-out test numbers above,
+not the CV scores printed during training.
 
 ## Before committing: a quick size sanity check
 
@@ -185,6 +233,7 @@ variants (6x per training clip).
 
 ```powershell
 Get-ChildItem processed\*.csv | Sort-Object Length -Descending | Select-Object Name, @{N='MB';E={[math]::Round($_.Length/1MB,2)}}
+
 ```
 
 If any single file is creeping past ~50MB, flag it before pushing -- either
@@ -195,9 +244,13 @@ failed push.
 
 ## Utility scripts
 
-- `scripts/force_rebuild.py` -- deletes `processed/features.csv`,
-  `processed/test_set.csv`, and `models/whistle_svm_model.pkl`, then reruns `05`
-  and `06` from scratch. Use after changing feature-extraction code to guarantee
-  no stale cached features leak into a new model. Does **not** regenerate
-  clip/index files -- rerun `02`-`04c` first if raw data or extraction windows
-  changed.
+* `scripts/force_rebuild.py` -- deletes `processed/features.csv`,
+`processed/test_set.csv`, and `models/whistle_svm_model.pkl`, then reruns `05`
+and `06` from scratch. Use after changing feature-extraction code to guarantee
+no stale cached features leak into a new model. Does **not** regenerate
+clip/index files -- rerun `02`-`04c` first if raw data or extraction windows
+changed.
+
+```
+
+```
