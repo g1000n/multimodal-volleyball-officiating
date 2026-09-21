@@ -70,7 +70,15 @@ def main():
     md += ["", "Verdict: CORRECT needs the score cutoff, the signal recognized by the model, a hold of at least half the "
                "required time, and no failed critical or strict check. ALMOST is the lower cutoff or a recognized signal "
                "with a critical flaw. Otherwise INCORRECT. A body not visible in enough frames gives NO READING (not counted).",
-           "Trainee points: CORRECT 10, ALMOST 5, INCORRECT 0.", "",
+           "Trainee points: CORRECT 10, ALMOST 5, INCORRECT 0.",
+           "Hold: FIVB 30.1 says a signal is maintained for a moment (no number is given). The required time is set per "
+           "level; for Service Authorization, which is a moving signal, it is scaled to "
+           f"{gg.HOLD_SCALE.get('service_authorization_left', 1.0):g} of that.",
+           "Open hand: the FIVB text names open hands for Ball Out and End of Set, and the FIVB illustrations show an open "
+           "hand for the other signals. It is applied as "
+           f"{'a strict' if gg.OPEN_HAND_STRICT else 'a scored'} check (gesture_grader.OPEN_HAND_STRICT): "
+           f"{'a visible fist caps the verdict at ALMOST' if gg.OPEN_HAND_STRICT else 'a closed hand only lowers the score and shows a tip, because the camera can misread fingers'}.",
+           gg.DISCLAIMER, "",
            "## Checks by signal", "", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for r in rows:
         md.append("| " + " | ".join(str(x) for x in r) + " |")

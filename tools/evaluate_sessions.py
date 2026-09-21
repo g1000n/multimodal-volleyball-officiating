@@ -13,6 +13,7 @@ repetitions. Do this at each difficulty level you want to report.
 
 Run (from the project root):
     python tools/evaluate_sessions.py
+    python tools/evaluate_sessions.py --since 20260921_150000     # only the sessions after that time
 
 It reads data/trainer_sessions/*/*/attempts.csv and reports, per difficulty level and per signal:
   * acceptance rate of correct attempts   (verdict CORRECT)          -> the grader is not too strict
@@ -28,6 +29,7 @@ Honest note for the paper: the label is what the tester INTENDED, not an expert'
 and add the agreement between independent human judges if you can.
 """
 
+import argparse
 import csv
 import glob
 import os
@@ -51,10 +53,17 @@ def pct(a, b):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--since", default="", help="only sessions whose folder name is >= this, e.g. 20260921_150000")
+    ap.add_argument("--trainee", default="", help="only this trainee folder")
+    args = ap.parse_args()
+
     rows = []
     for f in sorted(glob.glob(os.path.join(ROOT, "*", "*", "attempts.csv"))):
         session = os.path.basename(os.path.dirname(f))
         trainee = os.path.basename(os.path.dirname(os.path.dirname(f)))
+        if session < args.since or (args.trainee and trainee != args.trainee):
+            continue
         with open(f, newline="", encoding="utf-8") as fh:
             for r in csv.DictReader(fh):
                 if r.get("kind") == "gesture" and r.get("intent") in ("correct", "wrong"):

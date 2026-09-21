@@ -53,11 +53,15 @@ def _conf(name, default):
 
 
 APP_TITLE = "Volleyball Officiating Training Tool"
-CONSENT_VERSION = "2026-09-v1"
+CONSENT_VERSION = "2026-09-v2"
 DATA_ROOT = os.path.join("data", "trainer_sessions")
 CONSENT_LOG = os.path.join("data", "consent_records.csv")
 SETTINGS_PATH = os.path.join("data", "ui_settings.json")
 SIGNAL_IMAGE_DIR = os.path.join("assets", "signals")   # optional: assets/signals/<label>.png
+
+# Evaluation-test labels (Session label + Note in the menu). Off for real use; switch on in trainer_config.py
+# while collecting the "correct on purpose" / "wrong on purpose" attempts.
+TEST_MODE = bool(_conf("TEST_MODE", False))
 
 CONTACT = _conf("CONTACT", "[TEAM CONTACT EMAIL]")
 RETENTION = _conf("RETENTION", "[RETENTION PERIOD]")
@@ -74,6 +78,7 @@ It uses your webcam and microphone to check the referee hand signals you perform
 WHAT WILL BE COLLECTED
 - Video of your training sessions, recorded from your webcam. You will appear in it.
 - Your session results: which signals you attempted, your scores, timestamps, and a session report.
+- Movement data: the body and hand keypoint positions (a stick-figure of your movement, not a picture) that the tool extracts from your video for each graded attempt, so your attempts can be graded and re-checked.
 - The name or nickname you typed on this screen.
 - Microphone audio is analysed live to detect whistles. The audio itself is not recorded; only whistle-detection events and timestamps are logged.
 
@@ -96,12 +101,14 @@ MODES = [
      "Choose ONE signal and repeat it. With several repetitions they run back to back and you see every score "
      "at the end. Choose 1 to practise freely, with retries."),
     ("combo", "Combo drill",
-     "Back-to-back calls like the end of a rally: Team to Serve, then the reason. Runs automatically; "
-     "review every score at the end."),
+     "The end of a rally, like a real match: a short story, then Team to Serve and the reason performed one right "
+     "after the other. Runs automatically; review every score at the end."),
     ("challenge", "Challenge",
-     "Every signal once, in random order. Your score is the number of signals you perform correctly."),
+     "Every signal once, in random order, one after the other with no stopping. Your score is the number of "
+     "signals you perform correctly."),
     ("sim", "Match simulation",
-     "Scenarios like a real rally: blow the whistle, then give the right signals in order."),
+     "A short narrated set: authorise the serve, then make the call at the end of each rally. You blow the whistle "
+     "first. The scoreboard moves only on your correct calls."),
 ]
 
 COMBO_CHOICES = [
@@ -198,14 +205,31 @@ PALETTES = {
 }
 
 
-def _load_saved_theme():
+def read_settings() -> dict:
+    """data/ui_settings.json: theme, chosen camera and microphone."""
     try:
         with open(SETTINGS_PATH, encoding="utf-8") as f:
-            name = json.load(f).get("theme")
-        if name in PALETTES:
-            return name
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
+        return {}
+
+
+def write_settings(patch: dict):
+    data = read_settings()
+    data.update(patch)
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
         pass
+
+
+def _load_saved_theme():
+    name = read_settings().get("theme")
+    if name in PALETTES:
+        return name
     default = _conf("THEME", "dark")
     return default if default in PALETTES else "dark"
 
@@ -227,12 +251,7 @@ def set_theme(name: str, save: bool = True):
         return
     _theme = name
     if save:
-        try:
-            os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
-            with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-                json.dump({"theme": name}, f)
-        except OSError:
-            pass
+        write_settings({"theme": name})
 
 
 class Skin:
@@ -458,7 +477,7 @@ def open_learn(parent, skin, start_label=None):
     win.geometry("980x640")
     skin.add(win, bg="bg")
 
-    labels = list(gg.SIGNALS.keys())
+    labels = ["__setup__"] + list(gg.SIGNALS.keys())
     left = skin.add(tk.Frame(win, highlightthickness=1), bg="card", highlightbackground="border")
     left.pack(side="left", fill="y", padx=(16, 8), pady=16)
     skin.add(tk.Label(left, text="Signals", font=("Segoe UI", 10, "bold")), bg="card", fg="muted").pack(
@@ -467,7 +486,7 @@ def open_learn(parent, skin, start_label=None):
                              activestyle="none"),
                   bg="card", fg="fg", selectbackground="green", selectforeground="primary_fg")
     for lab in labels:
-        lb.insert("end", gg.pretty_label(lab))
+        lb.insert("end", "How to set up (camera and position)" if lab == "__setup__" else gg.pretty_label(lab))
     lb.pack(fill="y", expand=True, padx=8, pady=(0, 10))
 
     right = skin.add(tk.Frame(win), bg="bg")
@@ -477,6 +496,8 @@ def open_learn(parent, skin, start_label=None):
     body = skin.add(tk.Text(right, wrap="word", font=("Segoe UI", 11), relief="flat", padx=16, pady=14,
                             highlightthickness=1), bg="card", fg="fg", highlightbackground="border")
     body.pack(fill="both", expand=True)
+    skin.add(tk.Label(right, text=gg.DISCLAIMER, font=("Segoe UI", 9), wraplength=640, justify="left", anchor="w"),
+             bg="bg", fg="muted").pack(anchor="w", pady=(6, 0))
 
     def retag():
         p = palette()
@@ -493,9 +514,20 @@ def open_learn(parent, skin, start_label=None):
         if not sel:
             return
         label = labels[sel[0]]
-        s = gg.SIGNALS[label]
         body.configure(state="normal")
         body.delete("1.0", "end")
+        if label == "__setup__":
+            body.insert("end", "How to set up\n", "h")
+            body.insert("end", "For the best results\n", "k")
+            for i, tip in enumerate(gg.SETUP_TIPS, 1):
+                body.insert("end", f"  {i}. {tip}\n")
+            body.insert("end", "\nThe camera reads a single 2D picture. Hands that overlap, sleeves that hide the elbows or "
+                               "standing sideways make the checks unreliable, and the tool then says it could not verify "
+                               "that part instead of guessing.\n", "m")
+            body.configure(state="disabled")
+            img_label.configure(image="")
+            return
+        s = gg.SIGNALS[label]
         body.insert("end", s["title"] + "\n", "h")
         body.insert("end", "FIVB signal\n", "k")
         body.insert("end", s["fivb"] + "\n")
@@ -508,14 +540,18 @@ def open_learn(parent, skin, start_label=None):
         if s.get("not_graded"):
             body.insert("end", "Not graded by the camera\n", "k")
             body.insert("end", s["not_graded"] + "\n")
-        body.insert("end", "\nWording paraphrased from the FIVB Official Volleyball Rules (Referee Hand Signals). "
-                           "Left and right always mean YOUR left and right.\n", "m")
+        body.insert("end", "\nWording follows the FIVB Official Volleyball Rules, Diagram 11 (Referees' Official Hand "
+                           "Signals) and rule 30.1 (a signal is maintained for a moment). Left and right always mean YOUR "
+                           "left and right.\n", "m")
         body.configure(state="disabled")
         img_path = os.path.join(SIGNAL_IMAGE_DIR, f"{label}.png")
         if os.path.exists(img_path):
             try:
-                win._img_ref = tk.PhotoImage(file=img_path)
-                img_label.configure(image=win._img_ref)
+                img = tk.PhotoImage(file=img_path)
+                if img.height() > 240:                       # keep room for the text below the picture
+                    img = img.subsample(-(-img.height() // 240))
+                win._img_ref = img
+                img_label.configure(image=img)
             except tk.TclError:
                 img_label.configure(image="")
         else:
@@ -538,9 +574,10 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
         {"action": "start", "mode", "gesture", "level", "reps", "combo", "intent", "note"}
         {"action": "quit"}
         {"action": "deleted"}
+        {"action": "devices"}     (open the camera and microphone setup)
     """
     result = {"value": {"action": "quit"}}
-    root, skin = _base_root(APP_TITLE, 900, 980)
+    root, skin = _base_root(APP_TITLE, 900, 1040 if TEST_MODE else 860)
 
     head = skin.add(tk.Frame(root), bg="bg")
     head.pack(fill="x", padx=32, pady=(22, 0))
@@ -555,8 +592,11 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
 
     bar = skin.add(tk.Frame(root), bg="bg")
     bar.pack(fill="x", padx=32, pady=14, side="bottom")
+    skin.add(tk.Label(root, text=gg.DISCLAIMER, font=("Segoe UI", 9), wraplength=830, justify="left", anchor="w"),
+             bg="bg", fg="muted").pack(fill="x", padx=32, side="bottom")
 
-    mode_var = tk.StringVar(value="drill")
+    last = read_settings().get("last_choice") or {}
+    mode_var = tk.StringVar(value=last.get("mode") if last.get("mode") in [m[0] for m in MODES] else "drill")
     cards = skin.add(tk.Frame(root), bg="bg")
     cards.pack(fill="x", padx=32)
     for key, title, desc in MODES:
@@ -566,7 +606,7 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
                                 highlightthickness=0, command=lambda: update_state()),
                  bg="card", fg="fg", selectcolor="card_hi", activebackground="card",
                  activeforeground="fg").pack(anchor="w", padx=12, pady=(6, 0))
-        skin.add(tk.Label(f, text=desc, font=("Segoe UI", 10), wraplength=780, justify="left"),
+        skin.add(tk.Label(f, text=desc, font=("Segoe UI", 10), wraplength=740, justify="left"),
                  bg="card", fg="muted").pack(anchor="w", padx=40, pady=(0, 6))
 
     opts = skin.add(tk.Frame(root), bg="bg")
@@ -581,43 +621,53 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
             row=row, column=0, sticky="w")
 
     opt_label("Signal (Drill):", 0)
-    sig_var = tk.StringVar(value=sig_names[0] if sig_names else "")
+    last_sig = gg.pretty_label(last["gesture"]) if last.get("gesture") in sig_labels else None
+    sig_var = tk.StringVar(value=last_sig or (sig_names[0] if sig_names else ""))
     sig_box = ttk.Combobox(opts, textvariable=sig_var, values=sig_names, state="readonly", width=42, font=("Segoe UI", 11))
     sig_box.grid(row=0, column=1, sticky="w", padx=12, pady=3)
 
     opt_label("Repetitions (Drill, Combo):", 1)
-    reps_var = tk.StringVar(value="5")
+    last_reps = str(last.get("reps", 5))
+    reps_var = tk.StringVar(value=next((r for r in REP_CHOICES if r.split()[0] == last_reps), "5"))
     reps_box = ttk.Combobox(opts, textvariable=reps_var, values=REP_CHOICES, state="readonly", width=42, font=("Segoe UI", 11))
     reps_box.grid(row=1, column=1, sticky="w", padx=12, pady=3)
 
     opt_label("Combo:", 2)
     combo_names = [n for _, n in combos]
-    combo_var = tk.StringVar(value=combo_names[0])
+    combo_var = tk.StringVar(value=next((n for k, n in combos if k == last.get("combo")), combo_names[0]))
     combo_box = ttk.Combobox(opts, textvariable=combo_var, values=combo_names, state="readonly", width=42, font=("Segoe UI", 11))
     combo_box.grid(row=2, column=1, sticky="w", padx=12, pady=3)
 
     opt_label("Difficulty:", 3)
-    level_var = tk.StringVar(value="standard")
+    level_var = tk.StringVar(value=last.get("level") if last.get("level") in gg.LEVELS else "standard")
     lv_frame = skin.add(tk.Frame(opts), bg="bg")
     lv_frame.grid(row=3, column=1, sticky="w", padx=12)
-    level_desc = skin.add(tk.Label(opts, text=LEVEL_INFO["standard"], font=("Segoe UI", 10)), bg="bg", fg="muted")
+    level_desc = skin.add(tk.Label(opts, text=LEVEL_INFO[level_var.get()], font=("Segoe UI", 10)), bg="bg", fg="muted")
     level_desc.grid(row=4, column=1, sticky="w", padx=12)
 
-    opt_label("Session label:", 5)
-    intent_var = tk.StringVar(value=INTENT_CHOICES[0][1])
-    intent_box = ttk.Combobox(opts, textvariable=intent_var, values=[n for _, n in INTENT_CHOICES], state="readonly",
-                              width=42, font=("Segoe UI", 11))
-    intent_box.grid(row=5, column=1, sticky="w", padx=12, pady=(8, 3))
+    whistle_var = tk.BooleanVar(value=bool(last.get("whistle", False)))
+    whistle_box = skin.add(tk.Checkbutton(opts, variable=whistle_var, highlightthickness=0, font=("Segoe UI", 11),
+                                          text="Require the whistle first (Team to Serve and Authorization to Serve)"),
+                           bg="bg", fg="fg", selectcolor="card_hi", activebackground="bg", activeforeground="fg")
+    whistle_box.grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-    opt_label("Note (test sessions):", 6)
+    intent_var = tk.StringVar(value=INTENT_CHOICES[0][1])
     note_var = tk.StringVar()
-    note_entry = skin.add(tk.Entry(opts, textvariable=note_var, font=("Segoe UI", 11), relief="flat", width=44,
-                                   highlightthickness=1),
-                          bg="card_hi", fg="fg", insertbackground="fg", highlightbackground="border",
-                          highlightcolor="green")
-    note_entry.grid(row=6, column=1, sticky="w", padx=12, pady=3, ipady=3)
-    skin.add(tk.Label(opts, text="What you will do differently, e.g. 'elbow bent' or 'one arm only'. Saved with each attempt.",
-                      font=("Segoe UI", 9)), bg="bg", fg="muted").grid(row=7, column=1, sticky="w", padx=12)
+    if TEST_MODE:
+        opt_label("Session label:", 5)
+        intent_box = ttk.Combobox(opts, textvariable=intent_var, values=[n for _, n in INTENT_CHOICES],
+                                  state="readonly", width=42, font=("Segoe UI", 11))
+        intent_box.grid(row=5, column=1, sticky="w", padx=12, pady=(8, 3))
+
+        opt_label("Note (test sessions):", 6)
+        note_entry = skin.add(tk.Entry(opts, textvariable=note_var, font=("Segoe UI", 11), relief="flat", width=44,
+                                       highlightthickness=1),
+                              bg="card_hi", fg="fg", insertbackground="fg", highlightbackground="border",
+                              highlightcolor="green")
+        note_entry.grid(row=6, column=1, sticky="w", padx=12, pady=3, ipady=3)
+        skin.add(tk.Label(opts, text="TEST MODE. What you will do differently, e.g. 'elbow bent' or 'one arm only'. "
+                                     "Saved with each attempt.", font=("Segoe UI", 9)),
+                 bg="bg", fg="muted").grid(row=7, column=1, sticky="w", padx=12)
 
     def on_level():
         level_desc.configure(text=LEVEL_INFO[level_var.get()])
@@ -633,6 +683,7 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
         sig_box.configure(state="readonly" if m == "drill" else "disabled")
         reps_box.configure(state="readonly" if m in ("drill", "combo") else "disabled")
         combo_box.configure(state="readonly" if m == "combo" else "disabled")
+        whistle_box.configure(state="normal" if m in ("drill", "combo", "challenge") else "disabled")
 
     update_state()
 
@@ -646,15 +697,25 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
             reps = int(reps_var.get().split()[0])
         except ValueError:
             reps = 1
-        intent = next((k for k, n in INTENT_CHOICES if n == intent_var.get()), "normal")
+        intent = next((k for k, n in INTENT_CHOICES if n == intent_var.get()), "normal") if TEST_MODE else "normal"
         result["value"] = {"action": "start", "mode": mode_var.get(), "gesture": label, "level": level_var.get(),
-                           "reps": reps, "combo": combo_key, "intent": intent, "note": note_var.get().strip()}
+                           "reps": reps, "combo": combo_key, "intent": intent,
+                           "note": note_var.get().strip() if TEST_MODE else "",
+                           "whistle": bool(whistle_var.get()) and mode_var.get() in ("drill", "combo", "challenge")}
+        # remember the choices (also for the next time the app is opened); the test label is never remembered
+        remembered = {k: v for k, v in result["value"].items() if k not in ("action", "intent", "note")}
+        remembered["gesture"] = label or last.get("gesture")
+        write_settings({"last_choice": remembered})
         root.destroy()
 
     def learn():
         name = sig_var.get()
         label = sig_labels[sig_names.index(name)] if name in sig_names else None
         open_learn(root, skin, label)
+
+    def devices():
+        result["value"] = {"action": "devices"}
+        root.destroy()
 
     def delete():
         if messagebox.askyesno(
@@ -667,6 +728,7 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
 
     FlatButton(bar, skin, "Start session", start, kind="primary", big=True).pack(side="right")
     FlatButton(bar, skin, "Learn the signals", learn).pack(side="right", padx=10)
+    FlatButton(bar, skin, "Camera and mic", devices).pack(side="right")
     FlatButton(bar, skin, "Delete my data", delete).pack(side="left")
     FlatButton(bar, skin, "Quit", root.destroy).pack(side="left", padx=10)
 

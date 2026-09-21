@@ -66,18 +66,26 @@ class FakeBackend(trainer.Backend):
     def _extract(self, frame):
         s = self.session
         self.n += 1
-        label = None
+        label, side = None, "right"
         if self.always_show:
             label = self.always_show
-        elif s is not None and s.phase == "capture" and s.step and s.step["kind"] == "gesture":
+        elif s is not None and s.phase == "capture" and s.step:
             elapsed = self.clock() - s.phase_t0
-            if 0.6 <= elapsed <= 3.6:
-                label = s.step["label"]
+            st = s.step
+            if st["kind"] == "gesture" and 0.6 <= elapsed <= 3.6:
+                label = st["label"]
+                side = (st.get("ctx") or {}).get("side", "right")
+            elif st["kind"] == "pair":
+                if 0.6 <= elapsed <= 3.4:
+                    label = st["labels"][0]
+                elif 4.4 <= elapsed <= 7.4:
+                    label = st["labels"][1]
+                    side = ((st.get("ctxs") or [None, None])[1] or {}).get("side", "right")
         if label is None:
             f = tg.idle()
             f[TAG_COL] = 0.0
             return f
-        f = POSES[label](self.n, False)
+        f = tg.g_double(side=side)(self.n, False) if label == "double_contact" else POSES[label](self.n, False)
         f[TAG_COL] = 1.0
         f[121] = 0.0
         # put the label id in another unused column so the fake classifier can name it
@@ -146,6 +154,8 @@ class TestSession(trainer.Session):
             return 27
         if getattr(self, "hands_off", False):
             # automatic modes: only start the run and leave the summary; everything between must run by itself
+            if self.phase == "wait_whistle" and self.clock() - self.phase_t0 > 0.5:
+                return ord("w")
             if self.phase == "intro" and not self.auto_go and self.clock() - self.phase_t0 > 0.3:
                 return 32
             if self.phase == "summary" and self.clock() - self.phase_t0 > 0.3:
@@ -219,8 +229,65 @@ def test_camera_fallback():
     print("camera     OK   fallback works")
 
 
+def test_devices():
+    """Microphone listing and the level meter, with a fake `sounddevice` module."""
+    import types
+
+    import devices
+
+    class FakeStream:
+        amplitude = 0.2
+
+        def __init__(self, device=None, channels=1, samplerate=44100, blocksize=1024, callback=None):
+            self.cb = callback
+
+        def start(self):
+            t = np.arange(1024) / 44100.0
+            data = (FakeStream.amplitude * np.sin(2 * np.pi * 3000 * t)).astype(np.float32).reshape(-1, 1)
+            self.cb(data, 1024, None, None)
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    fake = types.ModuleType("sounddevice")
+    fake.query_devices = lambda idx=None: (
+        [{"name": "Speakers", "max_input_channels": 0, "hostapi": 0, "default_samplerate": 44100.0},
+         {"name": "USB Mic", "max_input_channels": 1, "hostapi": 0, "default_samplerate": 44100.0},
+         {"name": "Webcam Mic", "max_input_channels": 2, "hostapi": 1, "default_samplerate": 48000.0}]
+        if idx is None else {"name": "USB Mic", "default_samplerate": 44100.0})
+    fake.query_hostapis = lambda: [{"name": "MME"}, {"name": "WASAPI"}]
+    fake.default = types.SimpleNamespace(device=(1, 0))
+    fake.InputStream = FakeStream
+    old = sys.modules.get("sounddevice")
+    sys.modules["sounddevice"] = fake
+    try:
+        mics, err = devices.list_microphones()
+        assert [m["index"] for m in mics] == [1, 2] and mics[0]["default"] and not mics[1]["default"], mics
+        m = devices.MicMeter()
+        m.start(1)
+        assert m.heard and m.level() > 0.6 and not m.error, (m.level(), m.error)
+        FakeStream.amplitude = 0.0005
+        m.start(1)
+        assert not m.heard and m.level() < 0.3
+        m.stop()
+        fake.query_devices = lambda idx=None: []
+        assert devices.list_microphones() == ([], "")
+    finally:
+        if old is None:
+            del sys.modules["sounddevice"]
+        else:
+            sys.modules["sounddevice"] = old
+    m2, err2 = devices.list_microphones()      # sounddevice missing or real: never raises
+    assert isinstance(m2, list)
+    print("devices    OK   microphone list and level meter")
+
+
 def main():
     test_camera_fallback()
+    test_devices()
     save_dir = None
     if "--save-frames" in sys.argv:
         save_dir = sys.argv[sys.argv.index("--save-frames") + 1]
@@ -253,6 +320,19 @@ def main():
         assert summary["correct"] == 4, summary
         print("combo x2   OK  ", targets)
 
+        # optional FIVB pictures: assets/signals/<label>.png is shown while getting ready
+        os.makedirs(os.path.join("assets", "signals"))
+        pic = np.full((420, 300, 3), 255, np.uint8)
+        cv2.circle(pic, (150, 90), 40, (60, 60, 60), 3)
+        cv2.line(pic, (150, 130), (150, 300), (60, 60, 60), 4)
+        cv2.line(pic, (150, 160), (70, 90), (60, 60, 60), 4)
+        cv2.line(pic, (150, 160), (230, 90), (60, 60, 60), 4)
+        cv2.imwrite(os.path.join("assets", "signals", "ball_out.png"), pic)
+        sess, summary = run_mode("drill", tmp, save_dir, gesture="ball_out", hands_off=True, reps=2)
+        assert any(v is not None for v in sess._ref_cache.values()), "the picture should have been loaded"
+        assert summary["attempts"] == 2, summary
+        print("pictures   OK   assets/signals picture shown")
+
         # labeled test sessions write intent + measured check values, and the evaluation tool reads them
         sess, summary = run_mode("drill", tmp, save_dir, gesture="ball_out", hands_off=True, reps=3,
                                  intent="wrong", level="standard", note="elbows tucked")
@@ -270,6 +350,28 @@ def main():
         assert "WRONG attempts that were accepted" in res.stdout and "elbows tucked" in res.stdout   # the fake person performs it correctly every time
         print("evaluation OK  ", [l for l in res.stdout.splitlines() if l.startswith("ALL")][0])
 
+        # whistle required before Team to Serve: whistle, signal, whistle, signal (all automatic)
+        sess, summary = run_mode("drill", tmp, save_dir, gesture="team_to_serve_left", hands_off=True, reps=2,
+                                 whistle=True)
+        assert [a["kind"] for a in sess.attempts] == ["whistle", "gesture"] * 2 and summary["correct"] == 4, \
+            [(a["kind"], a["verdict"]) for a in sess.attempts]
+        print("whistle    OK  ", summary["one_line"])
+
+        # combo with a double contact: the trainee must use the hand on the side of the team at fault
+        sess, summary = run_mode("combo", tmp, save_dir, hands_off=True, reps=2, combo="double_contact",
+                                 level="beginner")
+        assert summary["correct"] == 4, [(a["target"], a["verdict"], a["feedback"]) for a in sess.attempts]
+        print("combo dc   OK  ", [a["target"] for a in sess.attempts])
+
+        # every attempt keeps its real movement; the regrade tool reads it back with the current rules
+        npz = sorted(os.listdir(os.path.join(sess.dir, "attempts")))
+        assert len(npz) == 2 and npz[0].startswith("attempt_001_team_to_serve_") and npz[0].endswith("+double_contact.npz"), npz
+        import subprocess
+        res = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "regrade_attempts.py")],
+                             capture_output=True, text=True)
+        assert res.returncode == 0 and "unchanged" in res.stdout.lower(), res.stdout + res.stderr
+        print("regrade    OK  ", [l for l in res.stdout.splitlines() if "unchanged" in l.lower()][0].strip())
+
         # light theme renders every screen without errors (frames saved for a visual check)
         trainer.set_cv_theme("light")
         sess, summary = run_mode("drill", tmp, os.path.join(save_dir, "light") if save_dir else None,
@@ -280,13 +382,18 @@ def main():
         print("light mode OK")
 
         # challenge: one attempt for every signal
-        sess, summary = run_mode("challenge", tmp, save_dir, level="beginner")
-        assert summary["attempts"] == 8, summary
+        sess, summary = run_mode("challenge", tmp, save_dir, level="beginner", hands_off=True)
+        assert summary["attempts"] == 8 and summary["correct"] == 8, summary
         print("challenge  OK  ", summary["one_line"])
 
         # simulation: whistle + gestures across scenarios, scoreboard from correct calls
         sess, summary = run_mode("sim", tmp, save_dir, level="beginner")
-        assert summary["attempts"] > 4 and summary["team_points"] is not None, summary
+        assert summary["attempts"] > 8 and summary["team_points"] is not None, summary
+        assert sum(summary["team_points"].values()) == 3, summary          # 3 rallies, every call correct
+        assert summary["correct"] == summary["attempts"], summary
+        kinds = [a["kind"] for a in sess.attempts]
+        assert kinds[0] == "whistle" and kinds[-2:] == ["whistle", "gesture"], kinds
+        assert any(a["target"] == "end_of_set" for a in sess.attempts)
         print("sim        OK  ", summary["one_line"], summary["team_points"])
 
         # outputs written

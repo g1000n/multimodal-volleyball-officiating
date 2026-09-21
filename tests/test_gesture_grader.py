@@ -81,7 +81,7 @@ def seq(fn, n, mirror=False):
 
 # ---- pose generators: fn(i, mirror) -> frame ----
 
-def g_tts(side, deg=50, bend=False):
+def g_tts(side, deg=50, bend=False, fingers=None):
     def fn(i, m):
         e, w = straight_arm(side, deg)
         if bend:  # fold the forearm up so the elbow angle is ~100 deg
@@ -90,21 +90,23 @@ def g_tts(side, deg=50, bend=False):
             w = e + FORE * np.array([0.0, -1.0])
         oe, ow = hanging("right" if side == "left" else "left")
         args = (e, oe, w, ow) if side == "left" else (oe, e, ow, w)
-        return frame(*args, mirror=m)
+        kw = {"left_fingers": fingers} if side == "left" else {"right_fingers": fingers}
+        return frame(*args, mirror=m, **(kw if fingers is not None else {}))
     return fn
 
 
-def g_auth(side, moving=True, straight=False):
+def g_auth(side, moving=True, straight=False, fingers=None, drop=0.0):
     def fn(i, m):
         s = np.array(LS if side == "left" else RS)
         e = s + np.array([out_dir(side) * 0.10, 0.10])
         sweep = 0.30 * SW * np.sin(i / 3.0) if moving else 0.0
-        w = e + np.array([out_dir(side) * 0.10 + out_dir(side) * sweep, -0.06])
+        w = e + np.array([out_dir(side) * 0.10 + out_dir(side) * sweep, -0.06 + drop])
         if straight:
             e, w = straight_arm(side, 60)
         oe, ow = hanging("right" if side == "left" else "left")
         args = (e, oe, w, ow) if side == "left" else (oe, e, ow, w)
-        return frame(*args, mirror=m)
+        kw = {"left_fingers": fingers} if side == "left" else {"right_fingers": fingers}
+        return frame(*args, mirror=m, **(kw if fingers is not None else {}))
     return fn
 
 
@@ -154,24 +156,27 @@ def g_ball_out_tucked(i, m):
     return frame(le, re, lw, rw, left_fingers=OPEN, right_fingers=OPEN, mirror=m)
 
 
-def g_double(fingers=TWO, low=False):
+def g_double(fingers=TWO, low=False, side="right"):
     def fn(i, m):
-        s = np.array(RS)
-        e = s + np.array([-0.05, 0.10 if not low else 0.12])
-        w = e + np.array([-0.02, -0.16 if not low else 0.02])
-        le, lw = hanging("left")
-        return frame(le, e, lw, w, right_fingers=fingers, mirror=m)
+        s = np.array(RS if side == "right" else LS)
+        o = -1.0 if side == "right" else 1.0            # outward direction for this hand
+        e = s + np.array([o * 0.05, 0.10 if not low else 0.12])
+        w = e + np.array([o * 0.02, -0.16 if not low else 0.02])
+        oe, ow = hanging("left" if side == "right" else "right")
+        if side == "right":
+            return frame(oe, e, ow, w, right_fingers=fingers, mirror=m)
+        return frame(e, oe, w, ow, left_fingers=fingers, mirror=m)
     return fn
 
 
-def g_end(cross=True):
+def g_end(cross=True, low=0.0):
     def fn(i, m):
         mid = 0.5
         dx = 0.06 if cross else -0.10
-        le = (LS[0] - 0.02, SH_Y + 0.14)
-        re = (RS[0] + 0.02, SH_Y + 0.14)
-        lw = (mid - dx, SH_Y + 0.10)
-        rw = (mid + dx, SH_Y + 0.10)
+        le = (LS[0] - 0.02, SH_Y + 0.14 + low)
+        re = (RS[0] + 0.02, SH_Y + 0.14 + low)
+        lw = (mid - dx, SH_Y + 0.10 + low)
+        rw = (mid + dx, SH_Y + 0.10 + low)
         return frame(le, re, lw, rw, left_fingers=OPEN, right_fingers=OPEN, mirror=m)
     return fn
 
@@ -200,6 +205,44 @@ def run(target_fn, target, level="standard", **kw):
     mirror = kw.pop("mirror", False)
     frames, records, l2i = build_attempt(target_fn, target, mirror=mirror, **kw)
     return gg.grade_attempt(target, frames, records, l2i, level=level, aspect=ASPECT, step_seconds=0.3)
+
+
+def build_sequence(fns_labels, gap=4, lead=8, tail=10, share=0.6):
+    """Back-to-back gestures in ONE capture. fns_labels = [(pose_fn, label), ...]."""
+    label_to_idx = {l: i for i, l in enumerate(sorted(gg.RULES))}
+    frames, owner = [], []
+    for _ in range(lead):
+        frames.append(idle())
+        owner.append(None)
+    for k, (fn, label) in enumerate(fns_labels):
+        for i in range(24):
+            frames.append(fn(i, False))
+            owner.append(label)
+        if k < len(fns_labels) - 1:
+            for _ in range(gap):
+                frames.append(idle())
+                owner.append(None)
+    for _ in range(tail):
+        frames.append(idle())
+        owner.append(None)
+    frames = np.array(frames)
+    records = []
+    for end in range(24, len(frames) + 1, 3):
+        window_owner = owner[end - 24:end]
+        probs = np.full(len(label_to_idx), 0.02)
+        lab = gg.NOTHING_LABEL
+        for _, label in fns_labels:
+            if window_owner.count(label) / 24.0 >= share:
+                lab = label
+                probs[label_to_idx[label]] = 0.95
+        records.append({"label": lab, "probs": probs, "frames": frames[end - 24:end], "end": end})
+    return frames, records, label_to_idx
+
+
+def seq_run(fns_labels, targets, level="standard", contexts=None, **kw):
+    frames, records, l2i = build_sequence(fns_labels, **kw)
+    return gg.grade_sequence(targets, frames, records, l2i, level=level, aspect=ASPECT, step_seconds=0.3,
+                             contexts=contexts)
 
 
 def statuses(res):
@@ -264,7 +307,7 @@ def test_ball_out():
     over = run(overhead, "ball_out")
     assert statuses(over)["elbows_bent"] == "fail" and over.verdict != gg.VERDICT_CORRECT, over.feedback
     fists = run(g_ball_out(fingers=[0, 0, 0, 0, 0]), "ball_out")
-    assert statuses(fists)["hands_open"] == "fail" and fists.verdict != gg.VERDICT_CORRECT, fists.feedback
+    assert statuses(fists)["hands_open"] == "fail" and fists.score < ok.score, fists.feedback
     unseen = run(g_ball_out(fingers=None), "ball_out")     # hands not detected: NOT punished
     assert statuses(unseen)["hands_open"] == "unverified" and unseen.verdict == gg.VERDICT_CORRECT, unseen.feedback
     tucked = run(g_ball_out_tucked, "ball_out")
@@ -326,6 +369,113 @@ def test_every_rule_set_sums_to_form_weight():
     for label, rule in gg.RULES.items():
         checks = rule(gg.Geo(np.array([idle()] * 30), ASPECT), "standard")
         assert sum(c.weight for c in checks) == gg.W_FORM, (label, sum(c.weight for c in checks))
+
+
+def test_team_to_serve_elbow_down_forearm_up_is_wrong():
+    def folded(i, m):      # elbow at the side, only the forearm up
+        s = np.array(LS)
+        e = s + UP * np.array([0.05, 1.0])
+        w = e + FORE * np.array([0.0, -1.0])
+        oe, ow = hanging("right")
+        return frame(e, oe, w, ow, mirror=m)
+    r = run(folded, "team_to_serve_left")
+    assert statuses(r)["arm_extended"] == "fail" and r.verdict != gg.VERDICT_CORRECT, r.feedback
+
+
+def test_team_to_serve_contract_then_point_is_wrong():
+    """Fold the arm in first, then point: the swing must be straight from neutral to the point."""
+    label_to_idx = {l: i for i, l in enumerate(sorted(gg.RULES))}
+    tts = g_tts("left")
+    fold = g_tts("left", bend=True)
+    frames = ([idle() for _ in range(8)] + [fold(i, False) for i in range(8)] + [tts(i, False) for i in range(30)]
+              + [idle() for _ in range(8)])
+    frames = np.array(frames)
+    recs = []
+    for end in range(24, len(frames) + 1, 3):
+        good = sum(1 for k in range(end - 24, end) if 16 <= k < 46) / 24.0
+        probs = np.full(len(label_to_idx), 0.02)
+        lab = gg.NOTHING_LABEL
+        if good >= 0.5:
+            lab = "team_to_serve_left"
+            probs[label_to_idx[lab]] = 0.95
+        recs.append({"label": lab, "probs": probs, "frames": frames[end - 24:end], "end": end})
+    bad = gg.grade_attempt("team_to_serve_left", frames, recs, label_to_idx, level="standard", aspect=ASPECT)
+    assert statuses(bad)["no_contraction"] == "fail" and bad.verdict != gg.VERDICT_CORRECT, bad.feedback
+    good = run(g_tts("left"), "team_to_serve_left")
+    assert statuses(good)["no_contraction"] == "pass" and good.verdict == gg.VERDICT_CORRECT, good.feedback
+
+
+def test_open_hand_is_scored_but_does_not_change_the_verdict_by_default():
+    OPEN5, FIST = [1, 1, 1, 1, 1], [0, 0, 0, 0, 0]
+    assert gg.OPEN_HAND_STRICT is False
+    for label, mk, side in (("team_to_serve_left", g_tts, "left"), ("service_authorization_left", g_auth, "left")):
+        ok = run(mk("left", fingers=OPEN5), label)
+        fist = run(mk("left", fingers=FIST), label)
+        assert statuses(ok)["hands_open"] == "pass" and ok.verdict == gg.VERDICT_CORRECT, ok.feedback
+        assert statuses(fist)["hands_open"] == "fail", statuses(fist)
+        assert fist.score < ok.score                                  # points are lost ...
+        assert fist.verdict == gg.VERDICT_CORRECT                    # ... but the gesture still counts
+        assert any("open" in f.lower() for f in fist.feedback)       # and the trainee is told to keep the hand open
+    fists = run(g_ball_out(fingers=FIST), "ball_out")
+    assert statuses(fists)["hands_open"] == "fail" and fists.verdict == gg.VERDICT_CORRECT
+    gg.OPEN_HAND_STRICT = True                                        # the strict option still works
+    try:
+        assert run(g_tts("left", fingers=FIST), "team_to_serve_left").verdict != gg.VERDICT_CORRECT
+        assert run(g_ball_out(fingers=FIST), "ball_out").verdict != gg.VERDICT_CORRECT
+        assert run(g_end(), "end_of_set").verdict == gg.VERDICT_CORRECT
+    finally:
+        gg.OPEN_HAND_STRICT = False
+
+
+def test_disclaimer_exists():
+    assert "mistakes" in gg.DISCLAIMER
+
+
+def test_authorization_height_band():
+    ok = run(g_auth("left"), "service_authorization_left")
+    assert statuses(ok)["at_chest"] == "pass"
+    high = run(g_auth("left", drop=-0.16), "service_authorization_left")      # hand above the shoulders
+    assert statuses(high)["at_chest"] == "fail" and high.verdict != gg.VERDICT_CORRECT, high.feedback
+    low = run(g_auth_low("left"), "service_authorization_left")               # belly
+    assert statuses(low)["at_chest"] == "fail" and low.verdict != gg.VERDICT_CORRECT
+
+
+def test_end_of_set_hugging_low_is_wrong():
+    ok = run(g_end(), "end_of_set")
+    assert statuses(ok)["at_chest"] == "pass"
+    low = run(g_end(low=0.16), "end_of_set")
+    assert statuses(low)["at_chest"] == "fail" and low.verdict != gg.VERDICT_CORRECT, low.feedback
+
+
+def test_double_contact_hand_side_context():
+    frames, records, l2i = build_attempt(g_double(), "double_contact")        # RIGHT hand raised
+    right = gg.grade_attempt("double_contact", frames, records, l2i, aspect=ASPECT, context={"side": "right"})
+    left = gg.grade_attempt("double_contact", frames, records, l2i, aspect=ASPECT, context={"side": "left"})
+    assert right.verdict == gg.VERDICT_CORRECT, right.feedback
+    assert {c.id: c.status for c in left.checks}["hand_side"] == "fail" and left.verdict != gg.VERDICT_CORRECT
+    for ctx in (None, {"side": "left"}):
+        checks = gg.RULES["double_contact"](gg.Geo(np.array([idle()] * 30), ASPECT), "standard", None, ctx)
+        assert sum(c.weight for c in checks) == gg.W_FORM
+
+
+def test_sequence_team_to_serve_then_ball_out():
+    good = seq_run([(g_tts("right"), "team_to_serve_right"), (g_ball_out(), "ball_out")],
+                   ["team_to_serve_right", "ball_out"])
+    assert [r.verdict for r in good] == [gg.VERDICT_CORRECT] * 2, [(r.verdict, r.feedback) for r in good]
+    # only the LAST signal is checked for returning to the ready position
+    assert "ready_position" not in {c.id for c in good[0].checks} and "ready_position" in {c.id for c in good[1].checks}
+    wrong_order = seq_run([(g_ball_out(), "ball_out"), (g_tts("right"), "team_to_serve_right")],
+                          ["team_to_serve_right", "ball_out"])
+    assert all(r.verdict != gg.VERDICT_CORRECT for r in wrong_order)
+    assert any("order" in f.lower() for f in wrong_order[0].feedback), wrong_order[0].feedback
+    missing = seq_run([(g_tts("right"), "team_to_serve_right")], ["team_to_serve_right", "ball_out"])
+    assert missing[1].verdict == gg.VERDICT_INCORRECT and missing[1].points == 0
+
+
+def test_authorization_hold_is_scaled():
+    assert gg.HOLD_SCALE["service_authorization_left"] < 1.0
+    r = run(g_auth("left"), "service_authorization_left")
+    assert r.hold_required < gg.LEVEL_CONFIG["standard"].hold_seconds
 
 
 if __name__ == "__main__":
