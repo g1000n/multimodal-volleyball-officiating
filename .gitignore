@@ -46,3 +46,11 @@ data/processed/
 # OS
 .DS_Store
 Thumbs.db
+
+# Training tool: trainee data and generated files (private, stays on this computer)
+data/trainer_sessions/
+data/consent_records.csv
+data/ui_settings.json
+data/all_sessions.csv
+data/all_attempts.csv
+data/evaluation_summary.csv
