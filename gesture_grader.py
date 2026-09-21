@@ -74,10 +74,15 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional
 
 import numpy as np
+
+try:                                   # your own adjustments live in trainer_config.py (see GRADER_OVERRIDES there)
+    import trainer_config as _tc
+except ImportError:
+    _tc = None
 
 NOTHING_LABEL = "nothing"
 
@@ -88,11 +93,11 @@ VERDICT_NO_READING = "NO_READING"
 POINTS = {VERDICT_CORRECT: 10, VERDICT_ALMOST: 5, VERDICT_INCORRECT: 0, VERDICT_NO_READING: 0}
 
 # Score weights (sum = 100)
-W_RECOGNITION = 35
+W_RECOGNITION = 38
 W_DISTINCT = 10
 W_HOLD = 10
 W_FORM = 40
-W_READY = 5
+W_READY = 2
 
 MIN_POSE_FRACTION = 0.6      # below this, the body was not seen well enough to grade
 MIN_ARM_VISIBLE_FRAC = 0.5   # an arm checked by a rule must be visible in >= this fraction of frames
@@ -117,10 +122,16 @@ class LevelConfig:
 
 
 LEVEL_CONFIG = {
-    "beginner": LevelConfig("beginner", "Beginner", 0.55, 0.15, 0.6, 65, 45),
-    "standard": LevelConfig("standard", "Standard", 0.75, 0.30, 1.0, 80, 60),
-    "referee": LevelConfig("referee", "Referee", 0.90, 0.45, 1.5, 90, 70),
+    "beginner": LevelConfig("beginner", "Beginner", 0.55, 0.15, 0.6, 60, 40),
+    "standard": LevelConfig("standard", "Standard", 0.75, 0.30, 1.0, 75, 55),
+    "referee": LevelConfig("referee", "Referee", 0.90, 0.45, 1.5, 90, 68),
 }
+# LEVEL_OVERRIDES in trainer_config.py, e.g. {"referee": {"correct_cut": 92}}. Keys: rec_threshold, margin_required,
+# hold_seconds, correct_cut, almost_cut.
+for _lv, _d in (getattr(_tc, "LEVEL_OVERRIDES", None) or {}).items():
+    if _lv in LEVEL_CONFIG:
+        LEVEL_CONFIG[_lv] = replace(LEVEL_CONFIG[_lv], **{k: v for k, v in _d.items() if k in (
+            "rec_threshold", "margin_required", "hold_seconds", "correct_cut", "almost_cut")})
 
 
 def pick(level: str, beginner, standard, referee):
@@ -142,12 +153,12 @@ SIGNALS: Dict[str, dict] = {
         "howto": [
             "Stand about 2 m from the camera, facing it, arms relaxed. Head, shoulders and hips should be in view.",
             "Swing your LEFT arm out to your left in ONE smooth movement, straight from your side to the pointing position. Do not bend the elbow first.",
-            "Keep the arm straight and about level with your shoulder or a little below, hand open with the fingers together (not a fist).",
+            "Keep the arm as straight as you can (a slight bend is fine) and about level with your shoulder or a little below, hand open with the fingers together (not a fist).",
             "Keep your other arm relaxed. Hold about 2 seconds (FIVB: signals are maintained for a moment), then lower the arm.",
         ],
         "mistakes": ["Elbow bent, or only the forearm raised", "Folding the arm in first, then pointing",
                      "Hand closed into a fist", "Using the wrong arm", "Raising both arms"],
-        "not_graded": "The FIVB illustration shows an open hand. A closed hand only lowers the score a little; the camera can misread fingers.",
+        "not_graded": "A perfectly straight arm is hard for one camera to see, so a slight bend is accepted. The FIVB illustration shows an open hand; a closed hand only lowers the score a little.",
     },
     "team_to_serve_right": {
         "title": "Team to Serve (your RIGHT arm)",
@@ -212,13 +223,13 @@ SIGNALS: Dict[str, dict] = {
         "fivb": "Raise the forearms vertically, hands open, palms towards the body.",
         "howto": [
             "Stand about 2 m from the camera, square to it, so BOTH hands stay visible and do not overlap.",
-            "Lift both arms so the elbows come out to about shoulder height and the armpits are open (referee guidance).",
+            "Raise both arms to the same height. For the full form lift the elbows out to about shoulder height so the armpits are open (referee guidance); elbows kept nearer the body still count, with fewer points.",
             "Bend both elbows so both forearms point straight up, hands open with the fingers extended, palms toward your face.",
             "Hold about 2 seconds, then lower both arms.",
         ],
         "mistakes": ["Only one arm raised", "Elbows tucked against the body (armpits closed)",
                      "Forearms leaning instead of vertical", "Arms straight overhead", "Hands closed"],
-        "not_graded": "Palm direction (palms toward the body) cannot be measured reliably by one 2D camera; check it with your instructor. The open armpits are referee guidance, not FIVB text.",
+        "not_graded": "Palm direction (palms toward the body) cannot be measured reliably by one 2D camera; check it with your instructor. The open armpits are referee guidance, not FIVB text, and only earn marks.",
     },
     "double_contact": {
         "title": "Double Contact",
@@ -240,7 +251,7 @@ SIGNALS: Dict[str, dict] = {
         "fivb": "Cross the forearms in front of the chest, hands open.",
         "howto": [
             "Stand about 2 m from the camera, square to it. Keep your hands visible: do not let one hand cover the other.",
-            "Bring both forearms up and cross them in front of your CHEST (not at the belly, not overhead).",
+            "Bend your elbows, bring both forearms up and cross them in front of your CHEST (not at the belly, not overhead). Overlapping forearms are fine.",
             "Keep both hands open with the fingers extended, and turn them so the camera can see them.",
             "Hold about 2 seconds, then lower both arms.",
         ],
@@ -249,6 +260,37 @@ SIGNALS: Dict[str, dict] = {
         "not_graded": "",
     },
 }
+
+# Shown in the Learn window: the similar-looking pairs that beginners (and scorekeepers) mix up.
+_COMPARE = {
+    "team_to_serve_left": "Do not confuse it with Authorization to Serve: Team to Serve is ONE straight arm held out to the side; Authorization is a bent arm whose hand sweeps at chest height.",
+    "team_to_serve_right": "Do not confuse it with Authorization to Serve: Team to Serve is ONE straight arm held out to the side; Authorization is a bent arm whose hand sweeps at chest height.",
+    "service_authorization_left": "Do not confuse it with Team to Serve: Authorization is a bent arm whose open hand SWEEPS at chest height; Team to Serve is a straight arm HELD out to the side.",
+    "service_authorization_right": "Do not confuse it with Team to Serve: Authorization is a bent arm whose open hand SWEEPS at chest height; Team to Serve is a straight arm HELD out to the side.",
+    "ball_in": "Do not confuse it with Team to Serve: Ball In points DOWN toward the floor; Team to Serve points out to the side at shoulder level.",
+    "ball_out": "Do not confuse it with End of Set: Ball Out raises BOTH forearms straight up; End of Set crosses the forearms in front of the chest.",
+    "double_contact": "Do not confuse it with Team to Serve or Authorization: Double Contact is ONE raised hand showing exactly two spread fingers.",
+    "end_of_set": "Do not confuse it with Ball Out: End of Set crosses the forearms in front of the chest; Ball Out raises both forearms straight up.",
+}
+for _label, _txt in _COMPARE.items():
+    SIGNALS[_label]["compare"] = _txt
+
+# Every graded check is taught in one of the numbered "how to" steps above (tests/test_gesture_grader.py enforces it).
+_TTS_TAUGHT = {"arm_extended": 3, "points_to_side": 2, "no_contraction": 2, "hands_open": 3, "other_arm_down": 4,
+               "ready_position": 4}
+_SA_TAUGHT = {"arm_bent": 2, "hand_moves": 3, "at_chest": 2, "hands_open": 4, "toward_side": 3, "other_arm_down": 4,
+              "ready_position": 5}
+_TAUGHT = {
+    "team_to_serve_left": _TTS_TAUGHT, "team_to_serve_right": _TTS_TAUGHT,
+    "service_authorization_left": _SA_TAUGHT, "service_authorization_right": _SA_TAUGHT,
+    "ball_in": {"arm_extended": 2, "arm_lowered": 2, "hand_open": 2, "other_arm_relaxed": 3, "ready_position": 4},
+    "ball_out": {"forearms_vertical": 3, "arms_raised": 2, "arms_symmetric": 2, "hands_open": 3, "elbows_bent": 3,
+                 "ready_position": 4},
+    "double_contact": {"hand_raised": 2, "hand_side": 2, "two_fingers": 3, "other_arm_down": 4, "ready_position": 4},
+    "end_of_set": {"forearms_crossed": 2, "at_chest": 2, "elbows_bent": 2, "hands_open": 3, "ready_position": 4},
+}
+for _label, _t in _TAUGHT.items():
+    SIGNALS[_label]["taught"] = _t
 
 # Shown first in the Learn window and referred to on the instruction cards.
 SETUP_TIPS = [
@@ -262,21 +304,42 @@ SETUP_TIPS = [
 ]
 
 DISCLAIMER = ("Training guide only. The system uses one camera and an AI model, so it can make mistakes. "
-              "It is not an official FIVB judgement.")
+              "It is not an official FIVB judgement and does not replace a coach.")
 
 KNOWN_WEAK = {
     "ball_in": "Ball In is the weakest signal for this system (lower recognition rate, and it was trained on the "
                "older straight-down form), so a low score can partly reflect the model and not only your form.",
 }
 
+# Ball Out with open armpits (elbows out to about shoulder height) is referee guidance, not FIVB text (which only says raise the
+# forearms vertically, hands open, palms towards the body). Measured on the team's own attempts the elbows are usually
+# kept near the body, so by default open armpits only earn marks. True = tucked elbows cap the verdict at ALMOST.
+ARMPITS_REQUIRED = bool(getattr(_tc, "ARMPITS_REQUIRED", False))
+
 # FIVB 30.1: signals are "maintained for a moment". Service Authorization is a moving signal, so the
 # time the model keeps recognising it is shorter; its hold requirement is scaled down.
-HOLD_SCALE = {"service_authorization_left": 0.6, "service_authorization_right": 0.6}
+HOLD_SCALE = {"service_authorization_left": 0.6, "service_authorization_right": 0.6,
+              "ball_in": 0.5}          # Ball In is recognised only briefly (measured 0.2 to 0.7 s)
+
+# While moving into a signal, the arm passes through poses that look like a neighbouring signal (for example the sweep
+# of Authorization to Serve or the arm going down for Ball In passes through Team to Serve). The system does not commit
+# anything for those in-between poses, so they are ignored and never shown as "looks like ...".
+TRANSITION_CONFUSIONS = {
+    "team_to_serve_left": {"service_authorization_left", "ball_in"},
+    "team_to_serve_right": {"service_authorization_right", "ball_in"},
+    "service_authorization_left": {"team_to_serve_left"},
+    "service_authorization_right": {"team_to_serve_right"},
+    "ball_in": {"team_to_serve_left", "team_to_serve_right"},
+    "ball_out": {"end_of_set", "double_contact"},
+    "double_contact": {"team_to_serve_left", "team_to_serve_right", "service_authorization_left",
+                       "service_authorization_right", "end_of_set"},
+    "end_of_set": {"ball_out"},
+}
 
 # Open hands: the FIVB text names them for Ball Out and End of Set, and the FIVB illustrations show an open hand for the
 # other signals too. Reading fingers from one camera can be wrong, so by default a closed hand only costs a few points
 # and shows a "keep your hand open" tip; it does NOT change the verdict. True = a visible fist caps the verdict at ALMOST.
-OPEN_HAND_STRICT = False
+OPEN_HAND_STRICT = bool(getattr(_tc, "OPEN_HAND_STRICT", False))
 
 
 def pretty_label(label: str) -> str:
@@ -471,8 +534,41 @@ def _fmt_need(ge, le, unit):
     return ""
 
 
+# Threshold / effect overrides typed in trainer_config.py:
+#   GRADER_OVERRIDES = {"service_authorization.hand_moves": {"ge": (0.5, 1.0, 1.4)},          # beginner, standard, referee
+#                       "service_authorization_left.arm_bent": {"le": 140, "effect": "important"}}
+# The key is "<signal>.<check id>": the signal without _left/_right applies to both sides, with it to that side only.
+# "ge" = minimum, "le" = maximum (a number for all levels, or a (beginner, standard, referee) tuple),
+# "effect" = "required" | "important" | "scored", "weight" = points. See tools/export_rubric.py --print for the ids.
+OVERRIDES = dict(getattr(_tc, "GRADER_OVERRIDES", None) or {})
+_CTX = {"label": None, "level": "standard"}
+
+
+def _override(cid, key, default):
+    if not OVERRIDES or _CTX["label"] is None:
+        return default
+    label = _CTX["label"]
+    base = label[:-5] if label.endswith(("_left", "_right")) and not label.startswith("ball") else label
+    if label.endswith("_left"):
+        base = label[:-5]
+    elif label.endswith("_right"):
+        base = label[:-6]
+    for k in (f"{label}.{cid}", f"{base}.{cid}"):
+        v = OVERRIDES.get(k)
+        if v is not None and key in v:
+            val = v[key]
+            return pick(_CTX["level"], *val) if isinstance(val, (tuple, list)) else val
+    return default
+
+
 def _c(cid, label, weight, critical, value, *, ge=None, le=None, arm: Optional[Arm] = None,
        basis="FIVB", tip="", unit="", verifiable=True, strict=False) -> Check:
+    ge = _override(cid, "ge", ge)
+    le = _override(cid, "le", le)
+    weight = _override(cid, "weight", weight)
+    effect = _override(cid, "effect", None)
+    if effect is not None:
+        critical, strict = effect == "required", effect == "important"
     status = "unverified"
     arm_ok = arm is None or arm.vis_frac >= MIN_ARM_VISIBLE_FRAC
     if verifiable and arm_ok and value is not None and math.isfinite(value):
@@ -507,13 +603,13 @@ def _rules_team_to_serve(g: Geo, lv: str, side: str, gcap=None, ctx=None) -> Lis
     n_open = g.hand(side).extended_count()
     return [
         _c("arm_extended", f"{S} arm extended (FIVB: extend the arm)", 12, True, A.lo(A.elbow),
-           ge=pick(lv, 140, 155, 165), unit=" deg", arm=A,
-           tip=f"Straighten your {side} arm fully. Do not keep the elbow bent or raise only the forearm"),
+           ge=pick(lv, 130, 145, 155), unit=" deg", arm=A,
+           tip=f"Straighten your {side} arm. Do not keep the elbow clearly bent or raise only the forearm"),
         _c("points_to_side", f"{S} arm pointing out to the side", 12, True,
-           A.hi(A.outward), ge=pick(lv, 0.40, 0.55, 0.70), arm=A,
-           tip=f"Swing your {side} arm out to the side, away from your body"),
+           A.hi(A.outward), ge=pick(lv, 0.45, 0.65, 0.85), arm=A,
+           tip=f"Swing your {side} arm out to the side, about level with your shoulder"),
         _c("no_contraction", "Arm swings out straight (no folding in first)", 8, False,
-           Ac.pct(Ac.elbow, 10), ge=pick(lv, 95, 115, 135), unit=" deg", arm=Ac, strict=True, basis="TRAINING",
+           Ac.pct(Ac.elbow, 10), ge=pick(lv, 100, 120, 132), unit=" deg", arm=Ac, strict=True, basis="TRAINING",
            tip=f"Swing your {side} arm from your side to the pointing position in one movement; do not fold it in first"),
         _c("hands_open", "Hand open (as in the FIVB illustration)", 4, False,
            None if n_open is None else float(n_open), ge=pick(lv, 2, 3, 4), verifiable=n_open is not None,
@@ -530,11 +626,11 @@ def _rules_authorization(g: Geo, lv: str, side: str, gcap=None, ctx=None) -> Lis
     S = side.upper()
     n_open = g.hand(side).extended_count()
     return [
-        _c("arm_bent", f"{S} elbow bent for the sweeping motion", 8, True, A.mid(A.elbow),
-           le=pick(lv, 150, 145, 140), unit=" deg", arm=A,
-           tip=f"Bend your {side} elbow; a straight arm reads as Team to Serve"),
+        _c("arm_bent", f"{S} elbow bent for the sweeping motion", 8, False, A.mid(A.elbow),
+           le=pick(lv, 150, 145, 140), unit=" deg", arm=A, basis="TRAINING", strict=(lv != "beginner"),
+           tip=f"Bend your {side} elbow; a nearly straight arm is sloppy and reads as Team to Serve"),
         _c("hand_moves", "Hand moves (FIVB: move the hand to indicate the direction)", 12, True,
-           A.motion(), ge=pick(lv, 0.15, 0.25, 0.40), arm=A,
+           A.motion(), ge=pick(lv, 0.5, 1.0, 1.4), arm=A,
            tip="Make a clearer sweeping motion with your hand; a still pose is not this signal"),
         _c("at_chest", "Sweep at chest (upper arm) level", 9, False, A.mid(A.wr_frac),
            ge=pick(lv, -0.15, 0.0, 0.05), le=pick(lv, 0.80, 0.65, 0.55), arm=A, strict=True, basis="TRAINING",
@@ -572,7 +668,7 @@ def _rules_ball_in(g: Geo, lv: str, gcap=None, ctx=None) -> List[Check]:
            ge=pick(lv, 130, 145, 155), unit=" deg", arm=A,
            tip="Straighten the pointing arm; do not leave the elbow bent"),
         _c("arm_lowered", "Arm pointing toward the floor", 14, False, A.mid(A.from_down),
-           le=pick(lv, 70, 55, 40), unit=" deg", arm=A, strict=True,
+           le=pick(lv, 70, 55, 50), unit=" deg", arm=A, strict=True,
            tip="Point the arm lower, toward the floor, not out to the side"),
         _c("hand_open", "Fingers extended (FIVB: arm and fingers)", 8, False,
            None if n_open is None else float(n_open), ge=pick(lv, 2, 3, 4), verifiable=n_open is not None,
@@ -603,9 +699,9 @@ def _rules_ball_out(g: Geo, lv: str, gcap=None, ctx=None) -> List[Check]:
         _c("forearms_vertical", "BOTH forearms vertical (FIVB: raise the forearms vertically)", 12, True,
            worst_fore, le=pick(lv, 40, 30, 20), unit=" deg", verifiable=both_vis,
            tip="Raise BOTH forearms straight up; keep them vertical, not leaning"),
-        _c("arms_raised", "Arms raised out to the sides, armpits open", 12, True, least_raised,
-           ge=pick(lv, 45, 60, 70), unit=" deg", verifiable=both_vis, basis="TRAINING",
-           tip="Lift your elbows up and out to about shoulder height so your armpits are open; do not just bend the elbows at your sides"),
+        _c("arms_raised", "Elbows lifted out to the sides, armpits open (full marks)", 12, ARMPITS_REQUIRED, least_raised,
+           ge=pick(lv, 20, 40, 60), unit=" deg", verifiable=both_vis, basis="TRAINING",
+           tip="For the full form lift your elbows up and out to about shoulder height so your armpits are open"),
         _c("arms_symmetric", "Both arms at the same height", 5, False, asym,
            le=pick(lv, 0.6, 0.4, 0.3), verifiable=both_vis,
            tip="Raise both arms to the same height"),
@@ -677,12 +773,26 @@ def _rules_end_of_set(g: Geo, lv: str, gcap=None, ctx=None) -> List[Check]:
     seen = [n for n in (nl, nr) if n is not None]
     worst_open = float(min(seen)) if seen else None
     both_vis = L.vis_frac >= MIN_ARM_VISIBLE_FRAC and R.vis_frac >= MIN_ARM_VISIBLE_FRAC
+    # Crossed = each wrist has passed the middle of the body, OR the two wrists are on top of each other near the middle.
+    # The second form matters because the tracker often loses or swaps the wrists when the forearms overlap.
+    thr_cross, thr_inner = pick(lv, 0.0, 0.05, 0.15), pick(lv, 0.45, 0.35, 0.30)
+    pl, pr = L.mid(L.pos_x), R.mid(R.pos_x)
+    inner = max(abs(pl), abs(pr)) if (math.isfinite(pl) and math.isfinite(pr)) else float("nan")
+    crossed_now = math.isfinite(worst_cross) and worst_cross >= thr_cross
+    overlapped = math.isfinite(inner) and inner <= thr_inner
+    if not both_vis or not (math.isfinite(worst_cross) or math.isfinite(inner)):
+        c_status = "unverified"
+    else:
+        c_status = "pass" if (crossed_now or overlapped) else "fail"
+    crossed = Check("forearms_crossed", "Forearms crossed (FIVB: cross the forearms)", "FIVB", 16, True, c_status,
+                    None if not math.isfinite(worst_cross) else float(worst_cross),
+                    f">= {thr_cross:g}, or both wrists close together at the middle",
+                    "Cross your forearms so the wrists pass each other in front of your chest")
     return [
-        _c("forearms_crossed", "Forearms crossed (FIVB: cross the forearms)", 16, True, worst_cross,
-           ge=pick(lv, 0.0, 0.10, 0.25), verifiable=both_vis,
-           tip="Cross your forearms so each wrist passes the middle of your body"),
+        crossed,
         _c("at_chest", "Crossed in front of the chest (FIVB)", 10, False, chest_value, le=0.0, verifiable=both_vis,
-           strict=True, tip="Cross your forearms at chest height: not low at the belly and not overhead"),
+           strict=(lv == "referee"),          # only the strictest level caps the verdict; otherwise it only costs points
+           tip="Cross your forearms at chest height: not low at the belly and not overhead"),
         _c("elbows_bent", "Elbows bent", 6, False, worst_elbow, le=pick(lv, 150, 135, 125), unit=" deg",
            verifiable=both_vis, tip="Bend your elbows to bring the forearms across your chest"),
         _c("hands_open", "Hands open (FIVB: hands open)", 8, False, worst_open,
@@ -706,7 +816,7 @@ RULES = {
 def ready_position_check(tail_frames, lv: str, aspect: float) -> Check:
     """TRAINING requirement: after the signal, arms return to the ready position."""
     tip = "Lower both arms to the ready position after the signal"
-    need = f"wrists at or below {pick(lv, 0.55, 0.70, 0.80):g} of the shoulder-to-hip distance"
+    need = f"wrists at or below {pick(lv, 0.45, 0.55, 0.65):g} of the shoulder-to-hip distance"
     try:
         g = Geo(tail_frames, aspect)
     except ValueError:
@@ -719,7 +829,16 @@ def ready_position_check(tail_frames, lv: str, aspect: float) -> Check:
     worst = min(fl, fr) if (math.isfinite(fl) and math.isfinite(fr)) else float("nan")
     # wr_frac: 0 = shoulder line, 1 = hip line; hanging arms sit around 1.0 or lower on screen
     return _c("ready_position", "Arms back at the ready position", W_READY, False, worst,
-              ge=pick(lv, 0.55, 0.70, 0.80), basis="TRAINING", tip=tip)
+              ge=pick(lv, 0.45, 0.55, 0.65), basis="TRAINING", tip=tip)
+
+
+def rules_for(label: str, g, lv: str, gcap=None, ctx=None):
+    """Run the rule set of a signal with the user's overrides (GRADER_OVERRIDES) applied."""
+    _CTX["label"], _CTX["level"] = label, lv
+    try:
+        return RULES[label](g, lv, gcap, ctx)
+    finally:
+        _CTX["label"] = None
 
 
 def grade_form_only(label: str, frames, level: str = "standard", aspect: float = 9.0 / 16.0,
@@ -733,7 +852,7 @@ def grade_form_only(label: str, frames, level: str = "standard", aspect: float =
     gcap = None
     if capture_frames is not None and len(capture_frames) >= 6:
         gcap = Geo(capture_frames, aspect)
-    return RULES[label](g, level, gcap, context)
+    return rules_for(label, g, level, gcap, context)
 
 
 # ----------------------------------------------------------------------------
@@ -766,6 +885,22 @@ def _form_points(checks: List[Check]):
     if verifiable <= 0:
         return 0.0
     return W_FORM * passed / verifiable
+
+
+def _arms_stayed_down(capture, aspect) -> bool:
+    """True when neither wrist was ever raised above about the hips during the capture."""
+    try:
+        g = Geo(capture, aspect)
+    except ValueError:
+        return False
+    lows = []
+    for side in ("left", "right"):
+        a = g.arm(side)
+        vals = np.asarray(a.wr_frac, dtype=float)[a.mask]
+        vals = vals[np.isfinite(vals)]
+        if len(vals):
+            lows.append(float(vals.min()))          # smallest wr_frac = highest the wrist ever got
+    return bool(lows) and min(lows) >= 0.75
 
 
 def missing_result(target: str, level: str, msg: str) -> AttemptResult:
@@ -829,10 +964,12 @@ def grade_attempt(target: str, capture_frames, window_records, label_to_idx: Dic
     # inside the hold, so onset / release frames do not pollute the geometry.
     analysis_i = (longest_end - longest // 2) if longest >= 1 else best_i
 
-    other_counts = Counter(lab for lab in labels if lab not in (target, NOTHING_LABEL))
-    dom_other, dom_n = (other_counts.most_common(1)[0] if other_counts else (None, 0))
-
     recognized = n_target >= 1 and best_p >= 0.5
+    # While the target IS recognised, windows of a neighbouring signal are just the movement passing through and are ignored.
+    # When the target was NOT recognised, the neighbour is reported ("the system saw X instead").
+    ignored = TRANSITION_CONFUSIONS.get(target, set()) if recognized else set()
+    other_counts = Counter(lab for lab in labels if lab not in (target, NOTHING_LABEL) and lab not in ignored)
+    dom_other, dom_n = (other_counts.most_common(1)[0] if other_counts else (None, 0))
 
     # --- FIVB form checks on the middle of the recognised hold (motion checks use the whole capture) ---
     motion_cap = capture
@@ -865,7 +1002,7 @@ def grade_attempt(target: str, capture_frames, window_records, label_to_idx: Dic
 
     critical_failed = any((c.critical or c.strict) and c.status == "fail" for c in checks)
     critical_unverified = any(c.critical and c.status == "unverified" for c in checks)
-    hold_ok = hold_seconds >= 0.5 * hold_req
+    hold_ok = hold_seconds >= 0.35 * hold_req
     other_dominates = dom_other is not None and dom_n >= 2 and dom_n > n_target
 
     note = ""
@@ -875,7 +1012,8 @@ def grade_attempt(target: str, capture_frames, window_records, label_to_idx: Dic
             note = f"The system saw {short_label(dom_other)} instead."
         elif best_p < 0.35:
             verdict = VERDICT_INCORRECT
-            note = "No clear signal was recognised."
+            note = ("No signal seen: your arms stayed down. Raise your arm(s) and perform the signal."
+                    if _arms_stayed_down(capture, aspect) else "No clear signal was recognised.")
         else:
             verdict = VERDICT_ALMOST if total >= cfg.almost_cut else VERDICT_INCORRECT
             note = "The system only partly recognised the signal."
@@ -989,3 +1127,29 @@ def grade_sequence(targets, capture_frames, window_records, label_to_idx: Dict[s
             res.feedback = res.feedback[:6]
             res.note = res.note or order_note
     return results
+
+
+# ----------------------------------------------------------------------------
+# Summaries for the screens (what is checked, and how the score works)
+# ----------------------------------------------------------------------------
+
+def graded_summary(label: str, ctx: Optional[dict] = None):
+    """What is checked for a signal, in trainee wording. Effect: Required (caps at ALMOST if failed or not visible),
+    Important (caps at ALMOST if failed), Scored (only costs points)."""
+    if label not in RULES:
+        return []
+    dummy = np.zeros((10, 122))
+    checks = rules_for(label, Geo(dummy), "standard", None, ctx) + [ready_position_check(np.zeros((6, 122)), "standard", 9.0 / 16.0)]
+    out = []
+    for c in checks:
+        effect = "Required" if c.critical else "Important" if c.strict else "Scored"
+        out.append({"id": c.id, "label": c.label, "weight": c.weight, "basis": c.basis, "effect": effect})
+    return out
+
+
+def scoring_note(level: str = "standard") -> str:
+    cfg = LEVEL_CONFIG[level]
+    return (f"Also scored: the system must recognise the signal ({W_RECOGNITION} points) and how clearly ({W_DISTINCT}), "
+            f"how long you hold it ({W_HOLD}), and lowering your arms afterwards ({W_READY}, minor). "
+            f"You do not need 100/100: {cfg.correct_cut} or more counts as CORRECT at {cfg.name} level, "
+            f"{cfg.almost_cut} or more is ALMOST.")

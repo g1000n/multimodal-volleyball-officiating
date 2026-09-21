@@ -107,8 +107,8 @@ MODES = [
      "Every signal once, in random order, one after the other with no stopping. Your score is the number of "
      "signals you perform correctly."),
     ("sim", "Match simulation",
-     "A short narrated set: authorise the serve, then make the call at the end of each rally. You blow the whistle "
-     "first. The scoreboard moves only on your correct calls."),
+     "A short narrated set like a real game: for each call you blow the whistle and give the signal right away. "
+     "A message at the bottom shows what was committed. Optional continuous mode runs the whole set by itself."),
 ]
 
 COMBO_CHOICES = [
@@ -127,10 +127,10 @@ INTENT_CHOICES = [
     ("wrong", "TEST: I will perform WRONG on purpose"),
 ]
 
-LEVEL_INFO = {
-    "beginner": "Forgiving: wide angle tolerances, shorter hold.",
-    "standard": "Balanced: a clear, recognisable signal.",
-    "referee": "Strict: close to textbook form, longer hold.",
+LEVEL_INFO = {   # built from the real pass marks, so the text can never disagree with the grader
+    "beginner": f"Forgiving: wide tolerances, shorter hold. {gg.LEVEL_CONFIG['beginner'].correct_cut} or more counts as correct.",
+    "standard": f"Balanced: a clear, recognisable signal. {gg.LEVEL_CONFIG['standard'].correct_cut} or more counts as correct (100 is not needed).",
+    "referee": f"Strict: close to textbook form, longer hold. {gg.LEVEL_CONFIG['referee'].correct_cut} or more counts as correct.",
 }
 
 
@@ -175,6 +175,47 @@ def record_consent(trainee_id: str, display_name: str) -> dict:
         json.dump(record, f, indent=2)
     _append_consent_log(trainee_id, "consent_given")
     return record
+
+
+def trainee_data_summary(trainee_id: str):
+    """(number of saved sessions, size in MB) for this trainee."""
+    path = trainee_dir(trainee_id)
+    sessions = 0
+    size = 0
+    if os.path.isdir(path):
+        sessions = sum(1 for d in os.listdir(path) if os.path.isdir(os.path.join(path, d)))
+        for base, _dirs, files in os.walk(path):
+            for f in files:
+                try:
+                    size += os.path.getsize(os.path.join(base, f))
+                except OSError:
+                    pass
+    return sessions, size / (1024 * 1024)
+
+
+def open_path(path: str) -> bool:
+    """Open a file or folder with the computer's default program (report in the browser, video in the player)."""
+    try:
+        if hasattr(os, "startfile"):
+            os.startfile(path)                                   # Windows
+        else:
+            import subprocess
+            import sys
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
+        return True
+    except Exception:
+        return False
+
+
+def delete_session(trainee_id: str, session: str) -> bool:
+    """Delete ONE session folder of a trainee (the rest of their data stays). Logged in the consent log."""
+    session = os.path.basename(session)                          # never a path
+    path = os.path.join(trainee_dir(trainee_id), session)
+    existed = os.path.isdir(path)
+    if existed:
+        shutil.rmtree(path, ignore_errors=True)
+        _append_consent_log(trainee_id, f"session_deleted:{session}")
+    return existed
 
 
 def delete_trainee_data(trainee_id: str) -> bool:
@@ -254,6 +295,13 @@ def set_theme(name: str, save: bool = True):
         write_settings({"theme": name})
 
 
+def _alive(widget) -> bool:
+    try:
+        return bool(widget.winfo_exists())
+    except tk.TclError:
+        return False
+
+
 class Skin:
     """Registry of widgets and the palette keys they use, so the whole window can be re-themed live."""
 
@@ -292,16 +340,27 @@ class Skin:
                              selectforeground=p["fg"])
         self.style.map("TCombobox", fieldbackground=[("readonly", p["card_hi"]), ("disabled", p["off_bg"])],
                        foreground=[("readonly", p["fg"]), ("disabled", p["off_fg"])])
+        self.style.configure("Treeview", background=p["card"], fieldbackground=p["card"], foreground=p["fg"],
+                             rowheight=26, borderwidth=0, font=("Segoe UI", 10))
+        self.style.configure("Treeview.Heading", background=p["card_hi"], foreground=p["fg"], relief="flat",
+                             font=("Segoe UI", 10, "bold"))
+        self.style.map("Treeview", background=[("selected", p["green"])], foreground=[("selected", p["primary_fg"])])
+        self.style.map("Treeview.Heading", background=[("active", p["card_hi"])])
         self.root.option_add("*TCombobox*Listbox.background", p["card"])
         self.root.option_add("*TCombobox*Listbox.foreground", p["fg"])
         self.root.option_add("*TCombobox*Listbox.selectBackground", p["green"])
         self.root.option_add("*TCombobox*Listbox.selectForeground", p["primary_fg"])
+        self.items = [(w, o) for w, o in self.items if _alive(w)]          # forget closed windows (Learn ...)
+        self.buttons = [b for b in self.buttons if _alive(b)]
         for w, opts in self.items:
             self._apply_one(w, opts)
         for b in self.buttons:
             b.retheme()
-        for cb in self.callbacks:
-            cb()
+        for cb in list(self.callbacks):
+            try:
+                cb()
+            except tk.TclError:                       # a widget the callback used has been destroyed
+                self.callbacks.remove(cb)
 
 
 class FlatButton(tk.Label):
@@ -367,6 +426,30 @@ def _base_root(title, w, h):
     return root, skin
 
 
+def ask_yes_no(title, text):
+    """A simple yes / no window. Returns True for yes (False if no window can be shown)."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        answer = messagebox.askyesno(title, text, parent=root)
+        root.destroy()
+        return bool(answer)
+    except tk.TclError:
+        print(f"{title}: {text}")
+        return False
+
+
+def show_message(title, text, error=False):
+    """A simple message window (used when the camera stops or a session fails)."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        (messagebox.showerror if error else messagebox.showinfo)(title, text, parent=root)
+        root.destroy()
+    except tk.TclError:
+        print(f"{title}: {text}")
+
+
 def _theme_button(parent, skin):
     """Small light/dark switch for the top-right corner."""
     def label():
@@ -396,7 +479,7 @@ def run_welcome():
     skin.add(tk.Label(head, text="Welcome, future referee!", font=("Segoe UI", 24, "bold"), anchor="w"),
              bg="bg", fg="fg").pack(side="left")
     skin.add(tk.Label(root, text="Learn and practise the official FIVB referee hand signals, with instant feedback "
-                                 "on whether you performed each one correctly.",
+                                 "on whether you performed each one correctly. It is a training aid and does not replace a coach.",
                       font=("Segoe UI", 12), wraplength=850, justify="left"),
              bg="bg", fg="muted").pack(anchor="w", padx=32, pady=(4, 14))
 
@@ -507,6 +590,12 @@ def open_learn(parent, skin, start_label=None):
 
     retag()
     skin.callbacks.append(retag)
+
+    def on_close(event):
+        if event.widget is win and retag in skin.callbacks:
+            skin.callbacks.remove(retag)
+
+    win.bind("<Destroy>", on_close)
     win._img_ref = None
 
     def show(_evt=None):
@@ -534,6 +623,16 @@ def open_learn(parent, skin, start_label=None):
         body.insert("end", "How to perform it\n", "k")
         for i, step in enumerate(s["howto"], 1):
             body.insert("end", f"  {i}. {step}\n")
+        body.insert("end", "What is checked\n", "k")
+        ctx = {"side": "left"} if label == "double_contact" else None
+        for it in gg.graded_summary(label, ctx):
+            body.insert("end", f"  [{it['effect']}] {it['label']} ({it['weight']} pts)\n")
+        body.insert("end", "  Required: a miss limits the result to ALMOST. Important: same, but only when the camera "
+                           "sees it. Scored: a miss only costs points.\n", "m")
+        body.insert("end", "  " + gg.scoring_note("standard") + "\n", "m")
+        if s.get("compare"):
+            body.insert("end", "Easy to confuse\n", "k")
+            body.insert("end", "  " + s["compare"] + "\n")
         body.insert("end", "Common mistakes\n", "k")
         for m in s["mistakes"]:
             body.insert("end", f"  - {m}\n")
@@ -565,23 +664,254 @@ def open_learn(parent, skin, start_label=None):
 
 
 # ----------------------------------------------------------------------------
+# 4. My progress
+# ----------------------------------------------------------------------------
+
+def open_progress(parent, skin, trainee, on_practice=None):
+    """Window with the trainee's progress over all their saved sessions (see progress.py)."""
+    import webbrowser
+
+    import progress
+
+    data = progress.build_progress(trainee_dir(trainee["trainee_id"]))
+    win = tk.Toplevel(parent)
+    win.title("My progress")
+    win.geometry("900x820")
+    skin.add(win, bg="bg")
+
+    skin.add(tk.Label(win, text=f"My progress: {trainee['display_name']}", font=("Segoe UI", 20, "bold"), anchor="w"),
+             bg="bg", fg="fg").pack(fill="x", padx=28, pady=(18, 4))
+    if not data["sessions"]:
+        skin.add(tk.Label(win, text="No sessions yet. Do a Drill, Combo drill, Challenge or Match simulation and your "
+                                    "progress will appear here.", font=("Segoe UI", 12), wraplength=820, justify="left",
+                          anchor="w"), bg="bg", fg="muted").pack(fill="x", padx=28, pady=10)
+        FlatButton(win, skin, "My sessions", lambda: open_sessions(win, skin, trainee)).pack(pady=(14, 4))
+        FlatButton(win, skin, "Close", win.destroy).pack(pady=6)
+        return win
+
+    cards = skin.add(tk.Frame(win), bg="bg")
+    cards.pack(fill="x", padx=28, pady=(6, 6))
+    stats = [("Sessions", str(len(data["sessions"]))), ("Attempts", str(data["total_attempts"])),
+             ("Correct", f"{data['accuracy']:.0f}%"), ("Average score", f"{data['avg_score']:.0f}/100")]
+    for k, (name, val) in enumerate(stats):
+        card = skin.add(tk.Frame(cards, highlightthickness=1), bg="card", highlightbackground="border")
+        card.grid(row=0, column=k, padx=(0 if k == 0 else 8, 0), sticky="ew")
+        cards.grid_columnconfigure(k, weight=1)
+        skin.add(tk.Label(card, text=name, font=("Segoe UI", 9)), bg="card", fg="muted").pack(anchor="w", padx=12, pady=(8, 0))
+        skin.add(tk.Label(card, text=val, font=("Segoe UI", 18, "bold")), bg="card", fg="fg").pack(anchor="w", padx=12, pady=(0, 8))
+    skin.add(tk.Label(win, text=data["trend_text"], font=("Segoe UI", 11), anchor="w", wraplength=840, justify="left"),
+             bg="bg", fg="green").pack(fill="x", padx=28)
+    if data["whistle"]:
+        w = data["whistle"]
+        skin.add(tk.Label(win, text=f"Whistle: on time {w['on_time']} of {w['attempts']} ({w['pct']:.0f}%)",
+                          font=("Segoe UI", 10), anchor="w"), bg="bg", fg="muted").pack(fill="x", padx=28)
+
+    # ---- chart: average score per session
+    skin.add(tk.Label(win, text="Average score per session", font=("Segoe UI", 10, "bold"), anchor="w"),
+             bg="bg", fg="blue").pack(fill="x", padx=28, pady=(10, 2))
+    canvas = tk.Canvas(win, height=170, highlightthickness=0, bd=0)
+    canvas.pack(fill="x", padx=28)
+
+    def draw_chart(_evt=None):
+        p = palette()
+        try:
+            canvas.delete("all")
+            canvas.configure(bg=p["card"])
+        except tk.TclError:
+            return
+        W = canvas.winfo_width() or 840
+        H = 170
+        left, right, top, bottom = 40, 16, 14, 26
+        for v in (0, 50, 100):
+            y = top + (H - top - bottom) * (1 - v / 100.0)
+            canvas.create_line(left, y, W - right, y, fill=p["border"])
+            canvas.create_text(left - 6, y, text=str(v), fill=p["muted"], anchor="e", font=("Segoe UI", 8))
+        sess = data["sessions"]
+        n = len(sess)
+        pts = []
+        for i, s in enumerate(sess):
+            x = left + (W - left - right) * (0.5 if n == 1 else i / (n - 1))
+            y = top + (H - top - bottom) * (1 - s["avg_score"] / 100.0)
+            pts.append((x, y))
+        if n > 1:
+            canvas.create_line(*[c for pt in pts for c in pt], fill=p["green"], width=2)
+        for x, y in pts:
+            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=p["green"], outline=p["green"])
+        first, last = sess[0]["when"], sess[-1]["when"]
+        canvas.create_text(left, H - 10, anchor="w", fill=p["muted"], font=("Segoe UI", 8),
+                           text=first.strftime("%b %d %H:%M") if first else "first")
+        canvas.create_text(W - right, H - 10, anchor="e", fill=p["muted"], font=("Segoe UI", 8),
+                           text=last.strftime("%b %d %H:%M") if last else "latest")
+
+    canvas.bind("<Configure>", draw_chart)
+    skin.callbacks.append(draw_chart)
+
+    # ---- table by signal
+    skin.add(tk.Label(win, text="By signal (weakest first)", font=("Segoe UI", 10, "bold"), anchor="w"),
+             bg="bg", fg="blue").pack(fill="x", padx=28, pady=(10, 2))
+    cols = ("signal", "tries", "correct", "acc", "avg", "trend")
+    tree = ttk.Treeview(win, columns=cols, show="headings", height=min(8, max(3, len(data["per_signal"]))))
+    for c, txt, wd in (("signal", "Signal", 300), ("tries", "Tries", 60), ("correct", "Correct", 70),
+                       ("acc", "Accuracy", 80), ("avg", "Avg score", 80), ("trend", "Trend", 80)):
+        tree.heading(c, text=txt)
+        tree.column(c, width=wd, anchor="w" if c == "signal" else "center")
+    for label, v in sorted(data["per_signal"].items(), key=lambda kv: kv[1]["accuracy"]):
+        trend = "" if v["trend"] is None else ("up " if v["trend"] > 2 else "down " if v["trend"] < -2 else "same ") + "%+.0f" % v["trend"]
+        tree.insert("", "end", values=(gg.short_label(label), v["attempts"], v["correct"], f"{v['accuracy']:.0f}%",
+                                       f"{v['avg_score']:.0f}", trend))
+    tree.pack(fill="x", padx=28)
+
+    # ---- what to work on
+    skin.add(tk.Label(win, text="What to work on", font=("Segoe UI", 10, "bold"), anchor="w"),
+             bg="bg", fg="blue").pack(fill="x", padx=28, pady=(10, 2))
+    for line in progress.focus_lines(data) or ["Nothing yet."]:
+        skin.add(tk.Label(win, text="- " + line, font=("Segoe UI", 10), anchor="w", wraplength=840, justify="left"),
+                 bg="bg", fg="fg").pack(fill="x", padx=28)
+
+    bar = skin.add(tk.Frame(win), bg="bg")
+    bar.pack(fill="x", padx=28, pady=16, side="bottom")
+
+    def practise():
+        if on_practice and data["weakest"]:
+            on_practice(data["weakest"][0])
+            win.destroy()
+
+    def save_report():
+        path = os.path.join(trainee_dir(trainee["trainee_id"]), "progress.html")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(progress.progress_html(data, trainee["display_name"]))
+            webbrowser.open("file:///" + os.path.abspath(path).replace("\\", "/"))
+        except OSError as exc:
+            messagebox.showerror("Progress report", f"The report could not be saved: {exc}", parent=win)
+
+    FlatButton(bar, skin, "Close", win.destroy).pack(side="right")
+    FlatButton(bar, skin, "My sessions", lambda: open_sessions(win, skin, trainee)).pack(side="right", padx=(0, 8))
+    FlatButton(bar, skin, "Save report (HTML)", save_report).pack(side="right", padx=(0, 8))
+    practise_btn = FlatButton(bar, skin, "Practise my weakest signal", practise, kind="primary")
+    practise_btn.pack(side="right")
+    practise_btn.set_enabled(bool(on_practice and data["weakest"]))
+
+    def on_close(event):
+        if event.widget is win and draw_chart in skin.callbacks:
+            skin.callbacks.remove(draw_chart)
+
+    win.bind("<Destroy>", on_close)
+    skin.apply()
+    return win
+
+
+def open_sessions(parent, skin, trainee):
+    """List of the trainee's saved sessions: open the report, play the video, or delete just that session."""
+    import progress
+
+    win = tk.Toplevel(parent)
+    win.title("My sessions")
+    win.geometry("900x560")
+    skin.add(win, bg="bg")
+    skin.add(tk.Label(win, text=f"My sessions: {trainee['display_name']}", font=("Segoe UI", 20, "bold"), anchor="w"),
+             bg="bg", fg="fg").pack(fill="x", padx=28, pady=(18, 2))
+    skin.add(tk.Label(win, text="Select a session, then open its report, play its video, or delete only that session. "
+                                "To delete ALL your data, use Delete my data in the main menu.",
+                      font=("Segoe UI", 10), wraplength=840, justify="left", anchor="w"),
+             bg="bg", fg="muted").pack(fill="x", padx=28, pady=(0, 8))
+
+    cols = ("when", "mode", "level", "attempts", "correct", "points", "size")
+    tree = ttk.Treeview(win, columns=cols, show="headings", height=12, selectmode="browse")
+    for c, txt, wd in (("when", "Date and time", 190), ("mode", "Mode", 130), ("level", "Level", 80),
+                       ("attempts", "Attempts", 80), ("correct", "Correct", 80), ("points", "Points", 90),
+                       ("size", "Size (MB)", 90)):
+        tree.heading(c, text=txt)
+        tree.column(c, width=wd, anchor="w" if c in ("when", "mode") else "center")
+    tree.pack(fill="both", expand=True, padx=28)
+    rows = {}
+
+    def fill():
+        tree.delete(*tree.get_children())
+        rows.clear()
+        for s in progress.list_sessions(trainee_dir(trainee["trainee_id"])):
+            when = s["when"].strftime("%Y-%m-%d %H:%M") if s["when"] else s["session"]
+            mode = s["mode"] + (" (test)" if s["test"] else "")
+            iid = tree.insert("", "end", values=(when, mode, s["level"], s["attempts"], s["correct"],
+                                                 f"{s['points']}/{s['max_points']}", f"{s['size_mb']:.1f}"))
+            rows[iid] = s
+        empty.configure(text="" if rows else "No saved sessions yet.")
+
+    empty = skin.add(tk.Label(win, text="", font=("Segoe UI", 11)), bg="bg", fg="muted")
+    empty.pack()
+
+    def selected():
+        sel = tree.selection()
+        return rows.get(sel[0]) if sel else None
+
+    def need_selection():
+        messagebox.showinfo("My sessions", "Select a session in the list first.", parent=win)
+
+    def open_report():
+        s = selected()
+        if not s:
+            return need_selection()
+        path = os.path.join(s["path"], "report.html")
+        if not (os.path.exists(path) and open_path(path)):
+            messagebox.showinfo("My sessions", "This session has no report.", parent=win)
+
+    def play_video():
+        s = selected()
+        if not s:
+            return need_selection()
+        path = os.path.join(s["path"], "session.mp4")
+        if not (os.path.exists(path) and open_path(path)):
+            messagebox.showinfo("My sessions", "This session has no video, or it could not be opened. It is saved as "
+                                               "session.mp4 in the session folder.", parent=win)
+
+    def open_folder():
+        s = selected()
+        if not s:
+            return need_selection()
+        open_path(s["path"])
+
+    def delete_one():
+        s = selected()
+        if not s:
+            return need_selection()
+        when = s["when"].strftime("%Y-%m-%d %H:%M") if s["when"] else s["session"]
+        if messagebox.askyesno("Delete this session",
+                               f"Delete the session from {when} ({s['mode']}, {s['size_mb']:.1f} MB)? Its video, report and "
+                               "results are removed for good. Your other sessions are not touched.", parent=win):
+            delete_session(trainee["trainee_id"], s["session"])
+            fill()
+
+    bar = skin.add(tk.Frame(win), bg="bg")
+    bar.pack(fill="x", padx=28, pady=14)
+    FlatButton(bar, skin, "Close", win.destroy).pack(side="right")
+    FlatButton(bar, skin, "Delete this session", delete_one).pack(side="right", padx=(0, 8))
+    FlatButton(bar, skin, "Open folder", open_folder).pack(side="right", padx=(0, 8))
+    FlatButton(bar, skin, "Play video", play_video).pack(side="right", padx=(0, 8))
+    FlatButton(bar, skin, "Open report", open_report, kind="primary").pack(side="right", padx=(0, 8))
+    fill()
+    skin.apply()
+    return win
+
+
+# ----------------------------------------------------------------------------
 # 2. Main menu
 # ----------------------------------------------------------------------------
 
 def run_menu(trainee: dict, real_labels, last_summary: str = ""):
     """
     Returns one of:
-        {"action": "start", "mode", "gesture", "level", "reps", "combo", "intent", "note"}
+        {"action": "start", "mode", "gesture", "level", "reps", "combo", "intent", "note", "whistle", "continuous"}
         {"action": "quit"}
         {"action": "deleted"}
         {"action": "devices"}     (open the camera and microphone setup)
     """
     result = {"value": {"action": "quit"}}
-    root, skin = _base_root(APP_TITLE, 900, 1040 if TEST_MODE else 860)
+    root, skin = _base_root(APP_TITLE, 1000, 1080 if TEST_MODE else 900)
 
     head = skin.add(tk.Frame(root), bg="bg")
     head.pack(fill="x", padx=32, pady=(22, 0))
     _theme_button(head, skin).pack(side="right")
+    FlatButton(head, skin, "Quit", root.destroy).pack(side="right", padx=(0, 8))
     skin.add(tk.Label(head, text=f"Hi, {trainee['display_name']}!", font=("Segoe UI", 22, "bold"), anchor="w"),
              bg="bg", fg="fg").pack(side="left")
     skin.add(tk.Label(root, text="What would you like to do today?", font=("Segoe UI", 12), anchor="w"),
@@ -650,6 +980,11 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
                                           text="Require the whistle first (Team to Serve and Authorization to Serve)"),
                            bg="bg", fg="fg", selectcolor="card_hi", activebackground="bg", activeforeground="fg")
     whistle_box.grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
+    continuous_var = tk.BooleanVar(value=bool(last.get("continuous", False)))
+    continuous_box = skin.add(tk.Checkbutton(opts, variable=continuous_var, highlightthickness=0, font=("Segoe UI", 11),
+                                             text="Continuous (Match simulation runs the whole set by itself, timed to be readable)"),
+                              bg="bg", fg="fg", selectcolor="card_hi", activebackground="bg", activeforeground="fg")
+    continuous_box.grid(row=9, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
     intent_var = tk.StringVar(value=INTENT_CHOICES[0][1])
     note_var = tk.StringVar()
@@ -684,6 +1019,7 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
         reps_box.configure(state="readonly" if m in ("drill", "combo") else "disabled")
         combo_box.configure(state="readonly" if m == "combo" else "disabled")
         whistle_box.configure(state="normal" if m in ("drill", "combo", "challenge") else "disabled")
+        continuous_box.configure(state="normal" if m == "sim" else "disabled")
 
     update_state()
 
@@ -701,7 +1037,8 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
         result["value"] = {"action": "start", "mode": mode_var.get(), "gesture": label, "level": level_var.get(),
                            "reps": reps, "combo": combo_key, "intent": intent,
                            "note": note_var.get().strip() if TEST_MODE else "",
-                           "whistle": bool(whistle_var.get()) and mode_var.get() in ("drill", "combo", "challenge")}
+                           "whistle": bool(whistle_var.get()) and mode_var.get() in ("drill", "combo", "challenge"),
+                           "continuous": bool(continuous_var.get()) and mode_var.get() == "sim"}
         # remember the choices (also for the next time the app is opened); the test label is never remembered
         remembered = {k: v for k, v in result["value"].items() if k not in ("action", "intent", "note")}
         remembered["gesture"] = label or last.get("gesture")
@@ -717,20 +1054,32 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
         result["value"] = {"action": "devices"}
         root.destroy()
 
+    def practise(label):
+        mode_var.set("drill")
+        sig_var.set(gg.pretty_label(label))
+        update_state()
+
+    def progress_window():
+        open_progress(root, skin, trainee, practise)
+
     def delete():
+        n, mb = trainee_data_summary(trainee["trainee_id"])
         if messagebox.askyesno(
                 "Delete my data",
-                "This permanently deletes all saved videos, reports and results for you, and withdraws your "
-                "consent. You will need to accept the notice again to use the tool.\n\nDelete now?", parent=root):
+                f"This permanently deletes ALL saved data for '{trainee['display_name']}': {n} session(s), "
+                f"{mb:.1f} MB (videos, results and movement files), and withdraws your consent. It is not only the "
+                "latest session.\n\nOther people's data is not touched, and the consent log keeps a line saying that "
+                "the data was deleted. You will need to accept the notice again to use the tool.\n\nDelete now?",
+                parent=root):
             delete_trainee_data(trainee["trainee_id"])
             result["value"] = {"action": "deleted"}
             root.destroy()
 
     FlatButton(bar, skin, "Start session", start, kind="primary", big=True).pack(side="right")
-    FlatButton(bar, skin, "Learn the signals", learn).pack(side="right", padx=10)
-    FlatButton(bar, skin, "Camera and mic", devices).pack(side="right")
+    FlatButton(bar, skin, "Learn the signals", learn).pack(side="right", padx=(0, 8))
+    FlatButton(bar, skin, "Progress and sessions", progress_window).pack(side="right", padx=(0, 8))
+    FlatButton(bar, skin, "Camera and mic", devices).pack(side="right", padx=(0, 8))
     FlatButton(bar, skin, "Delete my data", delete).pack(side="left")
-    FlatButton(bar, skin, "Quit", root.destroy).pack(side="left", padx=10)
 
     skin.apply()
     root.mainloop()
@@ -738,7 +1087,14 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
 
 
 if __name__ == "__main__":
+    # Quick preview of the screens. The real program is:  python trainer.py
     t = run_welcome()
     print("welcome ->", t)
-    if t:
-        print("menu ->", run_menu(t, list(gg.SIGNALS.keys())))
+    while t:
+        choice = run_menu(t, list(gg.SIGNALS.keys()))
+        print("menu ->", choice)
+        if choice.get("action") == "devices":
+            import device_setup
+            print("camera and mic ->", device_setup.run_device_setup())
+            continue
+        break

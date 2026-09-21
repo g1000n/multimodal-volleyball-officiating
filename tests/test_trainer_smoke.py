@@ -105,8 +105,9 @@ class FakeBackend(trainer.Backend):
 class FakeHub:
     auto_active = False
 
-    def __init__(self):
-        self.pressed = False
+    def __init__(self, clock=None):
+        self.clock = clock
+        self.times = []
 
     def start(self):
         pass
@@ -115,10 +116,14 @@ class FakeHub:
         pass
 
     def manual(self):
-        self.pressed = True
+        self.times.append(self.clock() if self.clock else 0.0)
+
+    def first_since(self, t):
+        c = [x for x in self.times if x >= t]
+        return min(c) if c else None
 
     def heard_since(self, t):
-        return self.pressed
+        return self.first_since(t) is not None
 
 
 class TestSession(trainer.Session):
@@ -129,9 +134,15 @@ class TestSession(trainer.Session):
         self.save_dir = save_dir
         self.saved = set()
         self.max_frames = 4000
+        self.whistle_at = 0.3          # seconds after GO when the fake trainee blows the whistle (None = never)
 
     def _show(self, ui):
         self.frames_seen += 1
+        if self.attempts and not getattr(self, "_csv_checked", False):
+            self._csv_checked = True          # the first counted attempt is already on disk, before the session ends
+            import csv as _c
+            with open(os.path.join(self.dir, "attempts.csv"), newline="", encoding="utf-8") as fh:
+                assert len(list(_c.DictReader(fh))) == len(self.attempts), "attempt not written immediately"
         assert ui.shape == (trainer.UI_H, trainer.UI_W, 3)
         tag = None
         if self.phase == "intro" and "intro" not in self.saved:
@@ -152,6 +163,9 @@ class TestSession(trainer.Session):
     def _key(self):
         if self.frames_seen > self.max_frames:
             return 27
+        if self.phase == "capture" and self.step and self.step.get("whistle") and self.whistle_at is not None \
+                and self.clock() - self.phase_t0 > self.whistle_at and self.whistle.first_since(self.phase_t0) is None:
+            return ord("w")
         if getattr(self, "hands_off", False):
             # automatic modes: only start the run and leave the summary; everything between must run by itself
             if self.phase == "wait_whistle" and self.clock() - self.phase_t0 > 0.5:
@@ -180,13 +194,14 @@ class TestSession(trainer.Session):
         return 255
 
 
-def run_mode(mode, tmp, save_dir, gesture=None, level="standard", hands_off=False, **extra):
+def run_mode(mode, tmp, save_dir, gesture=None, level="standard", hands_off=False, whistle_at=0.3, **extra):
     clock = FakeClock()
     be = FakeBackend(clock, always_show="ball_out" if mode == "practice" else None)
     trainee = {"trainee_id": "tester", "display_name": "Tester"}
     choice = {"action": "start", "mode": mode, "gesture": gesture, "level": level, **extra}
-    sess = TestSession(be, trainee, choice, FakeHub(), clock=clock, rng=random.Random(3), save_dir=save_dir)
+    sess = TestSession(be, trainee, choice, FakeHub(clock), clock=clock, rng=random.Random(3), save_dir=save_dir)
     sess.hands_off = hands_off
+    sess.whistle_at = whistle_at
     summary = sess.run()
     return sess, summary
 
@@ -285,6 +300,77 @@ def test_devices():
     print("devices    OK   microphone list and level meter")
 
 
+class FailingCap:
+    """A camera that stops delivering frames after `fail_after` reads."""
+
+    def __init__(self, clock, fail_after):
+        self.clock, self.n, self.fail_after = clock, 0, fail_after
+
+    def read(self):
+        self.n += 1
+        if self.n > self.fail_after:
+            return False, None
+        self.clock.t += 0.1
+        return True, np.full((720, 1280, 3), 60, np.uint8)
+
+    def release(self):
+        pass
+
+
+def test_camera_lost_and_crash_keep_the_results():
+    trainee = {"trainee_id": "tester", "display_name": "Tester"}
+    choice = {"action": "start", "mode": "drill", "gesture": "ball_out", "level": "standard", "reps": 5}
+    # 1. the camera stops mid-session and cannot be reopened
+    clock = FakeClock()
+    be = FakeBackend(clock)
+    be.cap = FailingCap(clock, fail_after=330)
+    be.reopen_camera = lambda preferred: (_ for _ in ()).throw(RuntimeError("no camera"))
+    sess = TestSession(be, trainee, choice, FakeHub(clock), clock=clock, rng=random.Random(3))
+    sess.hands_off = True
+    sess.sleep = lambda s: None
+    summary = sess.run()
+    assert summary["camera_lost"] is True and summary["error"] == "", summary
+    assert summary["attempts"] >= 1
+    for fn in ("attempts.csv", "summary.json", "report.html"):
+        assert os.path.exists(os.path.join(sess.dir, fn)), fn
+    # 2. a crash in the middle of the session: everything recorded before it is still saved
+    clock = FakeClock()
+    be = FakeBackend(clock)
+    real_extract, calls = be.extract, {"n": 0}
+
+    def crashing_extract(frame):
+        calls["n"] += 1
+        if calls["n"] > 330:
+            raise RuntimeError("boom")
+        return real_extract(frame)
+    be.extract = crashing_extract
+    sess = TestSession(be, trainee, choice, FakeHub(clock), clock=clock, rng=random.Random(3))
+    sess.hands_off = True
+    summary = sess.run()
+    assert "boom" in summary["error"] and summary["attempts"] >= 1, summary
+    for fn in ("attempts.csv", "summary.json", "report.html", "error.log"):
+        assert os.path.exists(os.path.join(sess.dir, fn)), fn
+    with open(os.path.join(sess.dir, "error.log"), encoding="utf-8") as fh:
+        assert "boom" in fh.read()
+    print("reliability OK   camera lost and crash both keep the recorded results")
+
+
+def test_performance_is_measured_and_reported():
+    sess, summary = run_mode("drill", tempfile.mkdtemp(), None, gesture="ball_out", hands_off=True, reps=2)
+    p = summary["performance"]
+    for k in ("frames", "fps_mean", "fps_first_quarter", "fps_last_quarter", "extract_ms_mean", "classify_ms_mean",
+              "grade_ms_mean", "cpu_process_mean_pct", "ram_mean_mb", "psutil"):
+        assert k in p, k
+    assert p["frames"] > 100 and p["fps_mean"] > 0 and p["grade_ms_mean"] >= 0, p
+    with open(os.path.join(sess.dir, "report.html"), encoding="utf-8") as fh:
+        assert "Performance of this session" in fh.read()
+    import subprocess
+    res = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "performance_report.py"), "--min-seconds", "1"],
+                         capture_output=True, text=True)
+    assert res.returncode == 0 and "drill" in res.stdout, res.stdout + res.stderr
+    print("performance OK   ", [l for l in res.stdout.splitlines() if l.startswith("drill")][0][:70])
+
+
 def main():
     test_camera_fallback()
     test_devices()
@@ -296,6 +382,9 @@ def main():
     old = os.getcwd()
     os.chdir(tmp)
     try:
+        test_camera_lost_and_crash_keep_the_results()
+        test_performance_is_measured_and_reported()
+
         # practice
         sess, summary = run_mode("practice", tmp, save_dir)
         assert sess.stable_label == "ball_out", sess.stable_label
@@ -394,10 +483,32 @@ def main():
         kinds = [a["kind"] for a in sess.attempts]
         assert kinds[0] == "whistle" and kinds[-2:] == ["whistle", "gesture"], kinds
         assert any(a["target"] == "end_of_set" for a in sess.attempts)
-        print("sim        OK  ", summary["one_line"], summary["team_points"])
+        sim_sess, sim_summary = sess, summary
+        # the whistle is part of each signal step (not a separate step), and a commit message is produced
+        assert all(q["kind"] != "whistle" and q.get("whistle") for q in sess.queue), sess.queue
+        assert len(sess.queue) == 7 and kinds.count("whistle") == 7, (len(sess.queue), kinds.count("whistle"))
+        assert sess.commit["title"] == "SET ENDED" and any(l.startswith("COMMITTED") for l in sess.commit_log + ["COMMITTED"])
+        assert sess.whistle_state == "ok"
+        assert sess.serving in ("left", "right"), sess.serving          # the top bar shows who is serving
+        print("sim commit OK  ", sess.commit["title"], "|", sess.commit["lines"][0], "| serving", sess.serving)
+
+        # continuous match simulation: runs the whole set by itself
+        sess, summary = run_mode("sim", tmp, save_dir, level="beginner", hands_off=True, continuous=True)
+        assert summary["attempts"] == 17 and summary["correct"] == 17, summary
+        print("sim cont.  OK  ", summary["one_line"])
+
+        # whistle states: late and missing
+        sess, summary = run_mode("drill", tmp, save_dir, gesture="team_to_serve_left", hands_off=True, reps=2,
+                                 whistle=True, whistle_at=3.8)
+        assert [a["verdict"] for a in sess.attempts if a["kind"] == "whistle"] == ["ALMOST", "ALMOST"], sess.attempts
+        sess, summary = run_mode("drill", tmp, save_dir, gesture="team_to_serve_left", hands_off=True, reps=2,
+                                 whistle=True, whistle_at=None)
+        assert [a["verdict"] for a in sess.attempts if a["kind"] == "whistle"] == ["INCORRECT", "INCORRECT"]
+        print('whistle st OK   on time / late / not heard')
+        print("sim        OK  ", sim_summary["one_line"], sim_summary["team_points"])
 
         # outputs written
-        d = sess.dir
+        d = sim_sess.dir
         for fn in ("attempts.csv", "summary.json", "report.html"):
             assert os.path.exists(os.path.join(d, fn)), fn
         print("outputs    OK  ", sorted(os.listdir(d)))

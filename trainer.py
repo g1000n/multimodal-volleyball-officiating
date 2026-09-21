@@ -55,10 +55,16 @@ import random
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 
 import cv2
 import numpy as np
+
+try:                                   # optional: measures CPU and memory for the performance figures
+    import psutil
+except ImportError:
+    psutil = None
 
 import devices
 import gesture_grader as gg
@@ -94,10 +100,19 @@ RECORD_FPS = 10                  # matches live_deployment.py RAW_RECORD_FPS
 CAPTURE_SECONDS_PAIR = 9.0       # two signals performed back to back (Team to Serve, then the reason)
 AFTER_WHISTLE_COUNTDOWN = 1.0    # the signal follows the whistle right away (FIVB 22.2.3)
 # automatic runs: (pause showing the next signal, how long each verdict stays up, countdown)
-TIMINGS = {"drill": (2.5, 3.0, 3.0), "combo": (2.5, 3.5, 3.0), "challenge": (1.8, 2.2, 2.0)}
+TIMINGS = {"drill": (2.5, 3.0, 3.0), "combo": (2.5, 3.5, 3.0), "challenge": (1.8, 2.2, 2.0),
+           "sim": (5.0, 5.5, 2.0)}          # the match simulation timings are only used when "continuous" is on
+WHISTLE_EXTRA_SECONDS = 1.5      # a step that starts with the whistle gets this much longer to capture
+WHISTLE_ONSET_OFFSET = 1.2       # a window is recognised about half a window (1.2 s) after the signal started
+WHISTLE_TOLERANCE = 0.6          # the whistle may come this late after the estimated start and still count as first
 AUTO_INTRO_SECONDS = 2.5
 AUTO_RESULT_SECONDS = 3.0
 WINDOW_NAME = "Volleyball Officiating Trainer"
+CAMERA_RETRY_SLEEP = 0.3         # camera stopped mid-session: wait this long between reconnect attempts
+CAMERA_RETRY_EVERY = 3           # reopen the camera every this many failed reads
+CAMERA_LOST_SECONDS = 8.0        # give up after this long, save everything and go back to the menu
+CSV_COLS = ["ph_time", "kind", "target", "level", "intent", "note", "verdict", "score", "points", "best_prob", "margin",
+            "hold_s", "confused_with", "failed_checks", "check_values", "feedback"]
 
 PH_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
@@ -141,6 +156,27 @@ VERDICT_TEXT = {gg.VERDICT_CORRECT: "CORRECT", gg.VERDICT_ALMOST: "ALMOST",
                 gg.VERDICT_INCORRECT: "INCORRECT", gg.VERDICT_NO_READING: "NO READING"}
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+
+CLEAN_LINE = "Clean signal. Nice work."
+
+
+def feedback_view(r):
+    """What to show under the checklist. A clean or correct attempt gets no 'How to improve': only a kind word, and an
+    optional short 'polish' list when a small check was missed. Camera notes are kept short and quiet.
+    Returns (heading or None, [(text, kind)]) with kind in "ok", "tip", "cam"."""
+    cam, tips = [], []
+    for f in r.feedback:
+        if f.startswith("Could not verify"):
+            what = f[len("Could not verify: "):].split(". Make sure")[0]
+            cam.append(f"Camera could not check: {what}. Keep that part visible.")
+        elif f != CLEAN_LINE:
+            tips.append(f)
+    if r.verdict == gg.VERDICT_CORRECT:
+        if not tips:
+            return None, [(CLEAN_LINE, "ok")] + [(c, "cam") for c in cam[:1]]
+        return "Optional polish", [("Counts as correct.", "ok")] + [(t, "tip") for t in tips[:3]] + [(c, "cam") for c in cam[:1]]
+    return "How to improve", [(t, "tip") for t in tips] + [(c, "cam") for c in cam[:1]]
 
 
 def now_ph_str(fmt="%Y-%m-%d %H:%M:%S"):
@@ -297,6 +333,7 @@ class Backend:
         self.label_to_idx = {v: k for k, v in self.idx_to_label.items()}
         self.real_labels = [self.idx_to_label[i] for i in sorted(self.idx_to_label)]
         self.close = close
+        self.cam_index = 0
 
     def release_camera(self):
         try:
@@ -307,6 +344,7 @@ class Backend:
     def reopen_camera(self, preferred):
         """Reopen after the setup screen. Falls back to another camera if `preferred` is unavailable."""
         self.cap, used = devices.open_camera(preferred)
+        self.cam_index = used
         return used
 
 
@@ -344,6 +382,7 @@ def build_backend(camera_index=None):
         return ld.classify_window(window_frames, model, idx_to_real_label)
 
     backend = Backend(cap, extract, classify, idx_to_real_label)
+    backend.cam_index = cam
 
     def close():
         backend.release_camera()
@@ -395,6 +434,12 @@ class WhistleHub:
     def auto_active(self):
         return self.detector is not None
 
+    def first_since(self, t):
+        """Time of the first whistle at or after t, or None."""
+        with self._lock:
+            c = [x for x in self._times if x >= t]
+        return min(c) if c else None
+
     def heard_since(self, t):
         with self._lock:
             return any(x >= t for x in self._times)
@@ -430,7 +475,8 @@ def narrate_rally_end(reason, winner, fault_side):
         return (f"The ball hit by the {W} team landed INSIDE the {F} team's court and was not returned. "
                 f"The team on your {W} wins the rally and serves next.")
     return (f"A player on the {F} team touched the ball twice (double contact). "
-            f"The team on your {W} wins the rally and serves next.")
+            f"The team on your {W} wins the rally and serves next. Show double contact with your {F} hand "
+            f"(the side of the team at fault).")
 
 
 def make_rally_end(rng, reason, server):
@@ -473,8 +519,8 @@ def build_combo_queue(choice, real_labels, rng):
 
 
 def build_sim_queue(rng, real_labels, n_rallies=3):
-    """A short narrated set: the trainee authorises the serve, then makes the call at the end of each rally,
-    then signals the end of the set. Everything comes from the same 8 signals and one set (project scope)."""
+    """A short narrated set. Like in a match, the whistle and the signal happen together: the trainee blows the
+    whistle and immediately gives the signal(s). Everything comes from the same 8 signals and one set (project scope)."""
     have = set(real_labels)
     reasons = [r for r in REASONS if r in have]
     queue = []
@@ -486,40 +532,37 @@ def build_sim_queue(rng, real_labels, n_rallies=3):
     for r in range(1, total + 1):
         sa = f"service_authorization_{server}"
         serve_text = (f"Rally {r} of {total}. The team on your {_side_word(server)} is in position and ready to serve. "
-                      f"Blow the whistle, then authorise the serve.")
+                      f"Blow the whistle and authorise the serve.")
         if sa in have:
-            queue.append({"kind": "whistle", "text": serve_text, "scenario": r, "n_scenarios": total})
-            queue.append({"kind": "gesture", "label": sa, "text": serve_text, "scenario": r, "n_scenarios": total})
+            queue.append({"kind": "gesture", "label": sa, "text": serve_text, "scenario": r, "n_scenarios": total,
+                          "whistle": True, "commit": "serve", "side": server})
         choices = [x for x in reasons if x != last] or reasons
         reason = rng.choice(choices)
         last = reason
         winner, fault_side, story = make_rally_end(rng, reason, server)
         if f"team_to_serve_{winner}" not in have:
             continue
-        text = f"Rally {r} of {total} is over. " + story
-        queue.append({"kind": "whistle", "text": text + " Blow the whistle, then show the team to serve and the reason.",
-                      "scenario": r, "n_scenarios": total})
-        queue.append(make_pair_step(winner, reason, fault_side, text, scenario=r, n_scenarios=total))
+        text = f"Rally {r} of {total} is over. " + story + " Blow the whistle, then show the team to serve and the reason."
+        queue.append(make_pair_step(winner, reason, fault_side, text, scenario=r, n_scenarios=total, whistle=True,
+                                    commit="rally"))
         server = winner
     if "end_of_set" in have:
         end_text = "The set is over (practice set). Blow the whistle and signal the end of the set."
-        queue.append({"kind": "whistle", "text": end_text, "scenario": total, "n_scenarios": total})
         queue.append({"kind": "gesture", "label": "end_of_set", "text": end_text, "scenario": total,
-                      "n_scenarios": total})
+                      "n_scenarios": total, "whistle": True, "commit": "set_end"})
     return queue
 
 
 def add_whistle_steps(queue, choice):
-    """Optional: Team to Serve and Service Authorization must be preceded by the whistle (FIVB 22.2)."""
+    """Optional: Team to Serve and Service Authorization start with the whistle (FIVB 22.2). The whistle is part of
+    the same step: blow it, then give the signal right away, like in a match."""
     if not choice.get("whistle"):
         return queue
     out = []
     for st in queue:
         first = st.get("label") or (st.get("labels") or [""])[0]
         if st["kind"] in ("gesture", "pair") and needs_whistle(first):
-            out.append({"kind": "whistle", "text": WHISTLE_NOTE})
-            if st.get("repeat"):
-                st = dict(st, loop_to=len(out) - 1)
+            st = dict(st, whistle=True)
         out.append(st)
     return out
 
@@ -573,7 +616,13 @@ class Session:
 
         self.whistle_required = bool(choice.get("whistle")) and self.mode in ("drill", "combo", "challenge")
         self.queue = build_queue(self.mode, choice, backend.real_labels, self.rng)
-        self.uses_whistle = self.mode == "sim" or any(q["kind"] == "whistle" for q in self.queue)
+        self.uses_whistle = self.mode == "sim" or any(q["kind"] == "whistle" or q.get("whistle") for q in self.queue)
+        self.continuous = self.mode == "sim" and bool(choice.get("continuous"))
+        self.serving = None             # match simulation: the team serving right now ("left" / "right", the trainee's side)
+        self.commit = None              # the "committed" message shown at the bottom after a call (match simulation)
+        self.commit_log = []
+        self.whistle_state = None
+        self._whistle_seen = False
         self.step_i = 0
         self.phase = "practice" if self.mode == "practice" else "intro"
         self.phase_t0 = 0.0
@@ -588,11 +637,18 @@ class Session:
         self.attempt_results = []       # parallel to attempts: AttemptResult (gestures) or None (whistle)
         self.review_i = None
         self.reps = int(choice.get("reps", 1) or 1)
-        self.auto = self.mode in ("combo", "challenge") or (self.mode == "drill" and self.reps > 1)
+        self.auto = (self.mode in ("combo", "challenge") or (self.mode == "drill" and self.reps > 1)
+                     or self.continuous)
         self.t_intro, self.t_result, self.t_countdown = TIMINGS.get(self.mode, (2.5, 3.0, COUNTDOWN_SECONDS))
         self.cd_seconds = self.t_countdown
         self.cap_seconds = CAPTURE_SECONDS
         self._ref_cache = {}
+        self.sleep = time.sleep
+        self._last_ui = None
+        self.camera_lost = False
+        self.error = None
+        self.error_trace = ""
+        self.perf = {"frame_ms": [], "extract_ms": [], "classify_ms": [], "grade_ms": [], "cpu_proc": [], "cpu_sys": [], "ram_mb": []}
         self.results = []               # AttemptResult per signal of the current step (1, or 2 for a pair)
         self.attempt_no = 0
         self.auto_go = False            # becomes True after the trainee presses SPACE once
@@ -624,6 +680,17 @@ class Session:
         self.phase = phase
         self.phase_t0 = self.clock()
 
+    def _intro_seconds(self, step):
+        """Continuous match simulation: long enough to read the narration."""
+        if self.continuous:
+            return min(9.0, max(4.0, len(step.get("text", "")) / 14.0))
+        return self.t_intro
+
+    def _sync_serving(self):
+        st = self.step
+        if st is not None and st.get("commit") == "serve":
+            self.serving = st["side"]
+
     def _begin_step(self):
         """Start the current step: the whistle wait, or the countdown before a signal."""
         step = self.step
@@ -644,6 +711,7 @@ class Session:
         if self.step_i >= len(self.queue):
             self._finish()
             return
+        self._sync_serving()
         nxt = self.step
         if step is not None and step["kind"] == "whistle" and nxt["kind"] in ("gesture", "pair"):
             # the signal follows the whistle right away (FIVB 22.2.3)
@@ -666,16 +734,18 @@ class Session:
         self.review_i = idxs[(cur + delta) % len(idxs)]
 
     # ---- attempt logging ----
-    def _log_attempt(self, step, res=None, whistle_ok=None):
+    def _log_attempt(self, step, res=None, whistle_ok=None, whistle_state=None):
         kind = step["kind"]
         if kind == "whistle":
-            verdict = gg.VERDICT_CORRECT if whistle_ok else gg.VERDICT_INCORRECT
-            pts = 10 if whistle_ok else 0
+            state = whistle_state or ("ok" if whistle_ok else "none")
+            verdict = {"ok": gg.VERDICT_CORRECT, "late": gg.VERDICT_ALMOST, "none": gg.VERDICT_INCORRECT}[state]
+            pts = {"ok": 10, "late": 5, "none": 0}[state]
+            fb = {"ok": "", "late": "The whistle came after you started the signal. Blow it first (FIVB 22.2).",
+                  "none": "No whistle detected."}[state]
             row = {"ph_time": now_ph_str(), "kind": "whistle", "target": "whistle", "level": self.level,
-                   "verdict": verdict, "score": 100 if whistle_ok else 0, "points": pts, "best_prob": "",
+                   "verdict": verdict, "score": pts * 10, "points": pts, "best_prob": "",
                    "margin": "", "hold_s": "", "confused_with": "", "failed_checks": "", "check_values": "",
-                   "intent": self.intent, "note": self.note,
-                   "feedback": "" if whistle_ok else "No whistle detected in time."}
+                   "intent": self.intent, "note": self.note, "feedback": fb}
         else:
             failed = [c.id for c in res.checks if c.status == "fail"]
             row = {"ph_time": now_ph_str(), "kind": "gesture", "target": step["label"], "level": self.level,
@@ -692,7 +762,21 @@ class Session:
             self.max_points += 10
             self.attempts.append(row)
             self.attempt_results.append(res if kind == "gesture" else None)
+            self._append_csv(row)
         return row
+
+    def _append_csv(self, row):
+        """Every counted attempt is written to attempts.csv at once, so a crash later cannot lose it."""
+        try:
+            path = os.path.join(self.dir, "attempts.csv")
+            new = not os.path.exists(path)
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=CSV_COLS)
+                if new:
+                    w.writeheader()
+                w.writerow(row)
+        except OSError:
+            pass
 
     def _make_summary(self):
         att = self.attempts
@@ -716,6 +800,22 @@ class Session:
                 "team_points": dict(self.team) if self.mode == "sim" else None, "one_line": one}
 
     # ---- main loop ----
+    def _show_banner(self, text):
+        img = self._last_ui.copy() if self._last_ui is not None else np.zeros((UI_H, UI_W, 3), np.uint8)
+        panel(img, 0, TOP_H + 200, UI_W, TOP_H + 300, C_AMBER, 0.92)
+        put(img, text, 40, TOP_H + 262, 0.85, (20, 20, 20), 2)
+        self._show(img)
+
+    def _sample_system(self, proc):
+        if proc is None:
+            return
+        try:
+            self.perf["cpu_proc"].append(proc.cpu_percent(interval=None))
+            self.perf["cpu_sys"].append(psutil.cpu_percent(interval=None))
+            self.perf["ram_mb"].append(proc.memory_info().rss / (1024 * 1024))
+        except Exception:
+            pass
+
     def run(self):
         os.makedirs(self.dir, exist_ok=True)
         writer = cv2.VideoWriter(os.path.join(self.dir, "session.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
@@ -725,13 +825,35 @@ class Session:
             self.whistle.start()
         if self.queue and self.mode != "practice":
             self._set_phase("intro")
+            self._sync_serving()
+        proc = psutil.Process() if psutil else None
+        if proc is not None:
+            try:
+                proc.cpu_percent(interval=None)
+                psutil.cpu_percent(interval=None)
+            except Exception:
+                proc = None
+        last_sample = time.perf_counter()
+        fails = 0
 
         try:
             while True:
                 ok, frame = self.be.cap.read()
                 if not ok:
-                    self.banner = "Camera stopped."
-                    break
+                    fails += 1                       # camera stopped: try to reconnect, then give up cleanly
+                    self._show_banner("Camera disconnected. Trying to reconnect...  (Q to stop)")
+                    if fails % CAMERA_RETRY_EVERY == 0:
+                        try:
+                            self.be.reopen_camera(self.be.cam_index)
+                        except Exception:
+                            pass
+                    if self._key() in (27, ord("q")) or fails * CAMERA_RETRY_SLEEP >= CAMERA_LOST_SECONDS:
+                        self.camera_lost = True
+                        break
+                    self.sleep(CAMERA_RETRY_SLEEP)
+                    continue
+                fails = 0
+                t_frame = time.perf_counter()
                 if INPUT_ALREADY_MIRRORED:
                     frame = cv2.flip(frame, 1)
                 self.aspect = frame.shape[0] / max(1, frame.shape[1])
@@ -741,12 +863,16 @@ class Session:
                 feats = np.zeros(122)
                 rec = None
                 if not self.paused:
+                    t0 = time.perf_counter()
                     feats = self.be.extract(frame)
+                    self.perf["extract_ms"].append((time.perf_counter() - t0) * 1000.0)
                     self.rolling.append(feats)
                     self.frame_counter += 1
                     if (self.phase in ("practice", "capture") and len(self.rolling) == ROLLING_WINDOW_FRAMES
                             and self.frame_counter % INFERENCE_EVERY_N_FRAMES == 0):
+                        t0 = time.perf_counter()
                         label, _conf, probs = self.be.classify(list(self.rolling))
+                        self.perf["classify_ms"].append((time.perf_counter() - t0) * 1000.0)
                         rec = {"label": label, "probs": np.array(probs, dtype=float),
                                "frames": np.array(self.rolling), "t": t}
                         self.last_rec = rec
@@ -755,22 +881,64 @@ class Session:
                     feats = np.array(self.rolling[-1]) if self.rolling else feats
 
                 ui = self._render(frame, feats, t)
+                self._last_ui = ui
                 writer.write(ui)
                 self._show(ui)
                 key = self._key()
+                self.perf["frame_ms"].append((time.perf_counter() - t_frame) * 1000.0)
+                if time.perf_counter() - last_sample >= 2.0:
+                    last_sample = time.perf_counter()
+                    self._sample_system(proc)
                 if self._handle_key(key):
                     break
                 if self.phase == "done":
                     break
+        except Exception as exc:                    # never lose the results already recorded
+            self.error = exc
+            self.error_trace = traceback.format_exc()
         finally:
-            writer.release()
+            try:
+                writer.release()
+            except Exception:
+                pass
             if self.uses_whistle:
-                self.whistle.stop()
+                try:
+                    self.whistle.stop()
+                except Exception:
+                    pass
 
         if self.summary is None:
             self.summary = self._make_summary()
-        self._save_outputs()
+        self.summary["performance"] = self._performance()
+        self.summary["camera_lost"] = self.camera_lost
+        self.summary["error"] = repr(self.error) if self.error else ""
+        try:
+            self._save_outputs()
+        except Exception:
+            self.error_trace += "\n" + traceback.format_exc()
         return self.summary
+
+    def _performance(self):
+        """Measured speed and load of THIS session (for the performance items of the expert form)."""
+        def mean(x):
+            return sum(x) / len(x) if x else 0.0
+
+        fm = self.perf["frame_ms"]
+        q = max(1, len(fm) // 4)
+        fps = lambda ms: (1000.0 / mean(ms)) if ms else 0.0
+        return {"frames": len(fm), "seconds": round(sum(fm) / 1000.0, 1), "fps_mean": round(fps(fm), 1),
+                "fps_first_quarter": round(fps(fm[:q]), 1), "fps_last_quarter": round(fps(fm[-q:]), 1),
+                "frame_ms_mean": round(mean(fm), 1), "frame_ms_max": round(max(fm), 1) if fm else 0.0,
+                "extract_ms_mean": round(mean(self.perf["extract_ms"]), 1),
+                "classify_ms_mean": round(mean(self.perf["classify_ms"]), 1),
+                "grade_ms_mean": round(mean(self.perf["grade_ms"]), 1),
+                "grade_ms_max": round(max(self.perf["grade_ms"]), 1) if self.perf["grade_ms"] else 0.0,
+                "psutil": psutil is not None,
+                "cpu_process_mean_pct": round(mean(self.perf["cpu_proc"]), 1),
+                "cpu_process_max_pct": round(max(self.perf["cpu_proc"]), 1) if self.perf["cpu_proc"] else 0.0,
+                "cpu_system_mean_pct": round(mean(self.perf["cpu_sys"]), 1),
+                "ram_mean_mb": round(mean(self.perf["ram_mb"]), 1),
+                "ram_max_mb": round(max(self.perf["ram_mb"]), 1) if self.perf["ram_mb"] else 0.0}
 
     # ---- state machine ----
     def _update(self, t, feats, rec):
@@ -786,7 +954,7 @@ class Session:
                 self.practice_checks = (gg.grade_form_only(self.stable_label, rec["frames"], self.level, self.aspect)
                                         if self.stable_label in gg.RULES else [])
         elif self.phase == "intro":
-            if self.auto and self.auto_go and step is not None and t - self.phase_t0 >= self.t_intro:
+            if self.auto and self.auto_go and step is not None and t - self.phase_t0 >= self._intro_seconds(step):
                 self._begin_step()
         elif self.phase == "result":
             if self.auto and t - self.phase_t0 >= self.t_result:
@@ -798,12 +966,20 @@ class Session:
             if t - self.phase_t0 >= self.cd_seconds:
                 self.cap_frames, self.cap_records = [], []
                 self.cap_seconds = CAPTURE_SECONDS_PAIR if step is not None and step["kind"] == "pair" else CAPTURE_SECONDS
+                if step is not None and step.get("whistle"):
+                    self.cap_seconds += WHISTLE_EXTRA_SECONDS
+                self._whistle_seen = False
+                self.whistle_state = None
                 self._set_phase("capture")
         elif self.phase == "capture":
             self.cap_frames.append(feats)
             if rec is not None:
                 rec["end"] = len(self.cap_frames)      # frame index in the capture where this window ends
                 self.cap_records.append(rec)
+            if step is not None and step.get("whistle") and not self._whistle_seen:
+                if self.whistle.first_since(self.phase_t0) is not None:
+                    self._whistle_seen = True
+                    self.whistle_flash_until = t + 1.0
             if t - self.phase_t0 >= self.cap_seconds:
                 self._grade_current()
         elif self.phase == "wait_whistle":
@@ -816,6 +992,7 @@ class Session:
                 self._advance()
 
     def _grade_current(self):
+        t_grade = time.perf_counter()
         step = self.step
         recs = self.cap_records
         step_s = 0.3
@@ -832,13 +1009,73 @@ class Session:
             results = [gg.grade_attempt(step["label"], self.cap_frames, recs, self.be.label_to_idx,
                                         level=self.level, aspect=self.aspect, step_seconds=step_s, context=step.get("ctx"))]
         self.results, self.result = results, results[0]
+        self.perf["grade_ms"].append((time.perf_counter() - t_grade) * 1000.0)
+        if step["kind"] == "pair" and step.get("winner"):
+            self.serving = step["winner"]           # the story is the truth: the winner serves next
+        # the whistle: heard during this capture, and before the first signal started?
+        self.whistle_state = None
+        if step.get("whistle"):
+            wt = self.whistle.first_since(self.phase_t0)
+            onset = next((r["t"] - WHISTLE_ONSET_OFFSET for r in recs if r["label"] == labels[0]), None)
+            if wt is None:
+                self.whistle_state = "none"
+            elif onset is None or wt <= onset + WHISTLE_TOLERANCE:
+                self.whistle_state = "ok"
+            else:
+                self.whistle_state = "late"
         self._save_attempt_npz(labels, ctxs, results, step_s)
         if not any(r.verdict == gg.VERDICT_NO_READING for r in results):
+            if self.whistle_state is not None:
+                self._log_attempt({"kind": "whistle"}, whistle_state=self.whistle_state)
             for label, res in zip(labels, results):
                 self._log_attempt({"kind": "gesture", "label": label}, res=res)
-                if (self.mode == "sim" and res.verdict == gg.VERDICT_CORRECT and label.startswith("team_to_serve_")):
+                if (self.mode == "sim" and res.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST)
+                        and label.startswith("team_to_serve_")):        # a close call still counts
                     self.team[label.rsplit("_", 1)[1]] += 1
+            if self.mode == "sim":
+                self.commit = self._make_commit(step, labels, results)
+                self.commit_log.append(f"{self.commit['title']}: {self.commit['lines'][0]}")
+                del self.commit_log[:-3]
         self._set_phase("result")
+
+    def _make_commit(self, step, labels, results):
+        """The message a scoreboard would show after the call (match simulation): what was committed, or why not.
+        A close call (ALMOST) is committed too; it does not have to be perfect."""
+        a, b = self.team["left"], self.team["right"]
+        score = f"Score: LEFT {a} - {b} RIGHT."
+        wl = {"ok": "Whistle: on time.", "late": "Whistle: heard, but after the signal started.",
+              "none": "Whistle: not heard."}.get(self.whistle_state)
+        expected = "Correct call: " + self._step_names(step) + "."
+        passes = lambda r: r.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST)
+        close = lambda r: " (close, not perfect)" if r.verdict == gg.VERDICT_ALMOST else ""
+        if step["kind"] == "pair":
+            W = _side_word(step["winner"])
+            if passes(results[0]):
+                title, ok = "COMMITTED", True
+                lines = [f"Point to the team on your {W}{close(results[0])}. {score}",
+                         f"The team on your {W} serves next. Reason: {gg.short_label(labels[1])}"
+                         + ("." if results[1].verdict != gg.VERDICT_INCORRECT else " (not confirmed).")]
+            else:
+                title, ok = "NOT COMMITTED", False
+                lines = ["Your call was not clear or not correct, so no point was recorded.", expected]
+        elif step.get("commit") == "serve":
+            W = _side_word(step["side"])
+            if passes(results[0]):
+                title, ok = "SERVE AUTHORISED", True
+                lines = [f"The team on your {W} may serve{close(results[0])}.", score]
+            else:
+                title, ok = "NOT AUTHORISED", False
+                lines = ["The authorisation was not clear or not correct.", expected]
+        else:
+            if passes(results[0]):
+                title, ok = "SET ENDED", True
+                lines = [f"Final {score}{close(results[0])}", "The set is finished."]
+            else:
+                title, ok = "NOT COMMITTED", False
+                lines = ["The end of set signal was not clear or not correct.", expected]
+        if wl:
+            lines.append(wl)
+        return {"ok": ok, "title": title, "lines": lines}
 
     def _save_attempt_npz(self, labels, ctxs, results, step_s):
         """Keeps the real movement of every attempt so thresholds can be re-checked later without redoing it
@@ -959,11 +1196,13 @@ class Session:
             right = f"Score {self.points}/{self.max_points}   Accuracy {acc:.0f}%"
         x = UI_W - tw(right, 0.7, 2) - 20
         put(ui, right, x, 36, 0.7, C_TEXT, 2)
-        if self.auto and self.queue and self.phase != "summary":
+        if self.auto and self.queue and self.phase != "summary" and self.mode != "sim":
             prog = f"Attempt {min(self.step_i + 1, len(self.queue))}/{len(self.queue)}"
             put(ui, prog, x - tw(prog, 0.6, 1) - 40, 36, 0.6, C_AMBER, 1)
         if self.mode == "sim":
-            team = f"Team on your LEFT {self.team['left']}  -  {self.team['right']} RIGHT"
+            team = f"LEFT {self.team['left']} - {self.team['right']} RIGHT"
+            if self.serving:
+                team += f"    Serving: {self.serving.upper()}"
             put(ui, team, x - tw(team, 0.6, 1) - 40, 36, 0.6, C_AMBER, 1)
 
     def _draw_disclaimer(self, ui, x, w, y_bottom=UI_H - 10):
@@ -1015,11 +1254,30 @@ class Session:
             return " then ".join(gg.pretty_label(l) for l in step["labels"])
         return gg.pretty_label(step["label"])
 
+    def _draw_commit(self, ui, by, bw, bh):
+        """Game-style message after a call, like a scoreboard: what was committed, or why not."""
+        c = self.commit
+        color = C_GREEN if c["ok"] else C_RED
+        cv2.rectangle(ui, (0, by), (12, by + bh), color, -1)
+        put(ui, c["title"], 28, by + 40, 1.0, color, 3)
+        yy = by + 70
+        shown = 0
+        for k, line in enumerate(c["lines"]):
+            for wl in wrap(line, bw - 60, 0.58):
+                if shown >= 3:
+                    return
+                put(ui, wl, 28, yy, 0.58, C_TEXT if k < 2 else C_MUTED, 1)
+                yy += 24
+                shown += 1
+
     def _draw_bottom(self, ui, t):
         bx, by, bw, bh = BOTTOM_BOX
         panel(ui, bx, by, bx + bw, by + bh, C_PANEL2)
         step = self.step
         y = by + 32
+        sim = self.mode == "sim"
+        whistle = step is not None and bool(step.get("whistle"))
+        two = step is not None and step["kind"] == "pair"
         if self.phase == "practice":
             put(ui, "Do any signal. The system will tell you which one it sees.", 20, y, 0.65, C_TEXT, 1)
             lab = self.stable_label
@@ -1030,18 +1288,26 @@ class Session:
             self._draw_intro_bottom(ui, by, bw, y, step)
         elif self.phase == "countdown":
             put(ui, "Get into the ready position: arms relaxed, facing the camera.", 20, y, 0.65, C_TEXT, 1)
-            two = step is not None and step["kind"] == "pair"
-            put(ui, ("Show the first signal at GO, hold about 2 s, then go straight into the second."
-                     if two else "Perform the signal when you see GO, hold it, then lower your arms."),
-                20, y + 28, 0.58, C_MUTED, 1)
+            if whistle:
+                msg = "At GO: blow the whistle, then give the signal right away."
+            elif two:
+                msg = "Show the first signal at GO, hold about 2 s, then go straight into the second."
+            else:
+                msg = "Perform the signal when you see GO, hold it, then lower your arms."
+            put(ui, msg, 20, y + 28, 0.58, C_MUTED, 1)
             if step is not None and step.get("text"):
                 for i, line in enumerate(wrap(step["text"], bw - 40, 0.52)[:2]):
                     put(ui, line, 20, y + 58 + i * 21, 0.52, C_TEXT, 1)
         elif self.phase == "capture":
-            two = step is not None and step["kind"] == "pair"
-            put(ui, ("Team to serve, hold 2 s, then go straight into the reason."
-                     if two else "Perform the signal now. Hold it steady, then lower your arms."),
-                20, y, 0.62, C_GREEN, 2)
+            if whistle and two:
+                msg = "Whistle, team to serve (hold 2 s), then the reason."
+            elif whistle:
+                msg = "Blow the whistle, then give the signal and hold it."
+            elif two:
+                msg = "Team to serve, hold 2 s, then go straight into the reason."
+            else:
+                msg = "Perform the signal now. Hold it steady, then lower your arms."
+            put(ui, msg, 20, y, 0.62, C_GREEN, 2)
             if step is not None and step.get("text"):
                 for i, line in enumerate(wrap(step["text"], bw - 40, 0.52)[:2]):
                     put(ui, line, 20, y + 32 + i * 21, 0.52, C_TEXT, 1)
@@ -1052,45 +1318,58 @@ class Session:
                 for i, line in enumerate(wrap(step["text"], bw - 40, 0.52)[:3]):
                     put(ui, line, 20, y + 32 + i * 21, 0.52, C_TEXT, 1)
         elif self.phase == "result" and self.results:
-            notes = [r.note for r in self.results if r.note]
-            msg = notes[0] if notes else "Check the panel on the right for details."
-            if step is not None and step["kind"] == "pair":
-                msg += "   Correct call: " + self._step_names(step) + "."
-            elif self.mode == "sim" and step is not None and step["kind"] == "gesture":
-                msg += "   Correct call: " + self._step_names(step) + "."
-            if self.auto:
-                msg += "  The next step starts automatically; every score is listed at the end."
-            for i, line in enumerate(wrap(msg, bw - 40, 0.55)[:3]):
-                put(ui, line, 20, y + i * 24, 0.55, C_TEXT, 1)
+            if sim and self.commit:
+                self._draw_commit(ui, by, bw, bh)
+            else:
+                notes = [r.note for r in self.results if r.note]
+                msg = notes[0] if notes else "Check the panel on the right for details."
+                if step is not None and (two or (sim and step["kind"] == "gesture")):
+                    msg += "   Correct call: " + self._step_names(step) + "."
+                if self.auto:
+                    msg += "  The next step starts automatically; every score is listed at the end."
+                for i, line in enumerate(wrap(msg, bw - 40, 0.55)[:3]):
+                    put(ui, line, 20, y + i * 24, 0.55, C_TEXT, 1)
+        if sim and self.commit_log and self.phase in ("intro", "countdown", "capture"):
+            put(ui, "Last: " + fit(self.commit_log[-1], bw - 70, 0.46), 20, by + bh - 34, 0.46, C_MUTED, 1)
+        if self.continuous and self.auto_go:
+            start_keys = "Continuous: the next step starts by itself"
+        else:
+            start_keys = "SPACE start" + ("  (then it runs by itself)" if self.continuous else "")
         keys = {"practice": "Q end practice   P pause   M mirror   T theme",
-                "intro": "SPACE start   Q end session   M mirror   T theme" + ("   H hint" if self.mode == "sim" else ""),
-                "result": "SPACE next" + ("   R retry" if self.mode == "drill" and not self.auto else "") + "   Q end session",
+                "intro": start_keys + "   Q end session   M mirror   T theme" + ("   H hint" if sim else ""),
+                "result": ("Continuous: next step in a moment" if self.continuous else "SPACE next")
+                          + ("   R retry" if self.mode == "drill" and not self.auto else "") + "   Q end session",
                 "countdown": "Q end session", "capture": "Q end session",
                 "wait_whistle": "W = manual whistle   Q end session", "whistle_result": ""}.get(self.phase, "")
+        if self.phase in ("capture", "countdown") and whistle:
+            keys = "W = manual whistle   Q end session"
         put(ui, keys, 20, by + bh - 14, 0.5, C_MUTED, 1)
 
     def _draw_intro_bottom(self, ui, by, bw, y, step):
-        lines = wrap(step["text"], bw - 40, 0.56)[:3] if step.get("text") else []
+        sim = self.mode == "sim"
+        sc, lh = (0.68, 26) if sim else (0.56, 23)
+        lines = wrap(step["text"], bw - 40, sc)[:3] if step.get("text") else []
         for i, line in enumerate(lines):
-            put(ui, line, 20, y + i * 23, 0.56, C_TEXT, 1)
-        cur = y + 23 * len(lines) + (4 if lines else 0)
+            put(ui, line, 20, y + i * lh, sc, C_TEXT, 1)
+        cur = y + lh * len(lines) + (4 if lines else 0)
         if step["kind"] == "whistle":
             msg = "Step: blow the whistle." if not lines else "Then: blow the whistle."
-            prompt = None
         elif step["kind"] == "pair":
             msg = (f"Signals: {self._step_names(step)}" if self._reveal()
-                   else "Give the team to serve, then the reason. Press H for a hint.")
-        elif self.mode == "sim":
-            msg = (f"Signal needed: {self._step_names(step)}" if self._reveal()
-                   else "Give the correct signal. Press H for a hint.")
+                   else "Give the team to serve, then the reason.")
+        elif sim:
+            msg = (f"Signal needed: {self._step_names(step)}" if self._reveal() else "Give the correct signal.")
         elif self.mode == "challenge":
             msg = f"Signal {self.step_i + 1} of {len(self.queue)}: {self._step_names(step)}. One attempt each."
         elif self.auto:
             msg = f"Repetition {step.get('rep', 1)} of {step.get('n_reps', 1)}"
         else:
             msg = "Read the card on the right, then press SPACE when you are ready."
-        put(ui, msg, 20, cur + 18, 0.6, C_AMBER, 1)
-        if self.auto:
+        if step.get("whistle") and not sim:
+            msg += "   (blow the whistle first)"
+        if cur + 18 <= by + BOTTOM_BOX[3] - 36:
+            put(ui, msg, 20, cur + 18, 0.6, C_AMBER, 1)
+        if self.auto and cur + 42 <= by + BOTTOM_BOX[3] - 36:
             prompt = "Get ready..." if self.auto_go else "Press SPACE to start. The steps then run automatically."
             put(ui, prompt, 20, cur + 42, 0.52, C_MUTED, 1)
 
@@ -1110,10 +1389,14 @@ class Session:
                 for i, line in enumerate(wrap("Blow the whistle first, or press W. In a match the whistle comes before "
                                               "the signal (FIVB 22.2).", w, 0.55)):
                     put(ui, line, x0 + pad, y + 34 + i * 22, 0.55, C_TEXT, 1)
-            elif step["kind"] == "pair":
-                self._draw_side_pair_card(ui, x0 + pad, y, w, step)
             else:
-                self._draw_side_card(ui, x0 + pad, y, w, step)
+                if step.get("whistle"):
+                    put(ui, "1. Blow the whistle   2. Signal", x0 + pad, y - 6, 0.55, C_AMBER, 2)
+                    y += 34
+                if step["kind"] == "pair":
+                    self._draw_side_pair_card(ui, x0 + pad, y, w, step)
+                else:
+                    self._draw_side_card(ui, x0 + pad, y, w, step)
         elif self.phase in ("wait_whistle", "whistle_result"):
             ok = getattr(self, "whistle_ok", None)
             put(ui, "WHISTLE", x0 + pad, y, 0.85, C_AMBER, 2)
@@ -1129,7 +1412,17 @@ class Session:
                 self._draw_side_pair_result(ui, x0 + pad, y, w)
             else:
                 self._draw_side_result(ui, x0 + pad, y, w)
+            self._draw_whistle_result(ui, x0 + pad)
             self._draw_disclaimer(ui, x0 + pad, w)
+
+    def _draw_whistle_result(self, ui, x):
+        state = self.whistle_state
+        if state is None:
+            return
+        text, color = {"ok": ("Whistle: on time. +10 points", C_GREEN),
+                       "late": ("Whistle: heard, but after you started. Blow it first. +5 points", C_AMBER),
+                       "none": ("Whistle: not heard. 0 points", C_RED)}[state]
+        put(ui, fit(text, SIDE_W - 36, 0.44), x, UI_H - 70, 0.44, color, 1)
 
     def _draw_side_card(self, ui, x, y, w, step):
         label = step["label"]
@@ -1156,7 +1449,16 @@ class Session:
                     for j, line in enumerate(wrap(f"{i}. {stp}", w, 0.46)):
                         y += 18
                         put(ui, line, x, y, 0.46, C_MUTED if j else C_TEXT, 1)
-            if not compact and s.get("not_graded"):
+            if not compact and label in gg.RULES and self.phase in ("intro", "countdown"):
+                y += 26
+                put(ui, "What is checked", x, y, 0.5, C_BLUE, 1)
+                for it in gg.graded_summary(label):
+                    y += 17
+                    mark = {"Required": "R", "Important": "I", "Scored": "S"}[it["effect"]]
+                    put(ui, fit(f"[{mark}] {it['label']}", w, 0.4), x, y, 0.4, C_TEXT if mark != "S" else C_MUTED, 1)
+                y += 16
+                put(ui, "R required  I important  S scored.  100 is not needed.", x, y, 0.38, C_MUTED, 1)
+            if not compact and s.get("not_graded") and y < UI_H - 120:
                 y += 24
                 put(ui, "Not graded by the camera", x, y, 0.43, C_AMBER, 1)
                 for line in wrap(s["not_graded"], w, 0.42):
@@ -1194,7 +1496,17 @@ class Session:
         if self.phase == "capture":
             self._draw_pair_meter(ui, x, UI_H - 170, w, step)
 
+    def _draw_whistle_row(self, ui, x, y):
+        step = self.step
+        if step is None or not step.get("whistle"):
+            return
+        heard = self._whistle_seen or self.whistle.first_since(self.phase_t0) is not None
+        draw_icon(ui, "pass" if heard else "unverified", x + 8, y + 8, 8)
+        put(ui, "Whistle heard" if heard else "Waiting for the whistle (or press W)", x + 26, y + 14, 0.5,
+            C_GREEN if heard else C_AMBER, 1)
+
     def _draw_pair_meter(self, ui, x, y, w, step):
+        self._draw_whistle_row(ui, x, y - 32)
         labels = [r["label"] for r in self.cap_records]
         for k, lab in enumerate(step["labels"]):
             seen = lab in labels
@@ -1208,6 +1520,7 @@ class Session:
         bar(ui, x, y + 96, w, 8, left / self.cap_seconds, C_BLUE)
 
     def _draw_capture_meter(self, ui, x, y, w, target):
+        self._draw_whistle_row(ui, x, y - 34)
         rec = self.last_rec
         p = float(rec["probs"][self.be.label_to_idx[target]]) if rec is not None else 0.0
         seen = gg.short_label(rec["label"]) if rec is not None and rec["label"] != gg.NOTHING_LABEL else "nothing yet"
@@ -1231,14 +1544,20 @@ class Session:
                     draw_icon(ui, c.status, x + 8, yy + 6, 6)
                     put(ui, fit(c.label, w - 26, 0.42), x + 22, yy + 10, 0.42, C_TEXT if c.status == "pass" else C_MUTED, 1)
                     yy += 18
-            for line_src in r.feedback[:2]:
-                for j, line in enumerate(wrap(line_src, w, 0.44)[:2]):
-                    put(ui, ("- " if j == 0 else "  ") + line, x, yy + 12, 0.44, C_AMBER, 1)
+            _heading, items = feedback_view(r)
+            shown = 0
+            for text, kind in items:
+                if kind == "cam" or shown >= 2:
+                    continue
+                shown += 1
+                for j, line in enumerate(wrap(text, w, 0.44)[:2]):
+                    put(ui, ("- " if (j == 0 and kind == "tip") else "") + line, x, yy + 12, 0.44,
+                        C_GREEN if kind == "ok" else C_AMBER, 1)
                     yy += 17
             y = max(yy + 26, y + 150)
             cv2.line(ui, (x, y - 16), (x + w, y - 16), C_LINE, 1)
         for i, line in enumerate(wrap("Correct call: " + self._step_names(step), w, 0.42)[:2]):
-            put(ui, line, x, min(y + 6 + i * 16, UI_H - 62), 0.42, C_MUTED, 1)
+            put(ui, line, x, min(y + 6 + i * 16, UI_H - 78), 0.42, C_MUTED, 1)
 
     def _draw_side_result(self, ui, x, y, w, r=None):
         r = r or self.result
@@ -1249,7 +1568,9 @@ class Session:
                 put(ui, line, x, y + 50 + i * 22, 0.55, C_TEXT, 1)
             return
         put(ui, f"Score {r.score}/100   +{r.points} pts", x, y + 40, 0.65, C_TEXT, 2)
-        y += 64
+        cut = gg.LEVEL_CONFIG[r.level].correct_cut
+        put(ui, fit(f"Counts as CORRECT from {cut}. 100 is not needed.", w, 0.42), x, y + 58, 0.42, C_MUTED, 1)
+        y += 72
         rows = [("Recognition", r.parts["recognition"], gg.W_RECOGNITION), ("Distinctness", r.parts["distinctness"], gg.W_DISTINCT),
                 ("Hold", r.parts["hold"], gg.W_HOLD), ("FIVB form", r.parts["form"], gg.W_FORM),
                 ("Ready pos.", r.parts["ready_position"], gg.W_READY)]
@@ -1266,13 +1587,17 @@ class Session:
             put(ui, fit(c.label, w - 30, 0.45), x + 24, y + 12, 0.45, C_TEXT if c.status == "pass" else C_MUTED, 1)
             y += 21
         y += 10
-        put(ui, "How to improve", x, y + 8, 0.5, C_AMBER, 1)
-        y += 20
-        for line_src in r.feedback[:4]:
-            for j, line in enumerate(wrap(line_src, w, 0.46)):
-                if y > UI_H - 62:
+        heading, items = feedback_view(r)
+        if heading:
+            put(ui, heading, x, y + 8, 0.5, C_AMBER, 1)
+            y += 20
+        for text, kind in items:
+            col = {"ok": C_GREEN, "tip": C_TEXT, "cam": C_MUTED}[kind]
+            for j, line in enumerate(wrap(text, w, 0.46 if kind != "cam" else 0.42)):
+                if y > UI_H - 78:
                     return
-                put(ui, ("- " if j == 0 else "  ") + line, x, y + 12, 0.46, C_TEXT, 1)
+                put(ui, ("- " if (j == 0 and kind == "tip") else "  " if kind == "tip" else "") + line, x, y + 12,
+                    0.46 if kind != "cam" else 0.42, col, 1)
                 y += 19
 
     def _draw_side_practice(self, ui, x, y, w):
@@ -1368,15 +1693,16 @@ class Session:
 
     # ---- outputs ----
     def _save_outputs(self):
-        cols = ["ph_time", "kind", "target", "level", "intent", "note", "verdict", "score", "points", "best_prob", "margin",
-                "hold_s", "confused_with", "failed_checks", "check_values", "feedback"]
         with open(os.path.join(self.dir, "attempts.csv"), "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
+            w = csv.DictWriter(f, fieldnames=CSV_COLS)
             w.writeheader()
             w.writerows(self.attempts)
         with open(os.path.join(self.dir, "summary.json"), "w", encoding="utf-8") as f:
             json.dump({**self.summary, "trainee_id": self.trainee["trainee_id"], "intent": self.intent, "note": self.note,
                        "consent_version": trainer_ui.CONSENT_VERSION}, f, indent=2)
+        if self.error_trace:
+            with open(os.path.join(self.dir, "error.log"), "w", encoding="utf-8") as f:
+                f.write(self.error_trace)
         write_report(os.path.join(self.dir, "report.html"), self.trainee, self.summary, self.attempts)
 
 
@@ -1393,6 +1719,17 @@ def write_report(path, trainee, summary, attempts):
     if summary.get("team_points"):
         t = summary["team_points"]
         team = f"<p><b>Scoreboard (from the trainee's correct calls):</b> team on your LEFT {t['left']} - {t['right']} RIGHT</p>"
+    p = summary.get("performance") or {}
+    perf_html = ""
+    if p:
+        perf_html = (f"<h2>Performance of this session</h2><p>{p.get('frames', 0)} frames in {p.get('seconds', 0)} s. "
+                     f"Speed {p.get('fps_mean', 0)} frames per second (first quarter {p.get('fps_first_quarter', 0)}, "
+                     f"last quarter {p.get('fps_last_quarter', 0)}). Per frame: feature extraction {p.get('extract_ms_mean', 0)} ms, "
+                     f"model {p.get('classify_ms_mean', 0)} ms per inference. Verdict computed in {p.get('grade_ms_mean', 0)} ms "
+                     f"(max {p.get('grade_ms_max', 0)} ms). "
+                     + (f"CPU of this program {p.get('cpu_process_mean_pct', 0)}% (max {p.get('cpu_process_max_pct', 0)}%) of one core, "
+                        f"whole computer {p.get('cpu_system_mean_pct', 0)}%, memory {p.get('ram_mean_mb', 0)} MB (max {p.get('ram_max_mb', 0)} MB)."
+                        if p.get("psutil") else "CPU and memory were not measured (install psutil).") + "</p>")
     doc = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Training report</title>
 <style>body{{font-family:Arial,sans-serif;margin:30px;background:#fafafa;color:#222}}
 table{{border-collapse:collapse;width:100%;margin-top:10px}}th,td{{border:1px solid #ccc;padding:6px 10px;font-size:14px;text-align:left}}
@@ -1405,6 +1742,7 @@ th{{background:#eee}}.box{{background:#fff;border:1px solid #ddd;border-radius:6
 <p style="color:#666;font-size:12px">Consent version {e(trainer_ui.CONSENT_VERSION)}. Grading is based on the FIVB referee hand signals as measured by a single 2D camera
 (see gesture_grader.py). CORRECT = 10 pts, ALMOST = 5 pts.</p>
 <p style="color:#666;font-size:12px"><b>{e(gg.DISCLAIMER)}</b></p></div>
+{perf_html}
 <h2>By signal</h2><table><tr><th>Signal</th><th>Correct</th><th>Avg score</th></tr>{per}</table>
 <h2>Attempts</h2><table><tr><th>Time</th><th>Target</th><th>Verdict</th><th>Score</th><th>Points</th><th>Hold (s)</th><th>Failed checks</th><th>Feedback</th></tr>{rows}</table>
 </body></html>"""
@@ -1441,11 +1779,20 @@ def main(argv=None):
         import device_setup
         device_setup.run_device_setup()
 
-    try:
-        backend = build_backend(args.camera)
-    except Exception as exc:
-        print(f"Could not start the recognition backend: {exc}")
-        return
+    while True:
+        try:
+            backend = build_backend(args.camera)
+            break
+        except Exception as exc:
+            print(f"Could not start the recognition backend: {exc}")
+            if not trainer_ui.ask_yes_no(
+                    "The tool could not start",
+                    "The camera or the recognition model could not be started, so nothing was recorded.\n\n"
+                    f"{exc}\n\nCheck that the camera is plugged in (or Camo is running) and that no other program is "
+                    "using it. Open the camera and microphone check to pick a camera and try again?"):
+                return
+            import device_setup
+            device_setup.run_device_setup()
     whistle = WhistleHub()
     whistle.device = trainer_ui.read_settings().get("mic_index")
     last_summary = ""
@@ -1463,7 +1810,9 @@ def main(argv=None):
                     backend.reopen_camera(pick_camera_index(args.camera, settings.get("camera_index") or 0))
                 except Exception as exc:
                     print(f"Could not reopen the camera: {exc}")
-                    return
+                    trainer_ui.show_message("Camera not available",
+                                           f"The camera could not be opened: {exc}\n\nChoose another camera under "
+                                           "Camera and mic, or check the connection.", error=True)
                 continue
             if choice["action"] in ("quit", "deleted"):
                 break
@@ -1475,6 +1824,14 @@ def main(argv=None):
             cv2.destroyAllWindows()
             for _ in range(3):
                 cv2.waitKey(1)
+            if summary.get("error"):
+                trainer_ui.show_message("Something went wrong",
+                                        "The session stopped because of an error. Everything recorded before it was "
+                                        "saved (see error.log in the session folder).\n\n" + summary["error"], error=True)
+            elif summary.get("camera_lost"):
+                trainer_ui.show_message("Camera stopped",
+                                        "The camera stopped working during the session and could not be reconnected. "
+                                        "Your results so far were saved. Check the camera, then start again.")
     finally:
         whistle.stop()
         backend.close()

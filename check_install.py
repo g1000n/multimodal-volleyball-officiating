@@ -25,6 +25,7 @@ ROOT_FILES = {
     "trainer_ui.py": "welcome, consent and menu screens",
     "gesture_grader.py": "the FIVB based grading rules",
     "devices.py": "camera and microphone helpers",
+    "progress.py": "the My progress summary",
     "device_setup.py": "camera and microphone check screen",
     "trainer_config.py": "your settings (email, camera, theme)",
     "live_deployment.py": "YOUR existing recognition code (used unchanged)",

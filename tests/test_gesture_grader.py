@@ -81,7 +81,7 @@ def seq(fn, n, mirror=False):
 
 # ---- pose generators: fn(i, mirror) -> frame ----
 
-def g_tts(side, deg=50, bend=False, fingers=None):
+def g_tts(side, deg=70, bend=False, fingers=None):
     def fn(i, m):
         e, w = straight_arm(side, deg)
         if bend:  # fold the forearm up so the elbow angle is ~100 deg
@@ -95,11 +95,11 @@ def g_tts(side, deg=50, bend=False, fingers=None):
     return fn
 
 
-def g_auth(side, moving=True, straight=False, fingers=None, drop=0.0):
+def g_auth(side, moving=True, straight=False, fingers=None, drop=0.0, amp=1.0):
     def fn(i, m):
         s = np.array(LS if side == "left" else RS)
         e = s + np.array([out_dir(side) * 0.10, 0.10])
-        sweep = 0.30 * SW * np.sin(i / 3.0) if moving else 0.0
+        sweep = amp * SW * np.sin(i / 3.0) if moving else 0.0
         w = e + np.array([out_dir(side) * 0.10 + out_dir(side) * sweep, -0.06 + drop])
         if straight:
             e, w = straight_arm(side, 60)
@@ -311,7 +311,14 @@ def test_ball_out():
     unseen = run(g_ball_out(fingers=None), "ball_out")     # hands not detected: NOT punished
     assert statuses(unseen)["hands_open"] == "unverified" and unseen.verdict == gg.VERDICT_CORRECT, unseen.feedback
     tucked = run(g_ball_out_tucked, "ball_out")
-    assert statuses(tucked)["arms_raised"] == "fail" and tucked.verdict != gg.VERDICT_CORRECT, tucked.feedback
+    # measured on the team's own attempts: elbows are usually kept near the body, so this only costs points by default
+    assert statuses(tucked)["arms_raised"] == "fail" and tucked.score < ok.score, tucked.feedback
+    assert tucked.verdict == gg.VERDICT_CORRECT and gg.ARMPITS_REQUIRED is False
+    gg.ARMPITS_REQUIRED = True
+    try:
+        assert run(g_ball_out_tucked, "ball_out").verdict != gg.VERDICT_CORRECT
+    finally:
+        gg.ARMPITS_REQUIRED = False
     one = run(g_ball_out(one_arm=True), "ball_out")
     assert statuses(one)["forearms_vertical"] == "fail" and one.verdict != gg.VERDICT_CORRECT
 
@@ -444,7 +451,70 @@ def test_end_of_set_hugging_low_is_wrong():
     ok = run(g_end(), "end_of_set")
     assert statuses(ok)["at_chest"] == "pass"
     low = run(g_end(low=0.16), "end_of_set")
-    assert statuses(low)["at_chest"] == "fail" and low.verdict != gg.VERDICT_CORRECT, low.feedback
+    assert statuses(low)["at_chest"] == "fail" and low.score < ok.score          # points are lost ...
+    assert low.verdict == gg.VERDICT_CORRECT                                     # ... but Standard still counts it
+    low_ref = run(g_end(low=0.16), "end_of_set", "referee")
+    assert low_ref.verdict != gg.VERDICT_CORRECT                                 # the strictest level caps it
+
+
+def test_end_of_set_overlapping_wrists_count_as_crossed():
+    def overlap(i, m):        # forearms lying on top of each other: the tracker puts both wrists near the middle
+        mid = 0.5
+        le = (LS[0] - 0.02, SH_Y + 0.14)
+        re = (RS[0] + 0.02, SH_Y + 0.14)
+        return frame(le, re, (mid + 0.015, SH_Y + 0.10), (mid - 0.015, SH_Y + 0.10),
+                     left_fingers=OPEN, right_fingers=OPEN, mirror=m)
+    for lv in gg.LEVELS:
+        r = run(overlap, "end_of_set", lv)
+        assert statuses(r)["forearms_crossed"] == "pass" and r.verdict == gg.VERDICT_CORRECT, (lv, r.feedback)
+    apart = run(g_end(cross=False), "end_of_set")          # hands side by side, not crossed
+    assert statuses(apart)["forearms_crossed"] == "fail" and apart.verdict != gg.VERDICT_CORRECT
+
+
+def test_close_attempts_still_pass_and_100_is_not_needed():
+    for lv in gg.LEVELS:
+        cfg = gg.LEVEL_CONFIG[lv]
+        assert cfg.correct_cut <= 90 and cfg.almost_cut < cfg.correct_cut       # 100 is never required
+    assert gg.LEVEL_CONFIG["standard"].correct_cut <= 75
+    r = run(g_tts("left", deg=70), "team_to_serve_left")
+    assert r.score < 100 or r.verdict == gg.VERDICT_CORRECT
+
+
+def test_team_to_serve_slightly_bent_arm_is_accepted():
+    def slightly_bent(i, m):        # about 150 degrees at the elbow: the camera cannot see a perfectly straight arm
+        s = np.array(LS)
+        d1 = np.array([np.sin(np.radians(50)), np.cos(np.radians(50))])
+        e = s + UP * d1
+        d2 = np.array([np.sin(np.radians(50 + 30)), np.cos(np.radians(50 + 30))])
+        w = e + FORE * d2
+        oe, ow = hanging("right")
+        return frame(e, oe, w, ow, mirror=m)
+    r = run(slightly_bent, "team_to_serve_left")
+    assert statuses(r)["arm_extended"] == "pass" and r.verdict == gg.VERDICT_CORRECT, r.feedback
+    clearly_bent = run(g_tts("left", bend=True), "team_to_serve_left")
+    assert statuses(clearly_bent)["arm_extended"] == "fail"
+
+
+def test_service_authorization_transition_through_team_to_serve_is_ignored():
+    """The sweep passes through Team to Serve like poses; that must not become 'looks like Team to Serve'."""
+    label_to_idx = {l: i for i, l in enumerate(sorted(gg.RULES))}
+    frames = np.array([idle()] * 12 + [g_auth("left")(i, False) for i in range(34)] + [idle()] * 10)
+    recs = []
+    for end in range(24, len(frames) + 1, 3):
+        share = np.mean([12 <= k < 46 for k in range(end - 24, end)])
+        probs = np.full(len(label_to_idx), 0.02)
+        lab = gg.NOTHING_LABEL
+        if share >= 0.5:
+            # the model calls the first windows Team to Serve and the later ones Authorization
+            lab = "team_to_serve_left" if end < 36 else "service_authorization_left"
+            probs[label_to_idx[lab]] = 0.9
+            probs[label_to_idx["service_authorization_left"]] = max(probs[label_to_idx["service_authorization_left"]], 0.8)
+        recs.append({"label": lab, "probs": probs, "frames": frames[end - 24:end], "end": end})
+    r = gg.grade_attempt("service_authorization_left", frames, recs, label_to_idx, aspect=ASPECT)
+    assert r.confused_with is None and not any("looked like" in f or "saw" in f for f in r.feedback), r.feedback
+    # the same confusion is still reported for a signal that is not allowed to pass through it
+    r2 = gg.grade_attempt("ball_out", frames, recs, label_to_idx, aspect=ASPECT)
+    assert r2.verdict != gg.VERDICT_CORRECT
 
 
 def test_double_contact_hand_side_context():
@@ -476,6 +546,137 @@ def test_authorization_hold_is_scaled():
     assert gg.HOLD_SCALE["service_authorization_left"] < 1.0
     r = run(g_auth("left"), "service_authorization_left")
     assert r.hold_required < gg.LEVEL_CONFIG["standard"].hold_seconds
+
+
+def test_every_graded_check_is_taught_in_the_instruction_card():
+    for label in gg.RULES:
+        ctx = {"side": "left"} if label == "double_contact" else None
+        ids = {c["id"] for c in gg.graded_summary(label, ctx)}
+        taught = gg.SIGNALS[label]["taught"]
+        n_steps = len(gg.SIGNALS[label]["howto"])
+        missing = ids - set(taught)
+        stale = set(taught) - ids
+        assert not missing, (label, "graded but not taught:", missing)
+        assert not stale, (label, "taught but not graded:", stale)
+        assert all(1 <= step <= n_steps for step in taught.values()), (label, taught, n_steps)
+
+
+def test_neighbouring_signal_is_ignored_only_while_the_target_is_recognised():
+    label_to_idx = {l: i for i, l in enumerate(sorted(gg.RULES))}
+    frames = np.array([idle()] * 12 + [g_ball_out()(i, False) for i in range(34)] + [idle()] * 10)
+
+    def records(target_share_label, other_label):
+        recs = []
+        for end in range(24, len(frames) + 1, 3):
+            share = np.mean([12 <= k < 46 for k in range(end - 24, end)])
+            probs = np.full(len(label_to_idx), 0.02)
+            lab = gg.NOTHING_LABEL
+            if share >= 0.5:
+                lab = target_share_label if end < 33 else other_label
+                probs[label_to_idx[lab]] = 0.95
+            recs.append({"label": lab, "probs": probs, "frames": frames[end - 24:end], "end": end})
+        return recs
+    # Ball Out passes through End of Set on the way: mostly End of Set windows but the target IS seen -> no complaint
+    only_first_ball_out = records("ball_out", "end_of_set")
+    r = gg.grade_attempt("ball_out", frames, only_first_ball_out, label_to_idx, aspect=ASPECT)
+    assert r.confused_with is None and not any("looked like" in f for f in r.feedback), r.feedback
+    # the trainee did End of Set instead of Ball Out: the target is never recognised -> the system says what it saw
+    wrong = gg.grade_attempt("ball_out", frames, records("end_of_set", "end_of_set"), label_to_idx, aspect=ASPECT)
+    assert wrong.verdict == gg.VERDICT_INCORRECT and wrong.confused_with == "end_of_set", (wrong.verdict, wrong.feedback)
+    assert any("End of Set" in f for f in wrong.feedback), wrong.feedback
+
+
+def test_ball_in_short_recognition_is_accepted():
+    assert gg.HOLD_SCALE["ball_in"] <= 0.5
+    r = run(g_ball_in(deg=35), "ball_in")            # the measured natural angle is 33 to 46 degrees from vertical
+    assert statuses(r)["arm_lowered"] == "pass"
+    for lv in gg.LEVELS:
+        assert gg.RULES["ball_in"](gg.Geo(np.array([idle()] * 30), ASPECT), lv)             # builds for every level
+
+
+def test_measured_team_to_serve_values_separate_good_from_folded():
+    # numbers measured on real attempts: good swings 138 to 162 deg, deliberately folded ones 25 to 107 deg
+    for lv, thr in (("beginner", 100), ("standard", 120), ("referee", 132)):
+        checks = gg.RULES["team_to_serve_left"](gg.Geo(np.array([idle()] * 30), ASPECT), lv)
+        need = {c.id: c.need for c in checks}["no_contraction"]
+        assert f">= {thr}" in need, (lv, need)
+    for lv, thr in (("beginner", 130), ("standard", 145), ("referee", 155)):
+        need = {c.id: c.need for c in gg.RULES["team_to_serve_left"](gg.Geo(np.array([idle()] * 30), ASPECT), lv)}["arm_extended"]
+        assert f">= {thr}" in need, (lv, need)
+
+
+def test_scoring_note_says_a_perfect_score_is_not_needed():
+    for lv in gg.LEVELS:
+        note = gg.scoring_note(lv)
+        assert "100" in note and str(gg.LEVEL_CONFIG[lv].correct_cut) in note
+
+
+def test_sloppy_service_authorization_is_not_correct_at_standard_and_referee():
+    for lv in ("standard", "referee"):
+        good = run(g_auth("left"), "service_authorization_left", lv)
+        assert good.verdict == gg.VERDICT_CORRECT, (lv, good.feedback)
+        tiny = run(g_auth("left", amp=0.25), "service_authorization_left", lv)          # a small wiggle
+        assert statuses(tiny)["hand_moves"] == "fail" and tiny.verdict != gg.VERDICT_CORRECT, (lv, tiny.feedback)
+        straight = run(g_auth("left", straight=True), "service_authorization_left", lv)  # arm out, not a sweep
+        assert straight.verdict != gg.VERDICT_CORRECT
+    # a nearly straight arm that still sweeps: only the bent-elbow check catches it (Important at Standard and Referee)
+    def stiff(i, m):
+        s = np.array(LS)
+        e = s + np.array([0.13, 0.09])
+        sweep = 1.0 * SW * np.sin(i / 3.0)
+        w = e + np.array([0.14 + sweep, -0.02])           # forearm almost in line with the upper arm
+        oe, ow = hanging("right")
+        return frame(e, oe, w, ow, mirror=m)
+    r = run(stiff, "service_authorization_left", "referee")
+    assert statuses(r)["arm_bent"] == "fail" and r.verdict != gg.VERDICT_CORRECT, (r.feedback, statuses(r))
+
+
+def test_thresholds_can_be_overridden_from_the_config():
+    tiny = g_auth("left", amp=0.25)
+    assert run(tiny, "service_authorization_left").verdict != gg.VERDICT_CORRECT
+    old = dict(gg.OVERRIDES)
+    gg.OVERRIDES.update({"service_authorization.hand_moves": {"ge": (0.05, 0.05, 0.05)}})       # both sides
+    try:
+        assert statuses(run(tiny, "service_authorization_left"))["hand_moves"] == "pass"
+        assert statuses(run(tiny, "service_authorization_right"))["hand_moves"] in ("pass", "fail")
+        gg.OVERRIDES.clear()
+        gg.OVERRIDES.update({"service_authorization_right.hand_moves": {"ge": 0.05}})            # right side only
+        assert statuses(run(tiny, "service_authorization_left"))["hand_moves"] == "fail"
+        gg.OVERRIDES.clear()
+        gg.OVERRIDES.update({"service_authorization.at_chest": {"effect": "scored"}})            # not strict any more
+        chk = {c.id: c for c in gg.grade_form_only("service_authorization_left",
+                                                   np.array([g_auth_low("left")(i, False) for i in range(30)]),
+                                                   "standard", ASPECT)}
+        assert chk["at_chest"].status == "fail" and chk["at_chest"].strict is False and chk["at_chest"].critical is False
+        summ = {c["id"]: c["effect"] for c in gg.graded_summary("service_authorization_left")}
+        assert summ["at_chest"] == "Scored"
+        gg.OVERRIDES.clear()
+        assert {c["id"]: c["effect"] for c in gg.graded_summary("service_authorization_left")}["at_chest"] == "Important"
+    finally:
+        gg.OVERRIDES.clear()
+        gg.OVERRIDES.update(old)
+    assert gg._CTX["label"] is None                                                             # context is cleaned up
+
+
+def test_no_signal_says_so_plainly():
+    label_to_idx = {l: i for i, l in enumerate(sorted(gg.RULES))}
+
+    def records(frames):
+        return [{"label": gg.NOTHING_LABEL, "probs": np.full(len(label_to_idx), 0.02), "frames": frames[i:i + 24],
+                 "end": i + 24} for i in range(0, len(frames) - 23, 3)]
+    down = np.array([idle()] * 50)                      # standing still, arms never raised
+    r = gg.grade_attempt("ball_out", down, records(down), label_to_idx, aspect=ASPECT)
+    assert r.verdict == gg.VERDICT_INCORRECT and "arms stayed down" in r.note and r.points == 0, (r.verdict, r.note)
+    raised = np.array([g_ball_out()(i, False) for i in range(50)])   # arms up, but the model saw nothing
+    r2 = gg.grade_attempt("ball_out", raised, records(raised), label_to_idx, aspect=ASPECT)
+    assert r2.verdict == gg.VERDICT_INCORRECT and "arms stayed down" not in r2.note and "No clear signal" in r2.note, r2.note
+    r3 = gg.grade_attempt("ball_out", np.zeros((40, 122)), records(down), label_to_idx, aspect=ASPECT)   # not in frame
+    assert r3.verdict == gg.VERDICT_NO_READING and "could not see you" in r3.note
+
+
+def test_learn_notes_and_disclaimer():
+    assert all(gg.SIGNALS[l].get("compare", "").startswith("Do not confuse") for l in gg.SIGNALS)
+    assert "coach" in gg.DISCLAIMER and "mistakes" in gg.DISCLAIMER
 
 
 if __name__ == "__main__":
