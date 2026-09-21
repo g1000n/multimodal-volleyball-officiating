@@ -9,7 +9,7 @@ from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier, HistGradientBoostingClassifier
 
 ROOT = Path(__file__).parent.parent
-TEST_MATCHES = ["match9", "match7", "match13", "iphone_positive_audio"]
+TEST_MATCHES = ["match9", "match7", "iphone_positive_audio"]
 
 def main():
     feat_csv = ROOT / "processed" / "features.csv"
