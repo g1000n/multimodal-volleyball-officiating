@@ -336,6 +336,7 @@ class FlatButton(tk.Label):
 def _base_root(title, w, h):
     root = tk.Tk()
     root.title(title)
+    h = min(h, max(560, root.winfo_screenheight() - 90))   # never taller than the screen
     root.geometry(f"{w}x{h}")
     root.minsize(min(w, 760), min(h, 560))
     try:
@@ -534,7 +535,7 @@ def open_learn(parent, skin, start_label=None):
 def run_menu(trainee: dict, real_labels, last_summary: str = ""):
     """
     Returns one of:
-        {"action": "start", "mode", "gesture", "level", "reps", "combo", "intent"}
+        {"action": "start", "mode", "gesture", "level", "reps", "combo", "intent", "note"}
         {"action": "quit"}
         {"action": "deleted"}
     """
@@ -552,12 +553,15 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
         skin.add(tk.Label(root, text=f"Last session: {last_summary}", font=("Segoe UI", 10), anchor="w"),
                  bg="bg", fg="amber").pack(anchor="w", padx=32, pady=(0, 6))
 
+    bar = skin.add(tk.Frame(root), bg="bg")
+    bar.pack(fill="x", padx=32, pady=14, side="bottom")
+
     mode_var = tk.StringVar(value="drill")
     cards = skin.add(tk.Frame(root), bg="bg")
     cards.pack(fill="x", padx=32)
     for key, title, desc in MODES:
         f = skin.add(tk.Frame(cards, highlightthickness=1), bg="card", highlightbackground="border")
-        f.pack(fill="x", pady=3)
+        f.pack(fill="x", pady=2)
         skin.add(tk.Radiobutton(f, variable=mode_var, value=key, text=title, font=("Segoe UI", 12, "bold"),
                                 highlightthickness=0, command=lambda: update_state()),
                  bg="card", fg="fg", selectcolor="card_hi", activebackground="card",
@@ -605,6 +609,16 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
                               width=42, font=("Segoe UI", 11))
     intent_box.grid(row=5, column=1, sticky="w", padx=12, pady=(8, 3))
 
+    opt_label("Note (test sessions):", 6)
+    note_var = tk.StringVar()
+    note_entry = skin.add(tk.Entry(opts, textvariable=note_var, font=("Segoe UI", 11), relief="flat", width=44,
+                                   highlightthickness=1),
+                          bg="card_hi", fg="fg", insertbackground="fg", highlightbackground="border",
+                          highlightcolor="green")
+    note_entry.grid(row=6, column=1, sticky="w", padx=12, pady=3, ipady=3)
+    skin.add(tk.Label(opts, text="What you will do differently, e.g. 'elbow bent' or 'one arm only'. Saved with each attempt.",
+                      font=("Segoe UI", 9)), bg="bg", fg="muted").grid(row=7, column=1, sticky="w", padx=12)
+
     def on_level():
         level_desc.configure(text=LEVEL_INFO[level_var.get()])
 
@@ -634,7 +648,7 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
             reps = 1
         intent = next((k for k, n in INTENT_CHOICES if n == intent_var.get()), "normal")
         result["value"] = {"action": "start", "mode": mode_var.get(), "gesture": label, "level": level_var.get(),
-                           "reps": reps, "combo": combo_key, "intent": intent}
+                           "reps": reps, "combo": combo_key, "intent": intent, "note": note_var.get().strip()}
         root.destroy()
 
     def learn():
@@ -651,8 +665,6 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
             result["value"] = {"action": "deleted"}
             root.destroy()
 
-    bar = skin.add(tk.Frame(root), bg="bg")
-    bar.pack(fill="x", padx=32, pady=18, side="bottom")
     FlatButton(bar, skin, "Start session", start, kind="primary", big=True).pack(side="right")
     FlatButton(bar, skin, "Learn the signals", learn).pack(side="right", padx=10)
     FlatButton(bar, skin, "Delete my data", delete).pack(side="left")

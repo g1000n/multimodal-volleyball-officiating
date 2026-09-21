@@ -90,12 +90,24 @@ def main():
         print(f"overall accuracy vs intended label: {pct(tp + tn, n).strip()}   Cohen's kappa: {kappa(tp, fn, fp, tn):.2f}")
         out.append([lv, "ALL", tp + fn, tp, fp + tn, tn])
 
+        variants = defaultdict(lambda: [0, 0])      # (signal, note) -> [attempts, rejected]
+        for r in sub:
+            if r["intent"] == "wrong":
+                v = variants[(r["target"], (r.get("note") or "(no note)"))]
+                v[0] += 1
+                v[1] += r["verdict"] != "CORRECT"
+        if variants:
+            print("\n  Wrong attempts by what the tester did:")
+            for (sig, note), (n_att, n_rej) in sorted(variants.items()):
+                print(f"    {sig:28s} {note[:44]:44s} rejected {n_rej}/{n_att}")
+                out.append([lv, f"{sig} | {note}", 0, 0, n_att, n_rej])
+
         bad_acc = [r for r in sub if r["intent"] == "wrong" and r["verdict"] == "CORRECT"]
         bad_rej = [r for r in sub if r["intent"] == "correct" and r["verdict"] != "CORRECT"]
         if bad_acc:
             print("\n  WRONG attempts that were accepted (grader too lenient, or a mistake the camera cannot see):")
             for r in bad_acc[:12]:
-                print(f"    {r['trainee']}/{r['session']}  {r['target']}  score {r['score']}\n      {r['check_values']}")
+                print(f"    {r['trainee']}/{r['session']}  {r['target']}  score {r['score']}  note: {r.get('note') or '-'}\n      {r['check_values']}")
         if bad_rej:
             print("\n  CORRECT attempts that were rejected (grader too strict, or the model misread you):")
             for r in bad_rej[:12]:

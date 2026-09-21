@@ -255,18 +255,19 @@ def main():
 
         # labeled test sessions write intent + measured check values, and the evaluation tool reads them
         sess, summary = run_mode("drill", tmp, save_dir, gesture="ball_out", hands_off=True, reps=3,
-                                 intent="wrong", level="standard")
+                                 intent="wrong", level="standard", note="elbows tucked")
         import csv as _csv
         with open(os.path.join(sess.dir, "attempts.csv"), newline="", encoding="utf-8") as fh:
             rows = list(_csv.DictReader(fh))
-        assert rows and all(r["intent"] == "wrong" and "forearms_vertical=" in r["check_values"] for r in rows), rows[:1]
+        assert rows and all(r["intent"] == "wrong" and r["note"] == "elbows tucked"
+                            and "forearms_vertical=" in r["check_values"] for r in rows), rows[:1]
         assert sess.dir.endswith("_wrong"), sess.dir
         sess2, _ = run_mode("drill", tmp, save_dir, gesture="ball_out", hands_off=True, reps=3, intent="correct")
         import subprocess
         res = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "evaluate_sessions.py")],
                              capture_output=True, text=True)
         assert "STANDARD level" in res.stdout and "Cohen" in res.stdout, res.stdout + res.stderr
-        assert "WRONG attempts that were accepted" in res.stdout   # the fake person performs it correctly every time
+        assert "WRONG attempts that were accepted" in res.stdout and "elbows tucked" in res.stdout   # the fake person performs it correctly every time
         print("evaluation OK  ", [l for l in res.stdout.splitlines() if l.startswith("ALL")][0])
 
         # light theme renders every screen without errors (frames saved for a visual check)

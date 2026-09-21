@@ -526,6 +526,7 @@ class Session:
         self.cfg = gg.LEVEL_CONFIG[self.level]
 
         self.intent = choice.get("intent", "normal")    # normal | correct | wrong  (labels for evaluation tests)
+        self.note = choice.get("note", "") or ""         # free text: what the tester did differently
         stamp = datetime.datetime.now(PH_TZ).strftime("%Y%m%d_%H%M%S")
         suffix = "" if self.intent == "normal" else f"_{self.intent}"
         self.dir = os.path.join(trainer_ui.trainee_dir(trainee["trainee_id"]), f"{stamp}_{self.mode}{suffix}")
@@ -613,14 +614,15 @@ class Session:
             row = {"ph_time": now_ph_str(), "kind": "whistle", "target": "whistle", "level": self.level,
                    "verdict": verdict, "score": 100 if whistle_ok else 0, "points": pts, "best_prob": "",
                    "margin": "", "hold_s": "", "confused_with": "", "failed_checks": "", "check_values": "",
-                   "intent": self.intent, "feedback": "" if whistle_ok else "No whistle detected in time."}
+                   "intent": self.intent, "note": self.note,
+                   "feedback": "" if whistle_ok else "No whistle detected in time."}
         else:
             failed = [c.id for c in res.checks if c.status == "fail"]
             row = {"ph_time": now_ph_str(), "kind": "gesture", "target": step["label"], "level": self.level,
                    "verdict": res.verdict, "score": res.score, "points": res.points,
                    "best_prob": f"{res.best_prob:.3f}", "margin": f"{res.margin:.3f}",
                    "hold_s": f"{res.hold_seconds:.2f}", "confused_with": res.confused_with or "",
-                   "failed_checks": ";".join(failed), "intent": self.intent,
+                   "failed_checks": ";".join(failed), "intent": self.intent, "note": self.note,
                    "check_values": ";".join(
                        f"{c.id}={'' if c.value is None else round(c.value, 2)}[{c.need}]:{c.status}" for c in res.checks),
                    "feedback": " | ".join(res.feedback)}
@@ -1133,14 +1135,14 @@ class Session:
 
     # ---- outputs ----
     def _save_outputs(self):
-        cols = ["ph_time", "kind", "target", "level", "intent", "verdict", "score", "points", "best_prob", "margin",
+        cols = ["ph_time", "kind", "target", "level", "intent", "note", "verdict", "score", "points", "best_prob", "margin",
                 "hold_s", "confused_with", "failed_checks", "check_values", "feedback"]
         with open(os.path.join(self.dir, "attempts.csv"), "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=cols)
             w.writeheader()
             w.writerows(self.attempts)
         with open(os.path.join(self.dir, "summary.json"), "w", encoding="utf-8") as f:
-            json.dump({**self.summary, "trainee_id": self.trainee["trainee_id"], "intent": self.intent,
+            json.dump({**self.summary, "trainee_id": self.trainee["trainee_id"], "intent": self.intent, "note": self.note,
                        "consent_version": trainer_ui.CONSENT_VERSION}, f, indent=2)
         write_report(os.path.join(self.dir, "report.html"), self.trainee, self.summary, self.attempts)
 
