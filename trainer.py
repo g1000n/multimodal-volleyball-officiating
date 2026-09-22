@@ -112,7 +112,9 @@ CAMERA_RETRY_SLEEP = 0.3         # camera stopped mid-session: wait this long be
 CAMERA_RETRY_EVERY = 3           # reopen the camera every this many failed reads
 CAMERA_LOST_SECONDS = 8.0        # give up after this long, save everything and go back to the menu
 CSV_COLS = ["ph_time", "kind", "target", "level", "intent", "note", "verdict", "score", "points", "best_prob", "margin",
-            "hold_s", "confused_with", "failed_checks", "check_values", "feedback"]
+            "hold_s", "confused_with", "failed_checks", "check_values", "feedback",
+            # the SAME captured movement, graded at every level, so a report can show all three side by side
+            "score_beginner", "verdict_beginner", "score_standard", "verdict_standard", "score_referee", "verdict_referee"]
 
 PH_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
@@ -399,15 +401,25 @@ class WhistleHub:
     def __init__(self):
         self._lock = threading.Lock()
         self._times = deque(maxlen=50)
+        self._events = []           # every whistle event of the run: {"t", "source": "auto" | "manual", "confidence"}
         self.detector = None
         self.device = None          # microphone index chosen in the setup screen (None = use trainer_config)
 
-    def _on_whistle(self, timestamp, confidence=None):
+    def _record(self, source, confidence=None):
+        now = time.time()
         with self._lock:
-            self._times.append(time.time())
+            self._times.append(now)
+            self._events.append({"t": now, "source": source, "confidence": confidence})
 
-    def manual(self):
-        self._on_whistle(time.time())
+    def _on_whistle(self, timestamp, confidence=None):       # called by the detector thread
+        self._record("auto", confidence)
+
+    def manual(self):                                          # the W key
+        self._record("manual")
+
+    def events_since(self, t):
+        with self._lock:
+            return [dict(e) for e in self._events if e["t"] >= t]
 
     def start(self):
         if self.detector is not None:
@@ -569,7 +581,8 @@ def add_whistle_steps(queue, choice):
 
 def build_queue(mode, choice, real_labels, rng):
     if mode == "sim":
-        return build_sim_queue(rng, real_labels)
+        n = int(choice.get("reps") or 3)
+        return build_sim_queue(rng, real_labels, n if n in (3, 5, 10) else 3)
     if mode == "drill":
         reps = int(choice.get("reps", 1) or 1)
         if reps > 1:
@@ -616,21 +629,28 @@ class Session:
 
         self.whistle_required = bool(choice.get("whistle")) and self.mode in ("drill", "combo", "challenge")
         self.queue = build_queue(self.mode, choice, backend.real_labels, self.rng)
-        self.uses_whistle = self.mode == "sim" or any(q["kind"] == "whistle" or q.get("whistle") for q in self.queue)
+        self.uses_whistle = self.mode in ("sim", "match_test") or any(
+            q["kind"] == "whistle" or q.get("whistle") for q in self.queue)
         self.continuous = self.mode == "sim" and bool(choice.get("continuous"))
         self.serving = None             # match simulation: the team serving right now ("left" / "right", the trainee's side)
         self.commit = None              # the "committed" message shown at the bottom after a call (match simulation)
         self.commit_log = []
         self.whistle_state = None
         self._whistle_seen = False
+        self.restart = False            # summary screen: R = do the same session again
+        self.capture_windows = []       # for the whistle log: when each capture ran and how the whistle was judged
+        self._t0 = None
+        self._log_ready = False
         self.step_i = 0
-        self.phase = "practice" if self.mode == "practice" else "intro"
+        self.phase = "practice" if self.mode in ("practice", "match_test") else "intro"
         self.phase_t0 = 0.0
         self.cap_frames, self.cap_records = [], []
         self.result = None
         self.last_rec = None
         self.stable_label = gg.NOTHING_LABEL
         self._prev_label = gg.NOTHING_LABEL
+        self.practice_log = []          # Practice mode: one row per detection event (see _save_outputs)
+        self._practice_started = None
         self.practice_checks = []
         self.hint = False
         self.attempts = []
@@ -655,6 +675,15 @@ class Session:
         self.points = 0
         self.max_points = 0
         self.team = {"left": 0, "right": 0}
+        # Match Testing: continuous, unscripted grading of a real performer (see _update's "practice" branch and
+        # _mt_end_run / _mt_flush_run below). Not the main focus of the tool; a lightweight secondary mode.
+        self.mt_in_run = False
+        self.mt_run_frames, self.mt_run_records = [], []
+        self.mt_run_label = None
+        self.mt_last_result = None          # most recently graded AttemptResult, shown on the side panel
+        self.practice_scores = []           # Practice mode: one row per fully graded hold (see _mt_grade_run)
+        self.mt_whistle_pointer = 0.0        # continuous whistle polling: see _update
+        self.mt_whistle_count = 0
         self.whistle_flash_until = 0.0
         self.whistle_ok = None
         self.banner = ""
@@ -676,6 +705,20 @@ class Session:
         for _ in range(4):
             self.be.cap.read()
 
+    def _log_event(self, event, detail=""):
+        """One line in session_log.csv: what happened, when. Written at once, so nothing is lost if the app stops."""
+        try:
+            path = os.path.join(self.dir, "session_log.csv")
+            new = not os.path.exists(path)
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(["ph_time", "seconds_from_start", "event", "detail"])
+                start = self._t0 if self._t0 is not None else self.clock()
+                w.writerow([now_ph_str(), f"{self.clock() - start:.2f}", event, detail])
+        except OSError:
+            pass
+
     def _set_phase(self, phase):
         self.phase = phase
         self.phase_t0 = self.clock()
@@ -694,6 +737,8 @@ class Session:
     def _begin_step(self):
         """Start the current step: the whistle wait, or the countdown before a signal."""
         step = self.step
+        self._log_event("step_start", f"{step['kind']}: " + (", ".join(step["labels"]) if step["kind"] == "pair"
+                                                              else step.get("label", "whistle")))
         self.rolling.clear()
         if step["kind"] == "whistle":
             self._set_phase("wait_whistle")
@@ -734,7 +779,7 @@ class Session:
         self.review_i = idxs[(cur + delta) % len(idxs)]
 
     # ---- attempt logging ----
-    def _log_attempt(self, step, res=None, whistle_ok=None, whistle_state=None):
+    def _log_attempt(self, step, res=None, whistle_ok=None, whistle_state=None, all_levels=None):
         kind = step["kind"]
         if kind == "whistle":
             state = whistle_state or ("ok" if whistle_ok else "none")
@@ -745,7 +790,9 @@ class Session:
             row = {"ph_time": now_ph_str(), "kind": "whistle", "target": "whistle", "level": self.level,
                    "verdict": verdict, "score": pts * 10, "points": pts, "best_prob": "",
                    "margin": "", "hold_s": "", "confused_with": "", "failed_checks": "", "check_values": "",
-                   "intent": self.intent, "note": self.note, "feedback": fb}
+                   "intent": self.intent, "note": self.note, "feedback": fb,
+                   "score_beginner": "", "verdict_beginner": "", "score_standard": "", "verdict_standard": "",
+                   "score_referee": "", "verdict_referee": ""}
         else:
             failed = [c.id for c in res.checks if c.status == "fail"]
             row = {"ph_time": now_ph_str(), "kind": "gesture", "target": step["label"], "level": self.level,
@@ -756,6 +803,10 @@ class Session:
                    "check_values": ";".join(
                        f"{c.id}={'' if c.value is None else round(c.value, 2)}[{c.need}]:{c.status}" for c in res.checks),
                    "feedback": " | ".join(res.feedback)}
+            for lv in gg.LEVELS:
+                lv_res = (all_levels or {}).get(lv)
+                row[f"score_{lv}"] = lv_res.score if lv_res is not None else ""
+                row[f"verdict_{lv}"] = lv_res.verdict if lv_res is not None else ""
             pts = res.points
         if row["verdict"] != gg.VERDICT_NO_READING:
             self.points += pts
@@ -820,9 +871,14 @@ class Session:
         os.makedirs(self.dir, exist_ok=True)
         writer = cv2.VideoWriter(os.path.join(self.dir, "session.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
                                  RECORD_FPS, (UI_W, UI_H))
+        self._t0 = self.clock()
         self._flush_camera()
         if self.uses_whistle:
             self.whistle.start()
+        self._log_event("session_start", f"mode={self.mode}; level={self.level}; repetitions={self.reps}; "
+                        f"whistle_option={bool(self.choice.get('whistle'))}; continuous={self.continuous}; "
+                        f"whistle_detector={'auto (microphone)' if getattr(self.whistle, 'auto_active', False) else 'not running (W key)'}; "
+                        f"intent={self.intent}")
         if self.queue and self.mode != "practice":
             self._set_phase("intro")
             self._sync_serving()
@@ -841,6 +897,8 @@ class Session:
                 ok, frame = self.be.cap.read()
                 if not ok:
                     fails += 1                       # camera stopped: try to reconnect, then give up cleanly
+                    if fails == 1:
+                        self._log_event("camera_disconnected", "no frame from the camera")
                     self._show_banner("Camera disconnected. Trying to reconnect...  (Q to stop)")
                     if fails % CAMERA_RETRY_EVERY == 0:
                         try:
@@ -849,9 +907,12 @@ class Session:
                             pass
                     if self._key() in (27, ord("q")) or fails * CAMERA_RETRY_SLEEP >= CAMERA_LOST_SECONDS:
                         self.camera_lost = True
+                        self._log_event("camera_lost", "could not reconnect; the session was stopped and saved")
                         break
                     self.sleep(CAMERA_RETRY_SLEEP)
                     continue
+                if fails:
+                    self._log_event("camera_reconnected", f"after {fails} failed reads")
                 fails = 0
                 t_frame = time.perf_counter()
                 if INPUT_ALREADY_MIRRORED:
@@ -896,6 +957,7 @@ class Session:
         except Exception as exc:                    # never lose the results already recorded
             self.error = exc
             self.error_trace = traceback.format_exc()
+            self._log_event("error", repr(exc))
         finally:
             try:
                 writer.release()
@@ -907,9 +969,13 @@ class Session:
                 except Exception:
                     pass
 
+        if self.mode in ("match_test", "practice"):
+            self._mt_flush_run()
         if self.summary is None:
             self.summary = self._make_summary()
         self.summary["performance"] = self._performance()
+        self.summary["restart"] = bool(self.restart)
+        self._log_event("session_end", self.summary.get("one_line", ""))
         self.summary["camera_lost"] = self.camera_lost
         self.summary["error"] = repr(self.error) if self.error else ""
         try:
@@ -944,8 +1010,13 @@ class Session:
     def _update(self, t, feats, rec):
         step = self.step
         if self.phase == "practice":
+            if self.mode in ("match_test", "practice") and self.mt_in_run:
+                self.mt_run_frames.append(feats)      # every camera frame while a run is presumed active
+            if self.mode == "match_test":
+                self._mt_poll_whistle(t)               # whistle logging is match-test only; Practice does not need it
             if rec is not None:
                 lab = rec["label"]
+                prev_stable = self.stable_label
                 if lab == gg.NOTHING_LABEL:
                     self.stable_label = gg.NOTHING_LABEL
                 elif lab == self._prev_label:          # same signal on two consecutive windows = stable
@@ -953,6 +1024,24 @@ class Session:
                 self._prev_label = lab
                 self.practice_checks = (gg.grade_form_only(self.stable_label, rec["frames"], self.level, self.aspect)
                                         if self.stable_label in gg.RULES else [])
+                if self._practice_started is None:
+                    self._practice_started = self.clock()
+                if self.stable_label != prev_stable:   # a new detection event: log it (documentation for the paper)
+                    passed = sum(1 for c in self.practice_checks if c.status == "pass")
+                    total_c = sum(1 for c in self.practice_checks if c.status != "unverified")
+                    best_p = float(np.max(rec["probs"])) if rec.get("probs") is not None else None
+                    self.practice_log.append({
+                        "ph_time": now_ph_str(), "seconds_from_start": round(t - self._practice_started, 2),
+                        "detected_label": self.stable_label,
+                        "detected_name": gg.pretty_label(self.stable_label) if self.stable_label in gg.RULES else "(none)",
+                        "best_prob": "" if best_p is None else round(best_p, 3),
+                        "checks_passed": passed, "checks_total": total_c})
+                    if self.mode in ("match_test", "practice"):
+                        self._mt_handle_transition(prev_stable, feats)     # ends the old run, may start a new one
+                if self.mode in ("match_test", "practice") and self.mt_in_run:
+                    # this window belongs to the CURRENT stable label (just started, or continuing): record it
+                    rec["end"] = len(self.mt_run_frames)
+                    self.mt_run_records.append(rec)
         elif self.phase == "intro":
             if self.auto and self.auto_go and step is not None and t - self.phase_t0 >= self._intro_seconds(step):
                 self._begin_step()
@@ -971,6 +1060,7 @@ class Session:
                 self._whistle_seen = False
                 self.whistle_state = None
                 self._set_phase("capture")
+                self._log_event("capture_start", f"{self.cap_seconds:.1f} s window")
         elif self.phase == "capture":
             self.cap_frames.append(feats)
             if rec is not None:
@@ -980,6 +1070,9 @@ class Session:
                 if self.whistle.first_since(self.phase_t0) is not None:
                     self._whistle_seen = True
                     self.whistle_flash_until = t + 1.0
+                    evs = getattr(self.whistle, "events_since", lambda _t: [])(self.phase_t0)
+                    src = evs[0]["source"] if evs else "?"
+                    self._log_event("whistle_heard", f"source={src}; {t - self.phase_t0:.2f} s after GO")
             if t - self.phase_t0 >= self.cap_seconds:
                 self._grade_current()
         elif self.phase == "wait_whistle":
@@ -990,6 +1083,78 @@ class Session:
         elif self.phase == "whistle_result":
             if t - self.phase_t0 >= 1.6:
                 self._advance()
+
+    # ---------------------------------------------------------------------
+    # Match Testing: continuous, unscripted grading of a real performer.
+    # Not the main focus of the tool; a lightweight secondary mode for watching and grading someone perform signals
+    # naturally (no per-signal countdown, no expected order, whistle optional and purely observational).
+    # ---------------------------------------------------------------------
+    def _mt_poll_whistle(self, t):
+        if not self.uses_whistle:
+            return
+        w = self.whistle.first_since(self.mt_whistle_pointer)
+        if w is not None:
+            self.mt_whistle_count += 1
+            elapsed = w - self._t0 if self._t0 is not None else w
+            self._log_event("whistle_heard", f"match test whistle #{self.mt_whistle_count} at {elapsed:.2f}s")
+            self.mt_whistle_pointer = w + 1e-6      # advance past it so the next poll finds the NEXT whistle, if any
+
+    def _mt_handle_transition(self, old_label, feats):
+        """Called when the stable detected label changes. Grades and closes the run that just ended (if it was a
+        real signal), then starts a new run if the new stable label is itself a real signal (so a continuous
+        sequence like Team to Serve straight into the reason is captured as two back-to-back runs, not one)."""
+        if old_label in gg.RULES and self.mt_in_run:
+            self._mt_grade_run(old_label)
+        if self.stable_label in gg.RULES:
+            self.mt_in_run = True
+            self.mt_run_label = self.stable_label
+            self.mt_run_frames, self.mt_run_records = [feats], []
+        else:
+            self.mt_in_run = False
+            self.mt_run_label = None
+            self.mt_run_frames, self.mt_run_records = [], []
+
+    def _mt_grade_run(self, label):
+        """Grades one finished run (a hold of the same stable label, start to end) and logs it exactly like any
+        other attempt. Runs shorter than 2 recognised windows are discarded quietly (brief flicker, not a real
+        attempt) rather than graded and logged as a likely NO_READING or near-zero result."""
+        recs, frames = self.mt_run_records, self.mt_run_frames
+        if len(recs) < 2 or not frames:
+            return
+        step_s = max(0.05, (recs[-1]["t"] - recs[0]["t"]) / max(1, len(recs) - 1))
+        all_levels = gg.grade_at_all_levels(label, frames, recs, self.be.label_to_idx, aspect=self.aspect,
+                                            step_seconds=step_s)
+        result = all_levels[self.level]
+        old_cap_frames, old_cap_records = self.cap_frames, self.cap_records
+        self.cap_frames, self.cap_records = frames, recs
+        self._save_attempt_npz([label], [None], [result], step_s)
+        self.cap_frames, self.cap_records = old_cap_frames, old_cap_records
+        if result.verdict == gg.VERDICT_NO_READING:
+            return
+        self.mt_last_result = result
+        self.results = [result]
+        if self.mode == "practice":
+            if self._practice_started is None:
+                self._practice_started = self.clock()
+            row = {"ph_time": now_ph_str(), "seconds_from_start": round(self.clock() - self._practice_started, 2),
+                  "target": label, "verdict": result.verdict, "score": result.score, "hold_s": f"{result.hold_seconds:.2f}"}
+            for lv in gg.LEVELS:
+                row[f"score_{lv}"] = all_levels[lv].score
+                row[f"verdict_{lv}"] = all_levels[lv].verdict
+            self.practice_scores.append(row)
+        else:
+            self._log_attempt({"kind": "gesture", "label": label}, res=result, all_levels=all_levels)
+            if result.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST) and label.startswith("team_to_serve_"):
+                side = label.rsplit("_", 1)[1]
+                self.team[side] += 1
+                self.serving = side
+
+    def _mt_flush_run(self):
+        """Grades whatever was in progress when the session ended (Q pressed, camera lost), so a real performer's
+        last signal is not silently dropped."""
+        if self.mt_in_run and self.mt_run_label in gg.RULES:
+            self._mt_grade_run(self.mt_run_label)
+        self.mt_in_run = False
 
     def _grade_current(self):
         t_grade = time.perf_counter()
@@ -1003,11 +1168,20 @@ class Session:
             ctxs = step.get("ctxs") or [None] * len(labels)
             results = gg.grade_sequence(labels, self.cap_frames, recs, self.be.label_to_idx, level=self.level,
                                         aspect=self.aspect, step_seconds=step_s, contexts=ctxs)
+            # the SAME capture, re-graded at the other two levels, so a report can show all three side by side
+            all_levels_by_i = [{} for _ in labels]
+            for lv in gg.LEVELS:
+                lv_results = gg.grade_sequence(labels, self.cap_frames, recs, self.be.label_to_idx, level=lv,
+                                               aspect=self.aspect, step_seconds=step_s, contexts=ctxs)
+                for i, r in enumerate(lv_results):
+                    all_levels_by_i[i][lv] = r
         else:
             labels = [step["label"]]
             ctxs = [step.get("ctx")]
             results = [gg.grade_attempt(step["label"], self.cap_frames, recs, self.be.label_to_idx,
                                         level=self.level, aspect=self.aspect, step_seconds=step_s, context=step.get("ctx"))]
+            all_levels_by_i = [gg.grade_at_all_levels(step["label"], self.cap_frames, recs, self.be.label_to_idx,
+                                                      aspect=self.aspect, step_seconds=step_s, context=step.get("ctx"))]
         self.results, self.result = results, results[0]
         self.perf["grade_ms"].append((time.perf_counter() - t_grade) * 1000.0)
         if step["kind"] == "pair" and step.get("winner"):
@@ -1024,11 +1198,16 @@ class Session:
             else:
                 self.whistle_state = "late"
         self._save_attempt_npz(labels, ctxs, results, step_s)
+        onset_est = next((r["t"] - WHISTLE_ONSET_OFFSET for r in recs if r["label"] == labels[0]), None)
+        self.capture_windows.append({"start": self.phase_t0, "end": self.clock(), "step": self.attempt_no,
+                                     "labels": "+".join(labels), "state": self.whistle_state, "onset": onset_est})
+        self._log_event("verdict", "; ".join(f"{l}={r.verdict} {r.score}/100" for l, r in zip(labels, results))
+                        + (f"; whistle={self.whistle_state}" if self.whistle_state else ""))
         if not any(r.verdict == gg.VERDICT_NO_READING for r in results):
             if self.whistle_state is not None:
                 self._log_attempt({"kind": "whistle"}, whistle_state=self.whistle_state)
-            for label, res in zip(labels, results):
-                self._log_attempt({"kind": "gesture", "label": label}, res=res)
+            for label, res, all_levels in zip(labels, results, all_levels_by_i):
+                self._log_attempt({"kind": "gesture", "label": label}, res=res, all_levels=all_levels)
                 if (self.mode == "sim" and res.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST)
                         and label.startswith("team_to_serve_")):        # a close call still counts
                     self.team[label.rsplit("_", 1)[1]] += 1
@@ -1114,6 +1293,9 @@ class Session:
             return False
         ch = chr(key).lower() if 0 <= key < 256 else ""
         if key == 27 or ch == "q":
+            self._log_event("end_requested", "Q pressed")
+            if self.mode in ("match_test", "practice"):
+                self._mt_flush_run()
             if self.mode == "practice":
                 self.summary = self._make_summary()
                 return True
@@ -1126,6 +1308,7 @@ class Session:
             self.mirror_display = not self.mirror_display
         elif ch == "p" and self.phase in ("practice", "intro", "result"):
             self.paused = not self.paused
+            self._log_event("paused" if self.paused else "resumed")
         elif ch == "t":
             new = "light" if _cv_theme_name == "dark" else "dark"
             trainer_ui.set_theme(new)
@@ -1133,8 +1316,10 @@ class Session:
         elif ch == "w":
             self.whistle.manual()
             self.whistle_flash_until = self.clock() + 1.2
+            self._log_event("whistle_key", "W pressed (manual whistle)")
         elif ch == "h":
             self.hint = not self.hint
+            self._log_event("hint_on" if self.hint else "hint_off")
         elif key in (32, 13):
             if self.phase == "intro":
                 self.auto_go = True
@@ -1147,7 +1332,12 @@ class Session:
             elif self.phase == "summary":
                 self.phase = "done"
         elif ch == "r" and self.phase == "result" and self.mode == "drill" and not self.auto:
+            self._log_event("retry", "R pressed")
             self._set_phase("intro")
+        elif ch == "r" and self.phase == "summary" and self.mode != "practice":
+            self._log_event("do_again", "R pressed on the summary: the same session starts again")
+            self.restart = True
+            self.phase = "done"
         elif ch in ("a", "d") and self.phase == "summary":
             self._review_step(-1 if ch == "a" else 1)
         return False
@@ -1174,6 +1364,8 @@ class Session:
             self._draw_bottom(ui, t)
             self._draw_side(ui, t)
             self._draw_overlays(ui, t, placement)
+            if self.mode in ("sim", "match_test"):
+                self._draw_scoreboard_banner(ui)
             if self.phase in ("intro", "countdown"):
                 self._draw_reference(ui, self.step)
         if self.paused:
@@ -1183,7 +1375,8 @@ class Session:
 
     def _draw_top(self, ui):
         panel(ui, 0, 0, UI_W, TOP_H, C_PANEL)
-        title = {"practice": "PRACTICE", "drill": "DRILL", "combo": "COMBO DRILL", "challenge": "CHALLENGE", "sim": "MATCH SIMULATION"}[self.mode]
+        title = {"practice": "PRACTICE", "drill": "DRILL", "combo": "COMBO DRILL", "challenge": "CHALLENGE",
+                "sim": "MATCH SIMULATION", "match_test": "MATCH TESTING"}[self.mode]
         put(ui, title, 20, 36, 0.9, C_GREEN, 2)
         put(ui, f"{self.cfg.name} level", 20 + tw(title, 0.9, 2) + 20, 36, 0.6, C_MUTED, 1)
         if self.intent != "normal":
@@ -1199,11 +1392,29 @@ class Session:
         if self.auto and self.queue and self.phase != "summary" and self.mode != "sim":
             prog = f"Attempt {min(self.step_i + 1, len(self.queue))}/{len(self.queue)}"
             put(ui, prog, x - tw(prog, 0.6, 1) - 40, 36, 0.6, C_AMBER, 1)
-        if self.mode == "sim":
-            team = f"LEFT {self.team['left']} - {self.team['right']} RIGHT"
-            if self.serving:
-                team += f"    Serving: {self.serving.upper()}"
-            put(ui, team, x - tw(team, 0.6, 1) - 40, 36, 0.6, C_AMBER, 1)
+        if self.mode in ("sim", "match_test"):
+            put(ui, "SCOREBOARD BELOW", x - tw("SCOREBOARD BELOW", 0.45, 1) - 40, 36, 0.45, C_MUTED, 1)
+
+    def _draw_scoreboard_banner(self, ui):
+        """A big, unmissable scoreboard, drawn over the top of the camera view. Requested to be 'more apparent' than
+        the small top-bar text: bold, high-contrast, colour-coded by team, with the serving side highlighted."""
+        bx, by, bw = CAM_BOX[0] + 10, CAM_BOX[1] + 10, CAM_BOX[2] - 20
+        bh = 64
+        panel(ui, bx, by, bx + bw, by + bh, (18, 18, 18), alpha=0.82)
+        cv2.rectangle(ui, (bx, by), (bx + bw, by + bh), C_AMBER, 2)
+        a, b = self.team["left"], self.team["right"]
+        left_col = C_GREEN if self.serving == "left" else C_TEXT
+        right_col = C_GREEN if self.serving == "right" else C_TEXT
+        mid_x = bx + bw // 2
+        put(ui, "LEFT", bx + 24, by + 28, 0.6, left_col, 2)
+        put(ui, str(a), bx + 24, by + 56, 1.1, left_col, 3)
+        put(ui, "-", mid_x - 10, by + 48, 0.9, C_MUTED, 2)
+        rb = str(b)
+        put(ui, rb, bx + bw - 24 - tw(rb, 1.1, 3), by + 56, 1.1, right_col, 3)
+        put(ui, "RIGHT", bx + bw - 24 - tw("RIGHT", 0.6, 2), by + 28, 0.6, right_col, 2)
+        if self.serving:
+            tag = f"{self.serving.upper()} TO SERVE"
+            put(ui, tag, mid_x - tw(tag, 0.5, 1) // 2, by + 20, 0.5, C_GREEN, 1)
 
     def _draw_disclaimer(self, ui, x, w, y_bottom=UI_H - 10):
         lines = wrap(gg.DISCLAIMER, w, 0.38)
@@ -1278,7 +1489,15 @@ class Session:
         sim = self.mode == "sim"
         whistle = step is not None and bool(step.get("whistle"))
         two = step is not None and step["kind"] == "pair"
-        if self.phase == "practice":
+        if self.phase == "practice" and self.mode == "match_test":
+            for i, line in enumerate(wrap("Perform naturally. Every signal is detected, graded and scored "
+                                          "automatically. No set order.", bw - 40, 0.58)):
+                put(ui, line, 20, y + i * 24, 0.58, C_TEXT, 1)
+            if self.mt_last_result is not None:
+                r = self.mt_last_result
+                col = {gg.VERDICT_CORRECT: C_GREEN, gg.VERDICT_ALMOST: C_AMBER}.get(r.verdict, C_RED)
+                put(ui, f"Last: {gg.pretty_label(r.target)}  {r.verdict}  {r.score}/100", 20, y + 54, 0.55, col, 1)
+        elif self.phase == "practice":
             put(ui, "Do any signal. The system will tell you which one it sees.", 20, y, 0.65, C_TEXT, 1)
             lab = self.stable_label
             if lab in gg.SIGNALS:
@@ -1335,7 +1554,8 @@ class Session:
             start_keys = "Continuous: the next step starts by itself"
         else:
             start_keys = "SPACE start" + ("  (then it runs by itself)" if self.continuous else "")
-        keys = {"practice": "Q end practice   P pause   M mirror   T theme",
+        keys = {"practice": ("Q end match testing   P pause   M mirror   T theme" if self.mode == "match_test"
+                             else "Q end practice   P pause   M mirror   T theme"),
                 "intro": start_keys + "   Q end session   M mirror   T theme" + ("   H hint" if sim else ""),
                 "result": ("Continuous: next step in a moment" if self.continuous else "SPACE next")
                           + ("   R retry" if self.mode == "drill" and not self.auto else "") + "   Q end session",
@@ -1537,7 +1757,7 @@ class Session:
             color = VERDICT_COLOR[r.verdict]
             put(ui, fit(f"{k + 1}. " + gg.short_label(lab), w, 0.55), x, y, 0.55, C_BLUE, 1)
             put(ui, VERDICT_TEXT[r.verdict], x, y + 34, 0.9, color, 2)
-            put(ui, f"{r.score}/100  +{r.points} pts", x + 175, y + 32, 0.5, C_TEXT, 1)
+            put(ui, f"{r.score}/100  +{r.points} session pts", x + 165, y + 32, 0.46, C_TEXT, 1)
             yy = y + 52
             if r.verdict != gg.VERDICT_NO_READING:
                 for c in r.checks[:6]:
@@ -1567,7 +1787,7 @@ class Session:
             for i, line in enumerate(wrap(r.feedback[0], w, 0.55)):
                 put(ui, line, x, y + 50 + i * 22, 0.55, C_TEXT, 1)
             return
-        put(ui, f"Score {r.score}/100   +{r.points} pts", x, y + 40, 0.65, C_TEXT, 2)
+        put(ui, f"Signal score {r.score}/100   +{r.points} session pts", x, y + 40, 0.56, C_TEXT, 2)
         cut = gg.LEVEL_CONFIG[r.level].correct_cut
         put(ui, fit(f"Counts as CORRECT from {cut}. 100 is not needed.", w, 0.42), x, y + 58, 0.42, C_MUTED, 1)
         y += 72
@@ -1623,6 +1843,17 @@ class Session:
                 y += 21
                 draw_icon(ui, c.status, x + 8, y - 4, 7)
                 put(ui, fit(c.label, w - 30, 0.43), x + 24, y, 0.43, C_TEXT if c.status == "pass" else C_MUTED, 1)
+            y += 30
+        if self.mode in ("match_test", "practice") and self.mt_last_result is not None:
+            r = self.mt_last_result
+            col = {gg.VERDICT_CORRECT: C_GREEN, gg.VERDICT_ALMOST: C_AMBER}.get(r.verdict, C_RED)
+            put(ui, "Last graded hold", x, y, 0.5, C_BLUE, 1)
+            y += 22
+            tail = f"+{r.points} pts" if self.mode == "match_test" else "not counted, this is Practice"
+            put(ui, fit(f"{gg.pretty_label(r.target)}: {r.verdict}  {r.score}/100  {tail}", w, 0.46), x, y, 0.46, col, 1)
+            for f in r.feedback[:2]:
+                y += 19
+                put(ui, fit("- " + f, w, 0.4), x, y, 0.4, C_MUTED, 1)
 
     def _draw_overlays(self, ui, t, placement):
         ox, oy, nw, nh = placement
@@ -1680,7 +1911,8 @@ class Session:
             put(ui, fit(name, 330, 0.5), 80, y, 0.5, C_TEXT, 1)
             put(ui, a["verdict"], 430, y, 0.5, VERDICT_COLOR.get(a["verdict"], C_TEXT), 1)
             put(ui, f"{a['score']}/100  +{a['points']}", 590, y, 0.5, C_TEXT, 1)
-        put(ui, "A / D  review each attempt     SPACE  back to the menu", 40, UI_H - 26, 0.55, C_AMBER, 1)
+        again = "     R  do it again" if self.mode != "practice" else ""
+        put(ui, "A / D  review each attempt" + again + "     SPACE  back to the menu", 40, UI_H - 26, 0.55, C_AMBER, 1)
         self._draw_disclaimer(ui, 40, SIDE_X - 80, UI_H - 50)
         # right column: full breakdown of the selected attempt
         if self.review_i is not None:
@@ -1692,7 +1924,86 @@ class Session:
                 self._draw_side_result(ui, SIDE_X + 18, TOP_H + 60, SIDE_W - 36, res)
 
     # ---- outputs ----
+    def _whistle_rows(self):
+        """Every whistle event of this session with its time, source (auto = microphone detector, manual = W key), the
+        confidence (auto only), and how it was used. Like the whistle logs of the live system."""
+        getter = getattr(self.whistle, "events_since", None)
+        events = getter(self._t0 if self._t0 is not None else 0.0) if getter else []
+        rows = []
+        judged = set()
+        for ev in events:
+            win = next((w for w in self.capture_windows if w["start"] <= ev["t"] <= w["end"] + 0.5), None)
+            try:
+                when = datetime.datetime.fromtimestamp(ev["t"], PH_TZ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            except (OverflowError, OSError, ValueError):
+                when = ""
+            row = {"ph_time": when, "seconds_from_session_start": round(ev["t"] - (self._t0 or 0.0), 2),
+                   "source": ev["source"], "confidence": "" if ev.get("confidence") is None else round(float(ev["confidence"]), 3),
+                   "attempt_no": "", "signal": "", "seconds_after_go": "", "signal_onset_estimate_s": "",
+                   "judged_as": "outside a capture (not used)"}
+            if win is not None:
+                row.update(attempt_no=win["step"], signal=win["labels"], seconds_after_go=round(ev["t"] - win["start"], 2),
+                           signal_onset_estimate_s="" if win["onset"] is None else round(win["onset"] - win["start"], 2))
+                if win["step"] in judged:
+                    row["judged_as"] = "extra whistle in the same capture"
+                else:
+                    judged.add(win["step"])
+                    row["judged_as"] = {"ok": "on time (10 points)", "late": "late (5 points)",
+                                        "none": "not heard"}.get(win["state"], "heard")
+            rows.append(row)
+        return rows
+
+    def _write_whistle_log(self):
+        rows = self._whistle_rows()
+        self.whistle_rows = rows
+        if not rows:
+            return
+        cols = ["ph_time", "seconds_from_session_start", "source", "confidence", "attempt_no", "signal", "seconds_after_go",
+                "signal_onset_estimate_s", "judged_as"]
+        with open(os.path.join(self.dir, "whistle_events.csv"), "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(rows)
+
+    def _write_practice_log(self):
+        if not self.practice_log:
+            return
+        cols = ["ph_time", "seconds_from_start", "detected_label", "detected_name", "best_prob", "checks_passed",
+                "checks_total"]
+        with open(os.path.join(self.dir, "practice_log.csv"), "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(self.practice_log)
+        with open(os.path.join(self.dir, "practice_summary.csv"), "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["signal", "times_detected", "avg_checks_passed", "avg_checks_total"])
+            for row in practice_summary_rows(self.practice_log):
+                w.writerow(row)
+
+    def _write_practice_scores(self):
+        if not self.practice_scores:
+            return
+        cols = ["ph_time", "seconds_from_start", "target", "verdict", "score", "hold_s",
+                "score_beginner", "verdict_beginner", "score_standard", "verdict_standard",
+                "score_referee", "verdict_referee"]
+        with open(os.path.join(self.dir, "practice_scores.csv"), "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(self.practice_scores)
+
     def _save_outputs(self):
+        try:
+            self._write_whistle_log()
+        except Exception:
+            self.error_trace += "\n" + traceback.format_exc()
+        try:
+            self._write_practice_log()
+        except Exception:
+            self.error_trace += "\n" + traceback.format_exc()
+        try:
+            self._write_practice_scores()
+        except Exception:
+            self.error_trace += "\n" + traceback.format_exc()
         with open(os.path.join(self.dir, "attempts.csv"), "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=CSV_COLS)
             w.writeheader()
@@ -1703,22 +2014,125 @@ class Session:
         if self.error_trace:
             with open(os.path.join(self.dir, "error.log"), "w", encoding="utf-8") as f:
                 f.write(self.error_trace)
-        write_report(os.path.join(self.dir, "report.html"), self.trainee, self.summary, self.attempts)
+        write_report(os.path.join(self.dir, "report.html"), self.trainee, self.summary, self.attempts,
+                     getattr(self, "whistle_rows", []), self.practice_log, self.practice_scores)
 
 
-def write_report(path, trainee, summary, attempts):
+def practice_summary_rows(practice_log):
+    """One row per detected signal: how many times it showed up, and how thoroughly formed it was, on average, when
+    it did. This is the table to paste into the paper for Practice mode, rather than the raw per-event log."""
+    per = {}
+    for r in practice_log:
+        lab = r["detected_label"]
+        if lab == gg.NOTHING_LABEL:
+            continue
+        d = per.setdefault(lab, {"n": 0, "passed": 0, "total": 0})
+        d["n"] += 1
+        d["passed"] += r["checks_passed"]
+        d["total"] += r["checks_total"]
+    rows = []
+    for lab, d in sorted(per.items(), key=lambda kv: -kv[1]["n"]):
+        rows.append([gg.pretty_label(lab), d["n"], round(d["passed"] / max(1, d["n"]), 2),
+                    round(d["total"] / max(1, d["n"]), 2)])
+    return rows
+
+
+def practice_score_summary_rows(practice_scores):
+    """One row per signal from the fully graded Practice holds: how many times, and the average score at each
+    difficulty level. Unlike practice_summary_rows (checks_passed/total from a live snapshot), this uses a real
+    grade_attempt() score for the WHOLE hold, at all three levels."""
+    per = {}
+    for r in practice_scores:
+        d = per.setdefault(r["target"], {"n": 0, "beginner": 0, "standard": 0, "referee": 0})
+        d["n"] += 1
+        for lv in gg.LEVELS:
+            d[lv] += r[f"score_{lv}"]
+    rows = []
+    for lab, d in sorted(per.items(), key=lambda kv: -kv[1]["n"]):
+        rows.append([gg.pretty_label(lab), d["n"]] + [round(d[lv] / d["n"], 1) for lv in gg.LEVELS])
+    return rows
+
+
+def write_report(path, trainee, summary, attempts, whistle_rows=None, practice_log=None, practice_scores=None):
     e = html.escape
+    whistle_html = ""
+    if whistle_rows:
+        wr = "".join(
+            f"<tr><td>{e(str(w['ph_time']))}</td><td>{e(str(w['source']))}</td><td>{e(str(w['confidence']))}</td>"
+            f"<td>{e(str(w['attempt_no']))}</td><td>{e(str(w['signal']))}</td><td>{e(str(w['seconds_after_go']))}</td>"
+            f"<td>{e(str(w['judged_as']))}</td></tr>" for w in whistle_rows)
+        auto = sum(1 for w in whistle_rows if w["source"] == "auto")
+        whistle_html = (f"<h2>Whistle log</h2><p>{len(whistle_rows)} whistle event(s): {auto} heard by the microphone detector "
+                        f"(auto), {len(whistle_rows) - auto} from the W key (manual). Also saved as whistle_events.csv.</p>"
+                        "<table><tr><th>Time (PH)</th><th>Source</th><th>Confidence</th><th>Attempt</th><th>Signal</th>"
+                        f"<th>Seconds after GO</th><th>Judged as</th></tr>{wr}</table>")
+    def all_levels_cell(a):
+        parts = []
+        for lv, tag in (("beginner", "B"), ("standard", "S"), ("referee", "R")):
+            sc, vd = a.get(f"score_{lv}"), a.get(f"verdict_{lv}")
+            if sc not in (None, "") and vd not in (None, ""):
+                parts.append(f"{tag}:{sc} {vd[0]}")           # e.g. "B:95 C" (C/A/I for Correct/Almost/Incorrect)
+        return " &nbsp; ".join(parts)
+
     rows = "".join(
         f"<tr><td>{e(a['ph_time'])}</td><td>{e(a['target'])}</td>"
         f"<td style='font-weight:bold;color:{ {'CORRECT': '#2e7d32', 'ALMOST': '#e65100', 'INCORRECT': '#c62828'}.get(a['verdict'], '#333') }'>{e(a['verdict'])}</td>"
-        f"<td>{a['score']}</td><td>{a['points']}</td><td>{e(str(a['hold_s']))}</td><td>{e(a['failed_checks'])}</td>"
-        f"<td>{e(a['feedback'])}</td></tr>" for a in attempts) or "<tr><td colspan='8'>(no graded attempts)</td></tr>"
+        f"<td>{a['score']}</td><td>{a['points']}</td><td>{e(str(a['hold_s']))}</td>"
+        f"<td style='font-size:12px'>{all_levels_cell(a)}</td>"
+        f"<td>{e(a['failed_checks'])}</td>"
+        f"<td>{e(a['feedback'])}</td></tr>" for a in attempts) or "<tr><td colspan='9'>(no graded attempts)</td></tr>"
     per = "".join(f"<tr><td>{e(k)}</td><td>{v['correct']}/{v['n']}</td><td>{v['score_sum'] / max(1, v['n']):.0f}</td></tr>"
                   for k, v in summary["per_signal"].items())
     team = ""
     if summary.get("team_points"):
         t = summary["team_points"]
         team = f"<p><b>Scoreboard (from the trainee's correct calls):</b> team on your LEFT {t['left']} - {t['right']} RIGHT</p>"
+    practice_scores_html = ""
+    if practice_scores:
+        score_summary = practice_score_summary_rows(practice_scores)
+        ssr = "".join(f"<tr><td>{e(str(row[0]))}</td><td>{row[1]}</td><td>{row[2]}</td><td>{row[3]}</td><td>{row[4]}</td></tr>"
+                     for row in score_summary)
+        psr = "".join(
+            f"<tr><td>{e(str(r['ph_time']))}</td><td>{e(str(r['seconds_from_start']))}</td>"
+            f"<td>{e(gg.pretty_label(r['target']))}</td>"
+            f"<td style='font-weight:bold;color:{ {'CORRECT': '#2e7d32', 'ALMOST': '#e65100', 'INCORRECT': '#c62828'}.get(r['verdict'], '#333') }'>{e(r['verdict'])}</td>"
+            f"<td>{r['score']}</td><td>{r['hold_s']}</td>"
+            f"<td>B:{r['score_beginner']} {e(r['verdict_beginner'][0])} &nbsp; S:{r['score_standard']} {e(r['verdict_standard'][0])} "
+            f"&nbsp; R:{r['score_referee']} {e(r['verdict_referee'][0])}</td></tr>" for r in practice_scores)
+        practice_scores_html = (
+            "<h2>Practice: fully graded holds</h2>"
+            "<p>Every signal you held long enough to grade during Practice, scored the same way as Drill (recognition, "
+            "distinctness, hold, FIVB form, ready position), at all three difficulty levels. Not shown as a live score "
+            "during Practice itself, but recorded here for documentation.</p>"
+            "<h3>By signal (average score per level)</h3>"
+            "<table><tr><th>Signal</th><th>Times</th><th>Avg Beginner</th><th>Avg Standard</th><th>Avg Referee</th></tr>"
+            f"{ssr}</table>"
+            "<p style=\"color:#666;font-size:12px\">Also saved as practice_scores.csv.</p>"
+            "<details><summary>Every graded hold</summary>"
+            "<table><tr><th>Time</th><th>Seconds from start</th><th>Signal</th><th>Verdict (session level)</th>"
+            f"<th>Score</th><th>Hold (s)</th><th>All levels</th></tr>{psr}</table></details>")
+    practice_html = ""
+    if practice_log:
+        summary_rows = practice_summary_rows(practice_log)
+        sr = "".join(f"<tr><td>{e(str(row[0]))}</td><td>{row[1]}</td><td>{row[2]}</td><td>{row[3]}</td></tr>"
+                    for row in summary_rows) or "<tr><td colspan='4'>(no named signal was detected)</td></tr>"
+        pr = "".join(
+            f"<tr><td>{e(str(r['ph_time']))}</td><td>{e(str(r['seconds_from_start']))}</td>"
+            f"<td>{e(str(r['detected_name']))}</td><td>{e(str(r['best_prob']))}</td>"
+            f"<td>{r['checks_passed']}/{r['checks_total']}</td></tr>" for r in practice_log)
+        n_events = len(practice_log)
+        n_signals = sum(1 for r in practice_log if r["detected_label"] != gg.NOTHING_LABEL)
+        practice_html = (f"<h2>Practice log</h2><p>{n_events} detection event(s) logged during free practice "
+                         f"({n_signals} of them a named signal, the rest 'no signal'/arms down). No score is kept in "
+                         f"Practice mode; this is a record of what the system detected and when, for documentation.</p>"
+                         "<h3>Signals detected (summary table, for the paper)</h3>"
+                         "<table><tr><th>Signal</th><th>Times detected</th><th>Avg. checks passed</th>"
+                         f"<th>Avg. checks total</th></tr>{sr}</table>"
+                         "<p style=\"color:#666;font-size:12px\">Also saved as practice_summary.csv (this table) and "
+                         "practice_log.csv (every detection event).</p>"
+                         "<details><summary>Full event-by-event log</summary>"
+                         "<table><tr><th>Time (PH)</th><th>Seconds from start</th><th>Detected</th>"
+                         f"<th>Model confidence</th><th>Checks passed</th></tr>{pr}</table></details>")
     p = summary.get("performance") or {}
     perf_html = ""
     if p:
@@ -1743,8 +2157,13 @@ th{{background:#eee}}.box{{background:#fff;border:1px solid #ddd;border-radius:6
 (see gesture_grader.py). CORRECT = 10 pts, ALMOST = 5 pts.</p>
 <p style="color:#666;font-size:12px"><b>{e(gg.DISCLAIMER)}</b></p></div>
 {perf_html}
+{whistle_html}
+{practice_scores_html}
+{practice_html}
 <h2>By signal</h2><table><tr><th>Signal</th><th>Correct</th><th>Avg score</th></tr>{per}</table>
-<h2>Attempts</h2><table><tr><th>Time</th><th>Target</th><th>Verdict</th><th>Score</th><th>Points</th><th>Hold (s)</th><th>Failed checks</th><th>Feedback</th></tr>{rows}</table>
+<h2>Attempts</h2><p style="color:#666;font-size:12px">"All levels" shows how the SAME captured movement would be judged at every difficulty
+(B=Beginner, S=Standard, R=Referee; C/A/I = Correct/Almost/Incorrect), not just the level this session used.</p>
+<table><tr><th>Time</th><th>Target</th><th>Verdict</th><th>Score</th><th>Points</th><th>Hold (s)</th><th>All levels</th><th>Failed checks</th><th>Feedback</th></tr>{rows}</table>
 </body></html>"""
     with open(path, "w", encoding="utf-8") as f:
         f.write(doc)
@@ -1819,8 +2238,11 @@ def main(argv=None):
             set_cv_theme(trainer_ui.current_theme())
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(WINDOW_NAME, 1280, 720)
-            summary = Session(backend, trainee, choice, whistle).run()
-            last_summary = summary["one_line"]
+            while True:
+                summary = Session(backend, trainee, choice, whistle).run()
+                last_summary = summary["one_line"]
+                if not summary.get("restart") or summary.get("error") or summary.get("camera_lost"):
+                    break                         # R on the summary screen ("do it again") runs the same session again
             cv2.destroyAllWindows()
             for _ in range(3):
                 cv2.waitKey(1)

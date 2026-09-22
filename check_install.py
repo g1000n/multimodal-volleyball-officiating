@@ -40,7 +40,7 @@ OPTIONAL_FILES = {
     os.path.join("tests", "test_trainer_smoke.py"): "trainer tests",
 }
 PACKAGES = [("numpy", True), ("cv2", True), ("tkinter", True), ("mediapipe", True), ("torch", True),
-            ("sounddevice", False)]
+            ("sounddevice", False), ("psutil", False)]
 
 problems = []
 notes = []
@@ -82,8 +82,12 @@ def check_packages():
                    f"pip install {'opencv-python' if pkg == 'cv2' else pkg}"
             problems.append(f"package '{pkg}' is missing ({hint}).")
         if not found and not required:
-            notes.append(f"'{pkg}' is not installed: the microphone test and the whistle will not work "
-                         f"(pip install {pkg}); press W as the whistle instead.")
+            if pkg == "psutil":
+                notes.append("'psutil' is not installed: CPU and memory are not measured for the performance figures "
+                             "(pip install psutil). Speed (frames per second) is still measured.")
+            else:
+                notes.append(f"'{pkg}' is not installed: the microphone test and the whistle will not work "
+                             f"(pip install {pkg}); press W as the whistle instead.")
 
 
 def parse(path):

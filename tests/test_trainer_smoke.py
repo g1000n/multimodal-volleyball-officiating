@@ -8,6 +8,7 @@ grading hookup and report writing run without hardware, MediaPipe, PyTorch or a 
 Run:  python tests/test_trainer_smoke.py [--save-frames DIR]
 """
 
+import csv
 import os
 import random
 import shutil
@@ -56,18 +57,25 @@ class FakeCap:
 
 
 class FakeBackend(trainer.Backend):
-    def __init__(self, clock, always_show=None):
+    def __init__(self, clock, always_show=None, script=None):
         super().__init__(FakeCap(clock), self._extract, self._classify, IDX_TO_LABEL)
         self.session = None
         self.clock = clock
         self.always_show = always_show      # practice mode: label to perform continuously
+        self.script = script                # match_test: [(t_start, t_end, label_or_None), ...] since session start
         self.n = 0
 
     def _extract(self, frame):
         s = self.session
         self.n += 1
         label, side = None, "right"
-        if self.always_show:
+        if self.script is not None and self.session is not None and self.session._t0 is not None:
+            elapsed = self.clock() - self.session._t0
+            for t_start, t_end, seg_label in self.script:
+                if t_start <= elapsed < t_end:
+                    label = seg_label
+                    break
+        elif self.always_show:
             label = self.always_show
         elif s is not None and s.phase == "capture" and s.step:
             elapsed = self.clock() - s.phase_t0
@@ -116,7 +124,12 @@ class FakeHub:
         pass
 
     def manual(self):
-        self.times.append(self.clock() if self.clock else 0.0)
+        now = self.clock() if self.clock else 0.0
+        self.times.append(now)
+        self.events = getattr(self, "events", []) + [{"t": now, "source": "manual", "confidence": None}]
+
+    def events_since(self, t):
+        return [dict(e) for e in getattr(self, "events", []) if e["t"] >= t]
 
     def first_since(self, t):
         c = [x for x in self.times if x >= t]
@@ -163,6 +176,10 @@ class TestSession(trainer.Session):
     def _key(self):
         if self.frames_seen > self.max_frames:
             return 27
+        if (self.mode == "match_test" and getattr(self, "_mt_test_whistle_at", None) is not None
+                and self._t0 is not None and not self.whistle.times
+                and (self.clock() - self._t0) >= self._mt_test_whistle_at):
+            return ord("w")
         if self.phase == "capture" and self.step and self.step.get("whistle") and self.whistle_at is not None \
                 and self.clock() - self.phase_t0 > self.whistle_at and self.whistle.first_since(self.phase_t0) is None:
             return ord("w")
@@ -173,11 +190,15 @@ class TestSession(trainer.Session):
             if self.phase == "intro" and not self.auto_go and self.clock() - self.phase_t0 > 0.3:
                 return 32
             if self.phase == "summary" and self.clock() - self.phase_t0 > 0.3:
+                if getattr(self, "press_r", False):
+                    return ord("r")
                 self.summary_keys = getattr(self, "summary_keys", 0) + 1
                 return ord("d") if self.summary_keys == 1 else 32
             return 255
         if self.mode == "practice":
             return 27 if self.frames_seen > 60 else 255
+        if self.mode == "match_test":
+            return 27 if self.frames_seen > getattr(self, "mt_end_after", 220) else 255
         if self.phase == "intro" and self.clock() - self.phase_t0 > 0.3:
             step = self.step
             if step["kind"] == "whistle":
@@ -194,14 +215,20 @@ class TestSession(trainer.Session):
         return 255
 
 
-def run_mode(mode, tmp, save_dir, gesture=None, level="standard", hands_off=False, whistle_at=0.3, **extra):
+def run_mode(mode, tmp, save_dir, gesture=None, level="standard", hands_off=False, whistle_at=0.3, press_r=False,
+            script=None, mt_end_after=None, mt_whistle_at=None, **extra):
     clock = FakeClock()
-    be = FakeBackend(clock, always_show="ball_out" if mode == "practice" else None)
+    be = FakeBackend(clock, always_show="ball_out" if mode == "practice" else None, script=script)
     trainee = {"trainee_id": "tester", "display_name": "Tester"}
     choice = {"action": "start", "mode": mode, "gesture": gesture, "level": level, **extra}
     sess = TestSession(be, trainee, choice, FakeHub(clock), clock=clock, rng=random.Random(3), save_dir=save_dir)
     sess.hands_off = hands_off
     sess.whistle_at = whistle_at
+    sess.press_r = press_r
+    if mt_end_after is not None:
+        sess.mt_end_after = mt_end_after
+    if mt_whistle_at is not None:
+        sess._mt_test_whistle_at = mt_whistle_at
     summary = sess.run()
     return sess, summary
 
@@ -371,6 +398,81 @@ def test_performance_is_measured_and_reported():
     print("performance OK   ", [l for l in res.stdout.splitlines() if l.startswith("drill")][0][:70])
 
 
+def test_match_test_mode():
+    """Match Testing: continuous, unscripted grading of a real performer. No countdown, no expected order, no fixed
+    capture window. A run is graded and logged the moment the detected label changes; the scoreboard follows the
+    trainee's Team to Serve calls; a whistle blown at any point is logged (purely observational, not required)."""
+    tmp = tempfile.mkdtemp()
+    old_cwd = os.getcwd()
+    os.chdir(tmp)
+    try:
+        script = [
+            (0.0, 1.0, None),                          # arms down
+            (1.0, 3.0, "team_to_serve_left"),          # a clean 2 s hold
+            (3.0, 3.3, None),
+            (3.3, 5.3, "ball_out"),                    # a clean 2 s hold
+            (5.3, 6.5, None),
+        ]
+        sess, summary = run_mode("match_test", tmp, None, level="standard", script=script, mt_end_after=160,
+                                 mt_whistle_at=1.8)
+        gest = [a for a in sess.attempts if a["kind"] == "gesture"]
+        assert [a["target"] for a in gest] == ["team_to_serve_left", "ball_out"], gest
+        assert all(a["verdict"] in ("CORRECT", "ALMOST") for a in gest), gest
+        assert sess.serving == "left", sess.serving
+        assert sess.team["left"] >= 1, sess.team
+        assert sess.mt_last_result is not None and sess.mt_last_result.target == "ball_out"
+        assert sess.mt_in_run is False           # both runs were properly closed, nothing left dangling
+        # the whistle blown mid-hold was logged (purely observational; nothing required it)
+        log = open(os.path.join(sess.dir, "session_log.csv"), encoding="utf-8").read()
+        assert "whistle_heard" in log and "match test whistle #1" in log, log
+        # a movement file was saved for each graded run, so thresholds can be re-checked later
+        npz_dir = os.path.join(sess.dir, "attempts")
+        saved = sorted(os.listdir(npz_dir)) if os.path.isdir(npz_dir) else []
+        assert len(saved) == 2 and any("team_to_serve_left" in f for f in saved) and any("ball_out" in f for f in saved), saved
+        # the summary screen (A/D review) works with no scripted queue behind it
+        assert sess.phase in ("summary", "done"), sess.phase
+        for fn in ("attempts.csv", "summary.json", "report.html"):
+            assert os.path.exists(os.path.join(sess.dir, fn)), fn
+        print("match_test OK  ", summary["one_line"], "| serving", sess.serving, "| team", sess.team)
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_match_test_flicker_is_discarded_and_run_continues_across_a_pause():
+    """A very brief, flickering detection (well under the model's own natural hold) is discarded quietly, not
+    graded as a near-empty attempt."""
+    tmp = tempfile.mkdtemp()
+    old_cwd = os.getcwd()
+    os.chdir(tmp)
+    try:
+        script = [(0.0, 0.5, None), (0.5, 0.65, "double_contact"), (0.65, 2.0, None)]   # a 0.15 s blip
+        sess, summary = run_mode("match_test", tmp, None, level="standard", script=script, mt_end_after=80)
+        gest = [a for a in sess.attempts if a["kind"] == "gesture"]
+        assert gest == [], gest
+        print("match_test flicker OK   (discarded, not logged)")
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_match_test_flush_on_early_quit():
+    """Pressing Q mid-hold (session ends early) still grades and saves whatever was in progress, instead of
+    silently dropping the performer's last signal."""
+    tmp = tempfile.mkdtemp()
+    old_cwd = os.getcwd()
+    os.chdir(tmp)
+    try:
+        script = [(0.0, 0.5, None), (0.5, 30.0, "ball_out")]   # a long hold; ends only when Q cuts the session short
+        sess, summary = run_mode("match_test", tmp, None, level="standard", script=script, mt_end_after=40)
+        gest = [a for a in sess.attempts if a["kind"] == "gesture"]
+        assert len(gest) == 1 and gest[0]["target"] == "ball_out", gest
+        print("match_test flush OK   the in-progress run was graded when the session ended early")
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     test_camera_fallback()
     test_devices()
@@ -384,16 +486,51 @@ def main():
     try:
         test_camera_lost_and_crash_keep_the_results()
         test_performance_is_measured_and_reported()
+        test_match_test_mode()
+        test_match_test_flicker_is_discarded_and_run_continues_across_a_pause()
+        test_match_test_flush_on_early_quit()
 
         # practice
         sess, summary = run_mode("practice", tmp, save_dir)
         assert sess.stable_label == "ball_out", sess.stable_label
         print("practice   OK   stable label:", sess.stable_label)
 
+        # practice mode logs every detection event (documentation for the paper), even though it is not scored
+        assert os.path.exists(os.path.join(sess.dir, "practice_log.csv")), "practice_log.csv should be written"
+        prows = list(csv.DictReader(open(os.path.join(sess.dir, "practice_log.csv"), encoding="utf-8")))
+        assert len(prows) >= 1 and any(r["detected_label"] != "nothing" for r in prows), prows
+        assert "<h2>Practice log</h2>" in open(os.path.join(sess.dir, "report.html"), encoding="utf-8").read()
+        print("practice log OK  ", len(prows), "detection events logged")
+
+        # Practice mode ALSO produces a real, fully graded score per held signal (not just live checks), at all
+        # three difficulty levels, even though nothing is shown as a live score during Practice itself
+        assert os.path.exists(os.path.join(sess.dir, "practice_scores.csv")), "practice_scores.csv should be written"
+        psrows = list(csv.DictReader(open(os.path.join(sess.dir, "practice_scores.csv"), encoding="utf-8")))
+        assert len(psrows) >= 1, psrows
+        for r in psrows:
+            assert r["target"] == "ball_out" and r["verdict"] in ("CORRECT", "ALMOST", "INCORRECT")
+            for lv in ("beginner", "standard", "referee"):
+                assert r[f"score_{lv}"] != "" and r[f"verdict_{lv}"] in ("CORRECT", "ALMOST", "INCORRECT")
+        assert sess.mt_last_result is not None and sess.mt_last_result.target == "ball_out"
+        assert "<h2>Practice: fully graded holds</h2>" in open(os.path.join(sess.dir, "report.html"), encoding="utf-8").read()
+        print("practice score OK ", len(psrows), "fully graded holds, e.g.", psrows[0]["score_referee"], "at referee")
+        print("practice log OK  ", len(prows), "detection events logged")
+
         # drill: three graded attempts of one signal
         sess, summary = run_mode("drill", tmp, save_dir, gesture="team_to_serve_left")
         assert summary["attempts"] == 3 and summary["correct"] == 3 and summary["points"] == 30, summary
         print("drill      OK  ", summary["one_line"])
+
+        # every gesture attempt also shows how the SAME capture would grade at every difficulty level
+        for a in sess.attempts:
+            for lv in ("beginner", "standard", "referee"):
+                assert a[f"score_{lv}"] != "" and a[f"verdict_{lv}"] in ("CORRECT", "ALMOST", "INCORRECT"), a
+        with open(os.path.join(sess.dir, "attempts.csv"), newline="", encoding="utf-8") as f:
+            csv_rows = list(csv.DictReader(f))
+        assert csv_rows and all(r["score_referee"] != "" for r in csv_rows), csv_rows
+        assert "All levels" in open(os.path.join(sess.dir, "report.html"), encoding="utf-8").read()
+        print("multi-level OK   drill attempt graded at",
+              {lv: sess.attempts[0][f"score_{lv}"] for lv in ("beginner", "standard", "referee")})
 
         # drill with repetitions: runs back to back with no key presses, every rep is listed
         sess, summary = run_mode("drill", tmp, save_dir, gesture="ball_out", hands_off=True, reps=4)
@@ -408,6 +545,7 @@ def main():
                                          for i in (0, 2)), targets
         assert summary["correct"] == 4, summary
         print("combo x2   OK  ", targets)
+
 
         # optional FIVB pictures: assets/signals/<label>.png is shown while getting ready
         os.makedirs(os.path.join("assets", "signals"))
@@ -460,6 +598,33 @@ def main():
                              capture_output=True, text=True)
         assert res.returncode == 0 and "unchanged" in res.stdout.lower(), res.stdout + res.stderr
         print("regrade    OK  ", [l for l in res.stdout.splitlines() if "unchanged" in l.lower()][0].strip())
+
+        # logging: whistle events (time, auto or manual) and a full session log, also in the report
+        sess, summary = run_mode("drill", tmp, save_dir, gesture="team_to_serve_left", hands_off=True, reps=2, whistle=True)
+        import csv as _csv2
+        with open(os.path.join(sess.dir, "whistle_events.csv"), newline="", encoding="utf-8") as fh:
+            wrows = list(_csv2.DictReader(fh))
+        assert len(wrows) == 2 and all(r["source"] == "manual" and r["judged_as"].startswith("on time") for r in wrows), wrows
+        assert all(r["attempt_no"] and r["signal"] == "team_to_serve_left" and r["seconds_after_go"] for r in wrows), wrows
+        with open(os.path.join(sess.dir, "session_log.csv"), newline="", encoding="utf-8") as fh:
+            events = [r["event"] for r in _csv2.DictReader(fh)]
+        for needed in ("session_start", "step_start", "capture_start", "whistle_heard", "verdict", "session_end"):
+            assert needed in events, (needed, events)
+        report = open(os.path.join(sess.dir, "report.html"), encoding="utf-8").read()
+        assert "Whistle log" in report and "manual" in report
+        print("logs       OK   whistle_events.csv, session_log.csv, report:", len(wrows), "whistles,", len(events), "log lines")
+
+        # R on the summary screen = do the same session again
+        sess, summary = run_mode("drill", tmp, save_dir, gesture="ball_out", hands_off=True, reps=2, press_r=True)
+        assert summary["restart"] is True and summary["attempts"] == 2, summary
+        with open(os.path.join(sess.dir, "session_log.csv"), newline="", encoding="utf-8") as fh:
+            assert "do_again" in [r["event"] for r in _csv2.DictReader(fh)]
+        print("do again   OK   summary R restarts the session")
+
+        # simulation length follows the repetitions / rallies choice (5 rallies = 2 * 5 + 1 steps)
+        sess, summary = run_mode("sim", tmp, save_dir, level="beginner", hands_off=True, continuous=True, reps=5)
+        assert len(sess.queue) == 11 and summary["correct"] == summary["attempts"], (len(sess.queue), summary)
+        print("sim rallies OK  5 rallies")
 
         # light theme renders every screen without errors (frames saved for a visual check)
         trainer.set_cv_theme("light")

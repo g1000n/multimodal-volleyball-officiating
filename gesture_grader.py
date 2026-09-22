@@ -99,6 +99,7 @@ W_HOLD = 10
 W_FORM = 40
 W_READY = 2
 
+FRAMES_PER_STEP = 3          # the model looks at the movement every 3 camera frames (trainer.INFERENCE_EVERY_N_FRAMES)
 MIN_POSE_FRACTION = 0.6      # below this, the body was not seen well enough to grade
 MIN_ARM_VISIBLE_FRAC = 0.5   # an arm checked by a rule must be visible in >= this fraction of frames
 MIN_HAND_COVERAGE = 0.3      # hand-detection coverage needed to trust finger checks
@@ -181,11 +182,11 @@ SIGNALS: Dict[str, dict] = {
         "howto": [
             "Stand about 2 m from the camera, facing it, arms relaxed. In a match the whistle comes first (FIVB 12.3, 22.2.1.1).",
             "Bend your LEFT elbow and bring your OPEN hand in front of your body at chest height, about the level of your upper arm (bicep), forearm roughly level.",
-            "Sweep the hand smoothly toward the serving team on your left, once or twice. Keep the sweep at that chest height.",
+            "Sweep the hand smoothly toward the serving team on your left, once or twice, at an unhurried pace. Keep the WHOLE sweep at that chest height (not up above the shoulders, not down at the belly).",
             "Keep the hand open (not a fist) and the other arm relaxed.",
             "Hold the final position for about a second, then lower the arm.",
         ],
-        "mistakes": ["Hand above the shoulders or down at the belly", "Hand not moving (static pose)",
+        "mistakes": ["Hand swinging up above the shoulders or down at the belly", "A fast flick instead of a smooth sweep", "Hand not moving (static pose)",
                      "Arm fully straight like Team to Serve", "Hand closed into a fist", "Using the wrong hand"],
         "not_graded": "FIVB gives no height for the sweep. The chest (upper arm) level is referee guidance used by this trainer, not FIVB text.",
     },
@@ -196,11 +197,11 @@ SIGNALS: Dict[str, dict] = {
         "howto": [
             "Stand about 2 m from the camera, facing it, arms relaxed. In a match the whistle comes first (FIVB 12.3, 22.2.1.1).",
             "Bend your RIGHT elbow and bring your OPEN hand in front of your body at chest height, about the level of your upper arm (bicep), forearm roughly level.",
-            "Sweep the hand smoothly toward the serving team on your right, once or twice. Keep the sweep at that chest height.",
+            "Sweep the hand smoothly toward the serving team on your right, once or twice, at an unhurried pace. Keep the WHOLE sweep at that chest height (not up above the shoulders, not down at the belly).",
             "Keep the hand open (not a fist) and the other arm relaxed.",
             "Hold the final position for about a second, then lower the arm.",
         ],
-        "mistakes": ["Hand above the shoulders or down at the belly", "Hand not moving (static pose)",
+        "mistakes": ["Hand swinging up above the shoulders or down at the belly", "A fast flick instead of a smooth sweep", "Hand not moving (static pose)",
                      "Arm fully straight like Team to Serve", "Hand closed into a fist", "Using the wrong hand"],
         "not_graded": "FIVB gives no height for the sweep. The chest (upper arm) level is referee guidance used by this trainer, not FIVB text.",
     },
@@ -278,8 +279,8 @@ for _label, _txt in _COMPARE.items():
 # Every graded check is taught in one of the numbered "how to" steps above (tests/test_gesture_grader.py enforces it).
 _TTS_TAUGHT = {"arm_extended": 3, "points_to_side": 2, "no_contraction": 2, "hands_open": 3, "other_arm_down": 4,
                "ready_position": 4}
-_SA_TAUGHT = {"arm_bent": 2, "hand_moves": 3, "at_chest": 2, "hands_open": 4, "toward_side": 3, "other_arm_down": 4,
-              "ready_position": 5}
+_SA_TAUGHT = {"arm_bent": 2, "hand_moves": 3, "at_chest": 3, "sweep_pace": 3, "hands_open": 4, "toward_side": 3,
+              "other_arm_down": 4, "ready_position": 5}
 _TAUGHT = {
     "team_to_serve_left": _TTS_TAUGHT, "team_to_serve_right": _TTS_TAUGHT,
     "service_authorization_left": _SA_TAUGHT, "service_authorization_right": _SA_TAUGHT,
@@ -335,10 +336,18 @@ TRANSITION_CONFUSIONS = {
                        "service_authorization_right", "end_of_set"},
     "end_of_set": {"ball_out"},
 }
+# Always ignored for "looked like ..." feedback, even when the target was never recognised: Service Authorization and
+# End of Set are both bent-arm-near-torso poses the model sometimes swaps, and telling a trainee "your Authorization
+# looked like End of Set" is not an actionable correction. The geometric arm_bent check already covers the real issue.
+ALWAYS_IGNORED_CONFUSIONS = {
+    "service_authorization_left": {"end_of_set"},
+    "service_authorization_right": {"end_of_set"},
+}
 
 # Open hands: the FIVB text names them for Ball Out and End of Set, and the FIVB illustrations show an open hand for the
 # other signals too. Reading fingers from one camera can be wrong, so by default a closed hand only costs a few points
 # and shows a "keep your hand open" tip; it does NOT change the verdict. True = a visible fist caps the verdict at ALMOST.
+HOLD_OK_FRACTION = 0.35   # a CORRECT verdict needs the signal to be held at least this share of the required time
 OPEN_HAND_STRICT = bool(getattr(_tc, "OPEN_HAND_STRICT", False))
 
 
@@ -421,6 +430,26 @@ class Arm:
 
     def pct(self, arr, q):
         return _pct(arr, self.mask, q)
+
+    def band_excess(self, arr, lo, hi):
+        """How far the highest (10th percentile) and lowest (90th percentile) positions stray outside the band lo..hi.
+        Unlike the median this cannot be fooled by a movement that goes high and low and averages out to 'chest'."""
+        top, bottom = _pct(arr, self.mask, 10), _pct(arr, self.mask, 90)
+        if not (math.isfinite(top) and math.isfinite(bottom)):
+            return float("nan")
+        return float(max(0.0, lo - top, bottom - hi))
+
+    def peak_speed(self, dt):
+        """Fast end of the wrist speed (95th percentile of a 3 frame average) in shoulder widths per second."""
+        if not dt or dt <= 0:
+            return float("nan")
+        x = np.where(self.mask, self.pos_x, np.nan)
+        y = np.where(self.mask, self.pos_y, np.nan)
+        sp = np.hypot(np.diff(x), np.diff(y)) / dt
+        sp = sp[np.isfinite(sp)]
+        if len(sp) < 3:
+            return float("nan")
+        return float(np.percentile(np.convolve(sp, np.ones(3) / 3.0, mode="valid"), 95))
 
     def motion(self):
         """Size of the wrist's sweep in shoulder widths (robust range, not path length,
@@ -536,7 +565,8 @@ def _fmt_need(ge, le, unit):
 
 # Threshold / effect overrides typed in trainer_config.py:
 #   GRADER_OVERRIDES = {"service_authorization.hand_moves": {"ge": (0.5, 1.0, 1.4)},          # beginner, standard, referee
-#                       "service_authorization_left.arm_bent": {"le": 140, "effect": "important"}}
+#                       "service_authorization_left.arm_bent": {"le": 140, "effect": "important"},
+#                       "ball_out.arms_raised": {"le": (55, 45, 40)}}                             # tighter than the FIVB-picture default below
 # The key is "<signal>.<check id>": the signal without _left/_right applies to both sides, with it to that side only.
 # "ge" = minimum, "le" = maximum (a number for all levels, or a (beginner, standard, referee) tuple),
 # "effect" = "required" | "important" | "scored", "weight" = points. See tools/export_rubric.py --print for the ids.
@@ -613,7 +643,7 @@ def _rules_team_to_serve(g: Geo, lv: str, side: str, gcap=None, ctx=None) -> Lis
            tip=f"Swing your {side} arm from your side to the pointing position in one movement; do not fold it in first"),
         _c("hands_open", "Hand open (as in the FIVB illustration)", 4, False,
            None if n_open is None else float(n_open), ge=pick(lv, 2, 3, 4), verifiable=n_open is not None,
-           strict=OPEN_HAND_STRICT, basis="TRAINING",
+           strict=(lv == "referee" or OPEN_HAND_STRICT), basis="TRAINING",
            tip="Keep your hand open with the fingers extended, not a fist"),
         _c("other_arm_down", "Other arm kept down (one-arm signal)", 4, False,
            O.mid(O.from_down), le=pick(lv, 55, 40, 30), unit=" deg", arm=O,
@@ -625,21 +655,28 @@ def _rules_authorization(g: Geo, lv: str, side: str, gcap=None, ctx=None) -> Lis
     A, O = g.arm(side), g.arm(_other(side))
     S = side.upper()
     n_open = g.hand(side).extended_count()
+    dt = (ctx or {}).get("dt")
+    lo_band, hi_band = pick(lv, -0.15, 0.0, 0.05), pick(lv, 0.80, 0.65, 0.55)
+    speed = A.peak_speed(dt)
     return [
-        _c("arm_bent", f"{S} elbow bent for the sweeping motion", 8, False, A.mid(A.elbow),
+        _c("arm_bent", f"{S} elbow bent for the sweeping motion", 7, False, A.mid(A.elbow),
            le=pick(lv, 150, 145, 140), unit=" deg", arm=A, basis="TRAINING", strict=(lv != "beginner"),
            tip=f"Bend your {side} elbow; a nearly straight arm is sloppy and reads as Team to Serve"),
-        _c("hand_moves", "Hand moves (FIVB: move the hand to indicate the direction)", 12, True,
+        _c("hand_moves", "Hand moves (FIVB: move the hand to indicate the direction)", 11, True,
            A.motion(), ge=pick(lv, 0.5, 1.0, 1.4), arm=A,
            tip="Make a clearer sweeping motion with your hand; a still pose is not this signal"),
-        _c("at_chest", "Sweep at chest (upper arm) level", 9, False, A.mid(A.wr_frac),
-           ge=pick(lv, -0.15, 0.0, 0.05), le=pick(lv, 0.80, 0.65, 0.55), arm=A, strict=True, basis="TRAINING",
-           tip="Keep the sweep at chest height, about the level of your upper arm: not above the shoulders, not down at the belly"),
-        _c("hands_open", "Hand open (as in the FIVB illustration)", 6, False,
+        _c("at_chest", "Whole sweep stays at chest (upper arm) level", 9, False,
+           A.band_excess(A.wr_frac, lo_band, hi_band), le=pick(lv, 0.25, 0.15, 0.10), arm=A, strict=True,
+           basis="TRAINING",
+           tip="Keep the WHOLE sweep at chest height, about the level of your upper arm: not up above the shoulders and not down at the belly"),
+        _c("sweep_pace", "Sweep at an unhurried pace (not a flick)", 4, False, speed,
+           le=pick(lv, 14.0, 9.0, 7.0), arm=A, verifiable=math.isfinite(speed), basis="TRAINING",
+           tip="Slow the sweep down: a smooth, controlled movement, not a fast flick"),
+        _c("hands_open", "Hand open (as in the FIVB illustration)", 5, False,
            None if n_open is None else float(n_open), ge=pick(lv, 2, 3, 4), verifiable=n_open is not None,
-           strict=OPEN_HAND_STRICT, basis="TRAINING",
+           strict=(lv == "referee" or OPEN_HAND_STRICT), basis="TRAINING",
            tip="Keep your hand open with the fingers extended, not a fist"),
-        _c("toward_side", f"Hand travels toward the {side} side (direction of service)", 3, False,
+        _c("toward_side", f"Hand travels toward the {side} side (direction of service)", 2, False,
            A.hi(A.wr_out), ge=pick(lv, -0.4, -0.2, 0.0), arm=A,
            tip=f"Sweep your hand further toward your {side} side"),
         _c("other_arm_down", "Other arm kept down", 2, False, O.mid(O.from_down),
@@ -670,7 +707,7 @@ def _rules_ball_in(g: Geo, lv: str, gcap=None, ctx=None) -> List[Check]:
         _c("arm_lowered", "Arm pointing toward the floor", 14, False, A.mid(A.from_down),
            le=pick(lv, 70, 55, 50), unit=" deg", arm=A, strict=True,
            tip="Point the arm lower, toward the floor, not out to the side"),
-        _c("hand_open", "Fingers extended (FIVB: arm and fingers)", 8, False,
+        _c("hand_open", "Fingers extended (FIVB: arm and fingers)", 8, False,  # stays lenient: Ball In is the weakest model class  # critical=False: Ball In stays a lenient signal (weakest model class)
            None if n_open is None else float(n_open), ge=pick(lv, 2, 3, 4), verifiable=n_open is not None,
            tip="Keep your fingers open and straight, do not make a fist"),
         _c("other_arm_relaxed", "Other arm relaxed", 4, False, O.mid(O.from_down),
@@ -699,14 +736,20 @@ def _rules_ball_out(g: Geo, lv: str, gcap=None, ctx=None) -> List[Check]:
         _c("forearms_vertical", "BOTH forearms vertical (FIVB: raise the forearms vertically)", 12, True,
            worst_fore, le=pick(lv, 40, 30, 20), unit=" deg", verifiable=both_vis,
            tip="Raise BOTH forearms straight up; keep them vertical, not leaning"),
-        _c("arms_raised", "Elbows lifted out to the sides, armpits open (full marks)", 12, ARMPITS_REQUIRED, least_raised,
-           ge=pick(lv, 20, 40, 60), unit=" deg", verifiable=both_vis, basis="TRAINING",
-           tip="For the full form lift your elbows up and out to about shoulder height so your armpits are open"),
+        _c("arms_raised", "Elbows a little away from the body, armpits slightly open (full marks)", 12, ARMPITS_REQUIRED,
+           least_raised, ge=pick(lv, 10, 20, 30), le=pick(lv, 85, 80, 76), unit=" deg", verifiable=both_vis,
+           basis="TRAINING",
+           # Upper bound calibrated 2026-09-22 from a real Referee-level attempt measuring 67.7 deg (verdict CORRECT
+           # when captured); the bound is set a comfortable margin above that, not just above the synthetic full
+           # T-pose test (~90 deg). Still a placeholder for the T-pose side: a real over-the-limit sample would let
+           # this be tightened with confidence instead of guessed.
+           tip="Lift your elbows a LITTLE away from your body, as in the FIVB picture; not fully flat down and not a "
+               "stiff sideways T with the arms at shoulder height"),
         _c("arms_symmetric", "Both arms at the same height", 5, False, asym,
            le=pick(lv, 0.6, 0.4, 0.3), verifiable=both_vis,
            tip="Raise both arms to the same height"),
         _c("hands_open", "Hands open (FIVB: hands open)", 6, False, worst_open,
-           ge=pick(lv, 2, 3, 4), verifiable=worst_open is not None, strict=OPEN_HAND_STRICT,
+           ge=pick(lv, 2, 3, 4), verifiable=worst_open is not None, strict=(lv == "referee" or OPEN_HAND_STRICT),
            tip="Keep both hands open with the fingers extended"),
         _c("elbows_bent", "Elbows bent, forearms up (not arms straight overhead)", 5, True, worst_elbow,
            le=pick(lv, 150, 135, 125), unit=" deg", verifiable=both_vis,
@@ -796,7 +839,7 @@ def _rules_end_of_set(g: Geo, lv: str, gcap=None, ctx=None) -> List[Check]:
         _c("elbows_bent", "Elbows bent", 6, False, worst_elbow, le=pick(lv, 150, 135, 125), unit=" deg",
            verifiable=both_vis, tip="Bend your elbows to bring the forearms across your chest"),
         _c("hands_open", "Hands open (FIVB: hands open)", 8, False, worst_open,
-           ge=pick(lv, 2, 3, 4), verifiable=worst_open is not None, strict=OPEN_HAND_STRICT,
+           ge=pick(lv, 2, 3, 4), verifiable=worst_open is not None, strict=(lv == "referee" or OPEN_HAND_STRICT),
            tip="Keep your hands open with the fingers extended and turned toward the camera"),
     ]
 
@@ -968,6 +1011,7 @@ def grade_attempt(target: str, capture_frames, window_records, label_to_idx: Dic
     # While the target IS recognised, windows of a neighbouring signal are just the movement passing through and are ignored.
     # When the target was NOT recognised, the neighbour is reported ("the system saw X instead").
     ignored = TRANSITION_CONFUSIONS.get(target, set()) if recognized else set()
+    ignored = ignored | ALWAYS_IGNORED_CONFUSIONS.get(target, set())
     other_counts = Counter(lab for lab in labels if lab not in (target, NOTHING_LABEL) and lab not in ignored)
     dom_other, dom_n = (other_counts.most_common(1)[0] if other_counts else (None, 0))
 
@@ -976,8 +1020,10 @@ def grade_attempt(target: str, capture_frames, window_records, label_to_idx: Dic
     rec_end = window_records[analysis_i].get("end")
     if rec_end is not None:
         motion_cap = capture[:max(6, min(int(rec_end), len(capture)))]   # up to the end of the hold, not the release
+    rule_ctx = dict(context or {})
+    rule_ctx["dt"] = step_seconds / FRAMES_PER_STEP            # seconds between two camera frames, for the pace check
     checks = grade_form_only(target, window_records[analysis_i]["frames"], level, aspect,
-                             capture_frames=motion_cap, context=context)
+                             capture_frames=motion_cap, context=rule_ctx)
     ready = None
     if check_ready:
         tail = capture[-6:] if len(capture) >= 6 else capture
@@ -1002,7 +1048,7 @@ def grade_attempt(target: str, capture_frames, window_records, label_to_idx: Dic
 
     critical_failed = any((c.critical or c.strict) and c.status == "fail" for c in checks)
     critical_unverified = any(c.critical and c.status == "unverified" for c in checks)
-    hold_ok = hold_seconds >= 0.35 * hold_req
+    hold_ok = hold_seconds >= HOLD_OK_FRACTION * hold_req
     other_dominates = dom_other is not None and dom_n >= 2 and dom_n > n_target
 
     note = ""
@@ -1147,9 +1193,18 @@ def graded_summary(label: str, ctx: Optional[dict] = None):
     return out
 
 
+def grade_at_all_levels(target, capture, window_records, label_to_idx, aspect=9.0 / 16.0, step_seconds=0.2,
+                        context=None):
+    """Grades the SAME captured movement at all three difficulty levels at once (Beginner, Standard, Referee), so a
+    report can show how one real performance would be judged at every level, without re-capturing anything."""
+    return {lv: grade_attempt(target, capture, window_records, label_to_idx, level=lv, aspect=aspect,
+                              step_seconds=step_seconds, context=context) for lv in LEVELS}
+
+
 def scoring_note(level: str = "standard") -> str:
     cfg = LEVEL_CONFIG[level]
     return (f"Also scored: the system must recognise the signal ({W_RECOGNITION} points) and how clearly ({W_DISTINCT}), "
             f"how long you hold it ({W_HOLD}), and lowering your arms afterwards ({W_READY}, minor). "
-            f"You do not need 100/100: {cfg.correct_cut} or more counts as CORRECT at {cfg.name} level, "
-            f"{cfg.almost_cut} or more is ALMOST.")
+            f"You do not need 100/100: {cfg.correct_cut} or more counts as CORRECT at {cfg.name} level and "
+            f"{cfg.almost_cut} or more is ALMOST. Each attempt adds session points to your total "
+            f"(CORRECT 10, ALMOST 5, INCORRECT 0).")

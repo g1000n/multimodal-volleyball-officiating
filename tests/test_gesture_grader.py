@@ -95,12 +95,12 @@ def g_tts(side, deg=70, bend=False, fingers=None):
     return fn
 
 
-def g_auth(side, moving=True, straight=False, fingers=None, drop=0.0, amp=1.0):
+def g_auth(side, moving=True, straight=False, fingers=None, drop=0.0, amp=1.0, rate=1.0 / 3.0, vert=0.0):
     def fn(i, m):
         s = np.array(LS if side == "left" else RS)
         e = s + np.array([out_dir(side) * 0.10, 0.10])
-        sweep = amp * SW * np.sin(i / 3.0) if moving else 0.0
-        w = e + np.array([out_dir(side) * 0.10 + out_dir(side) * sweep, -0.06 + drop])
+        sweep = amp * SW * np.sin(i * rate) if moving else 0.0
+        w = e + np.array([out_dir(side) * 0.10 + out_dir(side) * sweep, -0.06 + drop + vert * np.sin(i * rate)])
         if straight:
             e, w = straight_arm(side, 60)
         oe, ow = hanging("right" if side == "left" else "left")
@@ -130,12 +130,14 @@ def g_ball_in(deg=15, fingers=OPEN):
     return fn
 
 
-def g_ball_out(one_arm=False, fingers=OPEN):
+def g_ball_out(one_arm=False, fingers=OPEN, out_frac=0.5, down_frac=0.5):
+    """Default (out_frac=0.5, down_frac=0.5) is a moderate, natural elbows-away-from-body pose (about 45 degrees
+    from hanging), matching the FIVB picture rather than a full sideways T."""
     def fn(i, m):
         out = []
         for side in ("left", "right"):
             s = np.array(LS if side == "left" else RS)
-            e = s + np.array([out_dir(side) * 0.8 * SW, 0.2 * SW])
+            e = s + np.array([out_dir(side) * out_frac * SW, down_frac * SW])
             w = e + np.array([0.0, -FORE])
             out.append((e, w))
         if one_arm:
@@ -146,11 +148,24 @@ def g_ball_out(one_arm=False, fingers=OPEN):
 
 
 def g_ball_out_tucked(i, m):
-    """Forearms vertical but elbows tucked at the sides (armpits closed): the older / incomplete form."""
+    """Forearms vertical but elbows tucked in close to the body (armpits closed, about 6 degrees): the older / incomplete
+    form, clearly below the new band."""
     out = []
     for side in ("left", "right"):
         s = np.array(LS if side == "left" else RS)
-        e = s + np.array([out_dir(side) * 0.3 * SW, 0.7 * SW])
+        e = s + np.array([out_dir(side) * 0.1 * SW, 0.9 * SW])
+        out.append((e, e + np.array([0.0, -FORE])))
+    (le, lw), (re, rw) = out
+    return frame(le, re, lw, rw, left_fingers=OPEN, right_fingers=OPEN, mirror=m)
+
+
+def g_ball_out_full_t(i, m):
+    """A stiff, fully horizontal sideways T (about 90 degrees): the exaggerated 'meme' pose. Should score below a
+    natural, moderate opening even though it is not blocked outright."""
+    out = []
+    for side in ("left", "right"):
+        s = np.array(LS if side == "left" else RS)
+        e = s + np.array([out_dir(side) * 1.0 * SW, 0.0])
         out.append((e, e + np.array([0.0, -FORE])))
     (le, lw), (re, rw) = out
     return frame(le, re, lw, rw, left_fingers=OPEN, right_fingers=OPEN, mirror=m)
@@ -311,12 +326,15 @@ def test_ball_out():
     unseen = run(g_ball_out(fingers=None), "ball_out")     # hands not detected: NOT punished
     assert statuses(unseen)["hands_open"] == "unverified" and unseen.verdict == gg.VERDICT_CORRECT, unseen.feedback
     tucked = run(g_ball_out_tucked, "ball_out")
-    # measured on the team's own attempts: elbows are usually kept near the body, so this only costs points by default
+    # measured on the team's own attempts: elbows can be kept close to the body, so this only costs points by default
     assert statuses(tucked)["arms_raised"] == "fail" and tucked.score < ok.score, tucked.feedback
     assert tucked.verdict == gg.VERDICT_CORRECT and gg.ARMPITS_REQUIRED is False
+    full_t = run(g_ball_out_full_t, "ball_out")            # the exaggerated pose is also outside the band now
+    assert statuses(full_t)["arms_raised"] == "fail" and full_t.score < ok.score, full_t.feedback
     gg.ARMPITS_REQUIRED = True
     try:
         assert run(g_ball_out_tucked, "ball_out").verdict != gg.VERDICT_CORRECT
+        assert run(g_ball_out_full_t, "ball_out").verdict != gg.VERDICT_CORRECT
     finally:
         gg.ARMPITS_REQUIRED = False
     one = run(g_ball_out(one_arm=True), "ball_out")
@@ -658,6 +676,39 @@ def test_thresholds_can_be_overridden_from_the_config():
     assert gg._CTX["label"] is None                                                             # context is cleaned up
 
 
+def test_authorization_no_longer_mentions_end_of_set():
+    """The sweep passes through a raised-hand pose that can look like End of Set; that must not be reported."""
+    label_to_idx = {l: i for i, l in enumerate(sorted(gg.RULES))}
+    frames = np.array([idle()] * 12 + [g_auth("left")(i, False) for i in range(34)] + [idle()] * 10)
+    recs = []
+    for end in range(24, len(frames) + 1, 3):
+        share = np.mean([12 <= k < 46 for k in range(end - 24, end)])
+        probs = np.full(len(label_to_idx), 0.02)
+        lab = gg.NOTHING_LABEL
+        if share >= 0.5:
+            lab = "end_of_set" if end < 36 else "service_authorization_left"
+            probs[label_to_idx[lab]] = 0.9
+            probs[label_to_idx["service_authorization_left"]] = max(probs[label_to_idx["service_authorization_left"]], 0.8)
+        recs.append({"label": lab, "probs": probs, "frames": frames[end - 24:end], "end": end})
+    r = gg.grade_attempt("service_authorization_left", frames, recs, label_to_idx, aspect=ASPECT)
+    assert r.confused_with is None and not any("End of Set" in f for f in r.feedback), r.feedback
+
+
+def test_closed_fist_limits_verdict_at_referee_only():
+    FIST = [0, 0, 0, 0, 0]
+    for label, mk in (("team_to_serve_left", g_tts), ("service_authorization_left", g_auth), (None, g_ball_out)):
+        for lv in ("beginner", "standard"):
+            fist = run(mk("left", fingers=FIST) if label else g_ball_out(fingers=FIST), label or "ball_out", lv)
+            assert fist.verdict == gg.VERDICT_CORRECT, (label, lv, fist.verdict, fist.feedback)
+        fist_ref = run(mk("left", fingers=FIST) if label else g_ball_out(fingers=FIST), label or "ball_out", "referee")
+        assert fist_ref.verdict != gg.VERDICT_CORRECT, (label, fist_ref.verdict, fist_ref.feedback)
+    gg.OPEN_HAND_STRICT = True                     # the global switch still forces it at every level
+    try:
+        assert run(g_tts("left", fingers=FIST), "team_to_serve_left", "beginner").verdict != gg.VERDICT_CORRECT
+    finally:
+        gg.OPEN_HAND_STRICT = False
+
+
 def test_no_signal_says_so_plainly():
     label_to_idx = {l: i for i, l in enumerate(sorted(gg.RULES))}
 
@@ -677,6 +728,121 @@ def test_no_signal_says_so_plainly():
 def test_learn_notes_and_disclaimer():
     assert all(gg.SIGNALS[l].get("compare", "").startswith("Do not confuse") for l in gg.SIGNALS)
     assert "coach" in gg.DISCLAIMER and "mistakes" in gg.DISCLAIMER
+
+
+def test_sloppy_swing_high_then_down_to_the_belly_is_not_correct():
+    """The reported case: the hand swings up above the shoulder and then down to the belly. The MEDIAN height is 'chest',
+    so a median based check was fooled; the whole range must stay inside the chest band."""
+    for lv in ("standard", "referee"):
+        good = run(g_auth("left"), "service_authorization_left", lv)
+        assert statuses(good)["at_chest"] == "pass" and good.verdict == gg.VERDICT_CORRECT, (lv, good.feedback)
+        sloppy = run(g_auth("left", vert=0.20), "service_authorization_left", lv)
+        assert statuses(sloppy)["at_chest"] == "fail", (lv, {c.id: (c.value, c.status) for c in sloppy.checks})
+        assert sloppy.verdict != gg.VERDICT_CORRECT and sloppy.score < 100, (lv, sloppy.verdict, sloppy.score)
+        assert any("WHOLE sweep" in f for f in sloppy.feedback), sloppy.feedback
+
+
+def test_fast_flick_loses_points_for_pace():
+    slow = run(g_auth("left"), "service_authorization_left")
+    fast = run(g_auth("left", rate=1.5), "service_authorization_left")          # 4.5 times as fast
+    assert statuses(slow)["sweep_pace"] == "pass" and statuses(fast)["sweep_pace"] == "fail"
+    assert fast.score < slow.score and any("flick" in f for f in fast.feedback), fast.feedback
+    # the pace needs the frame time; without it the check is simply not verifiable (never a false failure)
+    checks = gg.grade_form_only("service_authorization_left",
+                                np.array([g_auth("left")(i, False) for i in range(30)]), "standard", ASPECT)
+    assert {c.id: c.status for c in checks}["sweep_pace"] == "unverified"
+
+
+def test_rubric_export_tables_add_up():
+    """Every per-signal table in the exported rubric adds up to the form weight; the parts add up to 100; the ready
+    position is listed once (not under every signal)."""
+    import re
+    import subprocess
+    import tempfile
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with tempfile.TemporaryDirectory() as tmp:
+        out = subprocess.run([sys.executable, os.path.join(root, "tools", "export_rubric.py")], cwd=tmp,
+                             capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        assert "WARNING" not in out.stdout, out.stdout
+        md = open(os.path.join(tmp, "data", "grading_rubric.md"), encoding="utf-8").read()
+    totals = [int(m) for m in re.findall(r"^\| \*\*Total\*\* \| \| \*\*(\d+)\*\*", md, flags=re.M)]
+    assert totals == [gg.W_FORM] * len(gg.RULES), totals
+    assert re.search(r"^\| \*\*Total\*\* \| \*\*100\*\* \|", md, flags=re.M)
+    assert md.count("Arms back at the ready position") == 1, md.count("Arms back at the ready position")
+
+
+def test_service_authorization_never_reports_looked_like_end_of_set():
+    """Even when the model never clearly recognises Authorization and calls the frames End of Set instead, that is
+    not shown to the trainee: it is not an actionable correction (both are bent-arm-near-torso poses)."""
+    label_to_idx = {l: i for i, l in enumerate(sorted(gg.RULES))}
+    frames = np.array([idle()] * 12 + [g_auth("left")(i, False) for i in range(34)] + [idle()] * 10)
+    recs = []
+    for end in range(24, len(frames) + 1, 3):
+        share = np.mean([12 <= k < 46 for k in range(end - 24, end)])
+        probs = np.full(len(label_to_idx), 0.02)
+        lab = gg.NOTHING_LABEL
+        if share >= 0.3:
+            lab = "end_of_set"
+            probs[label_to_idx[lab]] = 0.9
+            probs[label_to_idx["service_authorization_left"]] = 0.3   # never crosses the recognition threshold
+        recs.append({"label": lab, "probs": probs, "frames": frames[end - 24:end], "end": end})
+    r = gg.grade_attempt("service_authorization_left", frames, recs, label_to_idx, aspect=ASPECT)
+    assert r.confused_with != "end_of_set", r.confused_with
+    assert not any("end of set" in f.lower() for f in r.feedback), r.feedback
+    # a genuinely different signal is still reported (End of Set is the only one silenced)
+    recs2 = [dict(r, label=("double_contact" if r["label"] == "end_of_set" else r["label"]),
+                 probs=(lambda p: (p.__setitem__(label_to_idx["double_contact"], p[label_to_idx["end_of_set"]]), p)[1])(r["probs"].copy()))
+            for r in recs]
+    r2 = gg.grade_attempt("service_authorization_left", frames, recs2, label_to_idx, aspect=ASPECT)
+    assert r2.confused_with == "double_contact", r2.confused_with
+
+
+def test_ball_out_real_good_attempt_still_passes_at_every_level():
+    """A real Referee-level attempt from the team (2026-09-22), verdict CORRECT/100 when captured, measured
+    arms_raised = 67.7 deg. This must still pass at every level; it is the anchor that keeps the T-pose fix
+    (below) from over-tightening and rejecting genuinely good, wide-open form."""
+    def real_good(i, m):
+        # reproduces the measured elbow raise (67.7 deg from hanging) and forearms vertical, both arms
+        s = np.array(LS)
+        d1 = np.array([np.sin(np.radians(67.7)), np.cos(np.radians(67.7))])
+        e = s + UP * d1
+        w = e + FORE * np.array([0.0, -1.0])
+        rs = np.array(RS)
+        d1r = np.array([np.sin(np.radians(67.7)), np.cos(np.radians(67.7))])
+        re = rs + UP * d1r
+        rw = re + FORE * np.array([0.0, -1.0])
+        return frame(e, re, w, rw, left_fingers=OPEN, right_fingers=OPEN, mirror=m)
+    for lv in gg.LEVELS:
+        r = run(real_good, "ball_out", lv)
+        assert statuses(r)["arms_raised"] == "pass" and r.verdict == gg.VERDICT_CORRECT, (lv, r.feedback)
+
+
+def test_ball_out_full_t_pose_no_longer_scores_a_perfect_clean_attempt():
+    """A full T pose (upper arms raised sideways to shoulder height, forearms vertical) used to pass with no mistakes
+    because arms_raised had no upper bound. It must now fail arms_raised (armpits open far more than the FIVB picture
+    shows) and can no longer read as a clean attempt, even though the check is scored-only, not Required."""
+    def t_pose(i, m):
+        ls, rs = np.array(LS), np.array(RS)
+        le, re = ls + np.array([0.20, 0.0]), rs + np.array([-0.20, 0.0])       # elbow straight out to the side
+        lw, rw = le + np.array([0.0, -0.15]), re + np.array([0.0, -0.15])     # forearm vertical up
+        return frame(le, re, lw, rw, left_fingers=OPEN, right_fingers=OPEN, mirror=m)
+    for lv in ("standard", "referee"):
+        r = run(t_pose, "ball_out", lv)
+        assert statuses(r)["arms_raised"] == "fail", (lv, statuses(r))
+        assert r.score < 100 and not any(f == gg.CLEAN_LINE for f in r.feedback) if hasattr(gg, "CLEAN_LINE") else r.score < 100
+
+
+def test_grade_at_all_levels_matches_individual_calls():
+    label_to_idx = {l: i for i, l in enumerate(sorted(gg.RULES))}
+    frames = np.array([g_ball_out()(i, False) for i in range(30)])
+    recs = [{"label": "ball_out", "probs": np.full(8, 0.9), "frames": frames[max(0, i - 24):i], "end": i}
+            for i in range(24, 31, 3)]
+    all_levels = gg.grade_at_all_levels("ball_out", frames, recs, label_to_idx, aspect=ASPECT, step_seconds=0.2)
+    assert set(all_levels) == set(gg.LEVELS)
+    for lv in gg.LEVELS:
+        individual = gg.grade_attempt("ball_out", frames, recs, label_to_idx, level=lv, aspect=ASPECT, step_seconds=0.2)
+        assert all_levels[lv].score == individual.score and all_levels[lv].verdict == individual.verdict
 
 
 if __name__ == "__main__":
