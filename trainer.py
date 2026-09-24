@@ -70,6 +70,7 @@ import devices
 import gesture_grader as gg
 import trainer_ui
 from devices import open_camera   # noqa: F401  (re-exported: tests and other tools use trainer.open_camera)
+from decision_engine import DecisionEngine, SCORING_GESTURES   # unchanged, same class live_deployment.py uses
 
 # ============================================================================
 # TUNABLE SETTINGS
@@ -108,6 +109,10 @@ WHISTLE_TOLERANCE = 0.6          # the whistle may come this late after the esti
 AUTO_INTRO_SECONDS = 2.5
 AUTO_RESULT_SECONDS = 3.0
 WINDOW_NAME = "Volleyball Officiating Trainer"
+SCOREBOARD_WINDOW_NAME = "Match Testing Scoreboard"     # separate window, Match Testing only -- see
+SCOREBOARD_W, SCOREBOARD_H = 640, 300                    # _build_scoreboard_canvas / Session.run()
+MT_WIN_SCORE = 25          # Match Testing win condition, same rule as live_deployment.py's
+MT_WIN_BY_MARGIN = 2       # GAME_WIN_SCORE / GAME_WIN_BY_MARGIN -- deuce-style win-by-2
 CAMERA_RETRY_SLEEP = 0.3         # camera stopped mid-session: wait this long between reconnect attempts
 CAMERA_RETRY_EVERY = 3           # reopen the camera every this many failed reads
 CAMERA_LOST_SECONDS = 8.0        # give up after this long, save everything and go back to the menu
@@ -676,7 +681,9 @@ class Session:
         self.max_points = 0
         self.team = {"left": 0, "right": 0}
         # Match Testing: continuous, unscripted grading of a real performer (see _update's "practice" branch and
-        # _mt_end_run / _mt_flush_run below). Not the main focus of the tool; a lightweight secondary mode.
+        # _mt_end_run / _mt_flush_run below). Not the main focus of the tool; a lightweight secondary mode. The
+        # whistle now GATES scoring here, exactly like live_deployment.py's decision_engine.py -- no longer
+        # purely observational (see mt_gate below, and _mt_grade_run / _mt_poll_whistle).
         self.mt_in_run = False
         self.mt_run_frames, self.mt_run_records = [], []
         self.mt_run_label = None
@@ -684,6 +691,22 @@ class Session:
         self.practice_scores = []           # Practice mode: one row per fully graded hold (see _mt_grade_run)
         self.mt_whistle_pointer = 0.0        # continuous whistle polling: see _update
         self.mt_whistle_count = 0
+        self.mt_history = deque(maxlen=8)    # sequence of labels that actually COMMITTED (point/authorization/
+        # reason), mirroring live_deployment.py's own gesture_history -- never a pending/unconfirmed run
+        self.mt_last_decision = None    # {"text", "color", "until"} -- the small chip shown ABOVE the history
+        # bar, mirroring live_deployment.py's own draw_last_decision_chip (see _mt_set_decision)
+        # Reuses the SAME DecisionEngine class live_deployment.py uses (imported unchanged) so a team point in
+        # Match Testing only counts once a real whistle-gated sequence confirms it -- fixes a Team to Serve run
+        # scoring instantly with no whistle check at all, which let a Service Authorization gesture misclassified
+        # as Team to Serve (a real, documented confusion -- see Discussion) score a point with nothing to catch it.
+        # Only active when the menu's "Require the whistle first" checkbox is checked for this session
+        # (choice["whistle"] -- same key drill/combo/challenge already use, same default of False the menu
+        # itself uses). Unchecked, this falls back to the ORIGINAL pre-fix behavior below (form verdict alone
+        # decides scoring, whistle purely observational).
+        self.mt_gate = (DecisionEngine() if self.mode == "match_test" and choice.get("whistle", False)
+                        else None)
+        self.mt_pending_form_ok = None       # FIVB form-quality (CORRECT/ALMOST) of whichever team_to_serve run
+        # is currently sitting in mt_gate.pending_gesture, re-checked if a later whistle confirms it
         self.whistle_flash_until = 0.0
         self.whistle_ok = None
         self.banner = ""
@@ -872,6 +895,9 @@ class Session:
         writer = cv2.VideoWriter(os.path.join(self.dir, "session.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
                                  RECORD_FPS, (UI_W, UI_H))
         self._t0 = self.clock()
+        if self.mode == "match_test":
+            cv2.namedWindow(SCOREBOARD_WINDOW_NAME, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(SCOREBOARD_WINDOW_NAME, SCOREBOARD_W, SCOREBOARD_H)
         self._flush_camera()
         if self.uses_whistle:
             self.whistle.start()
@@ -945,6 +971,8 @@ class Session:
                 self._last_ui = ui
                 writer.write(ui)
                 self._show(ui)
+                if self.mode == "match_test":
+                    show_letterboxed(SCOREBOARD_WINDOW_NAME, self._build_scoreboard_canvas())
                 key = self._key()
                 self.perf["frame_ms"].append((time.perf_counter() - t_frame) * 1000.0)
                 if time.perf_counter() - last_sample >= 2.0:
@@ -967,6 +995,11 @@ class Session:
                 try:
                     self.whistle.stop()
                 except Exception:
+                    pass
+            if self.mode == "match_test":
+                try:
+                    cv2.destroyWindow(SCOREBOARD_WINDOW_NAME)
+                except cv2.error:
                     pass
 
         if self.mode in ("match_test", "practice"):
@@ -1087,7 +1120,8 @@ class Session:
     # ---------------------------------------------------------------------
     # Match Testing: continuous, unscripted grading of a real performer.
     # Not the main focus of the tool; a lightweight secondary mode for watching and grading someone perform signals
-    # naturally (no per-signal countdown, no expected order, whistle optional and purely observational).
+    # naturally (no per-signal countdown, no expected order). The whistle now GATES scoring here, exactly like
+    # live_deployment.py's decision_engine.py -- no longer purely observational (see mt_gate above).
     # ---------------------------------------------------------------------
     def _mt_poll_whistle(self, t):
         if not self.uses_whistle:
@@ -1098,6 +1132,27 @@ class Session:
             elapsed = w - self._t0 if self._t0 is not None else w
             self._log_event("whistle_heard", f"match test whistle #{self.mt_whistle_count} at {elapsed:.2f}s")
             self.mt_whistle_pointer = w + 1e-6      # advance past it so the next poll finds the NEXT whistle, if any
+            if self.mt_gate is not None:
+                # A team_to_serve run graded a moment ago with no whistle yet is sitting in decision_engine.py's
+                # own pending_gesture, waiting on exactly this. Capture which label (if any) BEFORE calling
+                # on_whistle_detected(), since that call clears pending_gesture the instant it confirms it --
+                # same pattern live_deployment.py's own on_whistle() uses.
+                pending_before = (self.mt_gate.pending_gesture["label"]
+                                   if self.mt_gate.pending_gesture is not None else None)
+                confirm = self.mt_gate.on_whistle_detected(w)
+                if confirm is not None:
+                    self.mt_history.append(pending_before)   # this confirmation IS a real commit -- record it
+                    if pending_before in SCORING_GESTURES and self.mt_pending_form_ok:
+                        side = pending_before.rsplit("_", 1)[1]   # trainee's own side -- see the note in _mt_grade_run
+                        self.team[side] += 1
+                        self.serving = side
+                        self._log_event("mt_point_awarded", f"{pending_before} confirmed by a later whistle")
+                        self._mt_set_decision(f"{pending_before}: point_awarded (late whistle)", C_GREEN)
+                    elif pending_before in SCORING_GESTURES:
+                        self._mt_set_decision(f"{pending_before}: whistle arrived, form INCORRECT (no point)", C_AMBER)
+                    else:
+                        self._mt_set_decision(f"{pending_before}: {confirm['event']} (late whistle)", C_BLUE)
+                self.mt_pending_form_ok = None
 
     def _mt_handle_transition(self, old_label, feats):
         """Called when the stable detected label changes. Grades and closes the run that just ended (if it was a
@@ -1144,10 +1199,63 @@ class Session:
             self.practice_scores.append(row)
         else:
             self._log_attempt({"kind": "gesture", "label": label}, res=result, all_levels=all_levels)
-            if result.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST) and label.startswith("team_to_serve_"):
+            # Every graded run (not just team_to_serve) is fed into mt_gate, exactly like
+            # live_deployment.py feeds every committed label into decision_engine.py -- this is what lets
+            # a Service Authorization correctly consume its whistle, so a stray earlier whistle can't
+            # spuriously validate an unrelated later Team to Serve. The FIVB form-quality check
+            # (CORRECT/ALMOST) is kept as an ADDITIONAL requirement on top of the whistle gate, not
+            # replaced, so nothing that used to correctly score stops scoring.
+            if self.mt_gate is not None:
+                gate_result = self.mt_gate.on_gesture_detected(label, self.clock())
+                event = gate_result["event"]
+                if event in ("point_awarded", "authorization_acknowledged", "reason_attached"):
+                    self.mt_history.append(label)      # the sequence bar: only real commits appear here
+                form_ok = result.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST)
+                if label in SCORING_GESTURES:
+                    if event == "point_awarded" and form_ok:
+                        # side comes from the label itself, NOT gate_result["side"] -- decision_engine.py
+                        # flips left/right to the audience-facing side for a real match scoreboard, but
+                        # this trainer always means the TRAINEE's own left/right (see gesture_grader.py's
+                        # documented convention). Using gate_result["side"] here would silently reverse it.
+                        side = label.rsplit("_", 1)[1]
+                        self.team[side] += 1
+                        self.serving = side
+                        self._log_event("mt_point_awarded", f"{label} confirmed by whistle")
+                        self._mt_set_decision(f"{label}: point_awarded", C_GREEN)
+                    elif event == "point_awarded" and not form_ok:
+                        # decision_engine confirmed the whistle sequence, but the FIVB form check failed --
+                        # this trainer's own extra requirement, so no point is credited even though the real
+                        # deployed system would have scored one here. Worth being able to see this happening.
+                        self._log_event("mt_withheld", f"{label} whistle-confirmed but form was INCORRECT")
+                        self._mt_set_decision(f"{label}: whistle ok, form INCORRECT (no point)", C_AMBER)
+                    elif event == "awaiting_whistle_confirmation":
+                        self.mt_pending_form_ok = form_ok
+                        self._log_event("mt_pending", f"{label} waiting up to "
+                                        f"{gate_result.get('grace_seconds', '?')}s for a whistle before it can count")
+                        self._mt_set_decision(f"{label}: awaiting whistle "
+                                              f"({gate_result.get('grace_seconds', '?')}s)", C_AMBER)
+                    elif event == "ignored":
+                        self._log_event("mt_ignored", f"{label}: {gate_result.get('reason', '')}")
+                        self._mt_set_decision(f"{label}: ignored ({gate_result.get('reason', '')})", C_RED)
+                elif event == "authorization_acknowledged":
+                    self._mt_set_decision(f"{label}: authorization_acknowledged", C_BLUE)
+                elif event == "reason_attached":
+                    self._mt_set_decision(f"{label}: reason_attached", C_BLUE)
+                elif event == "ignored":
+                    self._log_event("mt_ignored", f"{label}: {gate_result.get('reason', '')}")
+                    self._mt_set_decision(f"{label}: ignored ({gate_result.get('reason', '')})", C_RED)
+            elif label in SCORING_GESTURES and result.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST):
+                # "Require whistle" unchecked: mt_gate is None, whistle is fully observational, same as this
+                # tool's original pre-fix behavior -- FIVB form verdict alone decides scoring. No decision_engine
+                # involved, so the sequence bar / decision chip stay empty in this mode (nothing to show).
                 side = label.rsplit("_", 1)[1]
                 self.team[side] += 1
                 self.serving = side
+
+    def _mt_set_decision(self, text, color, seconds=4.0):
+        """The small chip shown just above the gesture-history bar -- mirrors live_deployment.py's own
+        draw_last_decision_chip, same 4-second display window."""
+        self.mt_last_decision = {"text": text, "color": color, "until": self.clock() + seconds}
 
     def _mt_flush_run(self):
         """Grades whatever was in progress when the session ended (Q pressed, camera lost), so a real performer's
@@ -1320,6 +1428,18 @@ class Session:
         elif ch == "h":
             self.hint = not self.hint
             self._log_event("hint_on" if self.hint else "hint_off")
+        elif ch == "[" and self.mode == "match_test":     # mirrors live_deployment.py's manual score keys
+            self.team["left"] = max(0, self.team["left"] - 1)
+            self._log_event("mt_manual_score", f"left -1 -> {self.team}")
+        elif ch == "]" and self.mode == "match_test":
+            self.team["left"] += 1
+            self._log_event("mt_manual_score", f"left +1 -> {self.team}")
+        elif ch == "-" and self.mode == "match_test":
+            self.team["right"] = max(0, self.team["right"] - 1)
+            self._log_event("mt_manual_score", f"right -1 -> {self.team}")
+        elif ch in ("+", "=") and self.mode == "match_test":
+            self.team["right"] += 1
+            self._log_event("mt_manual_score", f"right +1 -> {self.team}")
         elif key in (32, 13):
             if self.phase == "intro":
                 self.auto_go = True
@@ -1364,8 +1484,11 @@ class Session:
             self._draw_bottom(ui, t)
             self._draw_side(ui, t)
             self._draw_overlays(ui, t, placement)
-            if self.mode in ("sim", "match_test"):
+            if self.mode == "sim":
                 self._draw_scoreboard_banner(ui)
+            elif self.mode == "match_test":
+                self._draw_gesture_history_bar(ui)
+                self._draw_last_decision_chip(ui, t)
             if self.phase in ("intro", "countdown"):
                 self._draw_reference(ui, self.step)
         if self.paused:
@@ -1392,8 +1515,12 @@ class Session:
         if self.auto and self.queue and self.phase != "summary" and self.mode != "sim":
             prog = f"Attempt {min(self.step_i + 1, len(self.queue))}/{len(self.queue)}"
             put(ui, prog, x - tw(prog, 0.6, 1) - 40, 36, 0.6, C_AMBER, 1)
-        if self.mode in ("sim", "match_test"):
+        if self.mode == "sim":
             put(ui, "SCOREBOARD BELOW", x - tw("SCOREBOARD BELOW", 0.45, 1) - 40, 36, 0.45, C_MUTED, 1)
+        elif self.mode == "match_test":
+            a, b = self.team["left"], self.team["right"]
+            score_txt = f"L {a} - {b} R"
+            put(ui, score_txt, x - tw(score_txt, 0.55, 2) - 40, 36, 0.55, C_GREEN, 2)
 
     def _draw_scoreboard_banner(self, ui):
         """A big, unmissable scoreboard, drawn over the top of the camera view. Requested to be 'more apparent' than
@@ -1415,6 +1542,105 @@ class Session:
         if self.serving:
             tag = f"{self.serving.upper()} TO SERVE"
             put(ui, tag, mid_x - tw(tag, 0.5, 1) // 2, by + 20, 0.5, C_GREEN, 1)
+
+    def _draw_gesture_history_bar(self, ui):
+        """Match Testing only: the sequence of gestures that actually COMMITTED (point awarded, authorization
+        acknowledged, reason attached) -- mirrors live_deployment.py's own gesture_history pill-chip bar.
+        Sits at the BOTTOM of the camera view (not the top), same as live_deployment.py's own layout, with
+        the last-decision chip stacked just above it (see _draw_last_decision_chip)."""
+        bx, bw = CAM_BOX[0] + 10, CAM_BOX[2] - 20
+        bh = 44
+        by = CAM_BOX[1] + CAM_BOX[3] - bh - 10
+        panel(ui, bx, by, bx + bw, by + bh, (18, 18, 18), alpha=0.82)
+        cv2.rectangle(ui, (bx, by), (bx + bw, by + bh), C_BLUE, 1)
+        if not self.mt_history:
+            txt = "(no gestures committed yet)"
+            put(ui, txt, bx + (bw - tw(txt, 0.5, 1)) // 2, by + bh // 2 + 6, 0.5, C_MUTED, 1)
+            return
+        names = [gg.short_label(l) for l in self.mt_history]
+        arrow = "  ->  "
+        arrow_w = tw(arrow, 0.55, 2)
+        chip_pad = 14
+        widths = [tw(n, 0.55, 2) + chip_pad * 2 for n in names]
+        total_w = sum(widths) + arrow_w * (len(names) - 1)
+        x = bx + max(10, (bw - total_w) // 2)
+        y1, y2 = by + 6, by + bh - 6
+        for i, (n, w) in enumerate(zip(names, widths)):
+            bg = C_PANEL2 if i % 2 == 0 else C_LINE
+            is_last = i == len(names) - 1
+            color = C_GREEN if is_last else C_TEXT
+            cv2.rectangle(ui, (x, y1), (x + w, y2), bg, -1)
+            if is_last:
+                cv2.rectangle(ui, (x, y1), (x + w, y2), C_GREEN, 1, cv2.LINE_AA)
+            put(ui, n, x + chip_pad, y2 - 10, 0.55, color, 2)
+            x += w
+            if i < len(names) - 1:
+                put(ui, arrow, x, y2 - 10, 0.55, C_MUTED, 2)
+                x += arrow_w
+
+    def _draw_last_decision_chip(self, ui, t):
+        """Small message just ABOVE the gesture-history bar, mirroring live_deployment.py's own
+        draw_last_decision_chip -- shows the most recent mt_gate event for a few seconds."""
+        d = self.mt_last_decision
+        if d is None or t >= d["until"]:
+            return
+        bx, bw = CAM_BOX[0] + 10, CAM_BOX[2] - 20
+        chip_w = min(bw, tw(d["text"], 0.5, 1) + 24)
+        history_bh, history_gap = 44, 10
+        y2 = CAM_BOX[1] + CAM_BOX[3] - history_bh - history_gap - 6
+        y1 = y2 - 26
+        panel(ui, bx, y1, bx + chip_w, y2, (30, 26, 24), alpha=0.85, border=True)
+        put(ui, d["text"], bx + 12, y2 - 8, 0.5, d["color"], 1)
+
+    def _mt_win_condition(self):
+        """Match Testing win-by-two check, same rule as live_deployment.py's GAME_WIN_SCORE /
+        GAME_WIN_BY_MARGIN (first to MT_WIN_SCORE, win by MT_WIN_BY_MARGIN). Returns the winning
+        side or None. This is DISPLAY-ONLY and never stops scoring -- same deliberate design as
+        live_deployment.py's own win-condition handling (see Table 13: "Auto-stop removed; scoring
+        continues regardless of detected score" -- an earlier auto-stop froze scoring mid-set on a
+        premature misdetection-triggered win, preventing further corrections from being logged).
+        Match Testing follows that exact same reasoning rather than inventing different behavior."""
+        a, b = self.team["left"], self.team["right"]
+        if max(a, b) >= MT_WIN_SCORE and abs(a - b) >= MT_WIN_BY_MARGIN:
+            return "left" if a > b else "right"
+        return None
+
+    def _build_scoreboard_canvas(self):
+        """Match Testing's separate scoreboard window (mirrors live_deployment.py having SCOREBOARD as its own
+        window instead of an overlay). Trainee's own left/right throughout -- see the left/right note in
+        _mt_grade_run for why this never applies decision_engine.py's audience-facing flip."""
+        canvas = np.zeros((SCOREBOARD_H, SCOREBOARD_W, 3), dtype=np.uint8)
+        canvas[:] = C_BG
+        winner = self._mt_win_condition()
+        if winner:
+            # a small strip ABOVE the score, never replacing it -- scoring keeps updating live
+            # underneath exactly as before, matching live_deployment.py's own fix for this
+            # (see _mt_win_condition's docstring for why an early version's freeze was wrong)
+            txt = f"WIN CONDITION REACHED -- {winner.upper()} (still logging)"
+            tw_ = tw(txt, 0.55, 1)
+            panel(canvas, 0, 0, SCOREBOARD_W, 26, C_AMBER, alpha=0.9)
+            put(canvas, txt, (SCOREBOARD_W - tw_) // 2, 18, 0.55, (20, 20, 20), 1)
+        a, b = self.team["left"], self.team["right"]
+        left_col = C_GREEN if self.serving == "left" else C_TEXT
+        right_col = C_GREEN if self.serving == "right" else C_TEXT
+        put(canvas, "LEFT", 50, 60, 0.9, left_col, 2)
+        put(canvas, str(a), 50, 210, 4.2, left_col, 9)
+        put(canvas, "-", SCOREBOARD_W // 2 - 12, 190, 2.2, C_MUTED, 5)
+        rtxt = str(b)
+        rw = tw(rtxt, 4.2, 9)
+        put(canvas, rtxt, SCOREBOARD_W - 50 - rw, 210, 4.2, right_col, 9)
+        rlab = "RIGHT"
+        rlw = tw(rlab, 0.9, 2)
+        put(canvas, rlab, SCOREBOARD_W - 50 - rlw, 60, 0.9, right_col, 2)
+        if self.serving:
+            tag = f"YOUR {self.serving.upper()} TO SERVE"
+            tw_ = tw(tag, 0.55, 1)
+            put(canvas, tag, (SCOREBOARD_W - tw_) // 2, SCOREBOARD_H - 20, 0.55, C_GREEN, 1)
+        else:
+            sub = "trainee's own left / right"
+            sw = tw(sub, 0.45, 1)
+            put(canvas, sub, (SCOREBOARD_W - sw) // 2, SCOREBOARD_H - 20, 0.45, C_MUTED, 1)
+        return canvas
 
     def _draw_disclaimer(self, ui, x, w, y_bottom=UI_H - 10):
         lines = wrap(gg.DISCLAIMER, w, 0.38)
@@ -1554,7 +1780,8 @@ class Session:
             start_keys = "Continuous: the next step starts by itself"
         else:
             start_keys = "SPACE start" + ("  (then it runs by itself)" if self.continuous else "")
-        keys = {"practice": ("Q end match testing   P pause   M mirror   T theme" if self.mode == "match_test"
+        keys = {"practice": ("Q end match testing   P pause   M mirror   T theme   [ / ] left score   - / + right score"
+                             if self.mode == "match_test"
                              else "Q end practice   P pause   M mirror   T theme"),
                 "intro": start_keys + "   Q end session   M mirror   T theme" + ("   H hint" if sim else ""),
                 "result": ("Continuous: next step in a moment" if self.continuous else "SPACE next")

@@ -8,8 +8,8 @@ Keep the quotes around text values. Do not keep the square brackets from the old
 """
 
 # ---- Consent notice (shown on the welcome screen) ---------------------------------------------
-CONTACT = "your-school-email@example.com"                      # TODO: put your real school email here
-RETENTION = "until the end of the thesis, after which recordings are deleted"   # edit if not accurate
+CONTACT = "rblobo@student.hau.edu.ph"                      # TODO: put your real school email here
+RETENTION = "for one (1) year after the completion of this study, after which recordings are deleted"  # edit if not accurate
 
 # ---- Camera -----------------------------------------------------------------------------------
 # Which camera to open. None = use CAMERA_INDEX from live_deployment.py. If that camera cannot be

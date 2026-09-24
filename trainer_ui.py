@@ -109,6 +109,9 @@ MODES = [
     ("sim", "Match simulation",
      "A short narrated set like a real game: for each call you blow the whistle and give the signal right away. "
      "A message at the bottom shows what was committed. Optional continuous mode runs the whole set by itself."),
+    ("match_test", "Match testing",
+     "Watch and grade a real performance, continuously: no set order, no per-signal countdown. Every signal is "
+     "detected and graded as it happens, with a live scoreboard. A lightweight extra mode, not the main focus."),
 ]
 
 COMBO_CHOICES = [
@@ -773,8 +776,9 @@ def open_progress(parent, skin, trainee, on_practice=None):
 
     def practise():
         if on_practice and data["weakest"]:
-            on_practice(data["weakest"][0])
+            label = data["weakest"][0]
             win.destroy()
+            on_practice(label)                 # sets the menu to a Drill of this signal and STARTS it
 
     def save_report():
         path = os.path.join(trainee_dir(trainee["trainee_id"]), "progress.html")
@@ -788,7 +792,9 @@ def open_progress(parent, skin, trainee, on_practice=None):
     FlatButton(bar, skin, "Close", win.destroy).pack(side="right")
     FlatButton(bar, skin, "My sessions", lambda: open_sessions(win, skin, trainee)).pack(side="right", padx=(0, 8))
     FlatButton(bar, skin, "Save report (HTML)", save_report).pack(side="right", padx=(0, 8))
-    practise_btn = FlatButton(bar, skin, "Practise my weakest signal", practise, kind="primary")
+    weakest = gg.short_label(data["weakest"][0]) if data["weakest"] else ""
+    practise_btn = FlatButton(bar, skin, f"Start a Drill: {weakest}" if weakest else "Start a Drill of my weakest signal",
+                              practise, kind="primary")
     practise_btn.pack(side="right")
     practise_btn.set_enabled(bool(on_practice and data["weakest"]))
 
@@ -807,7 +813,7 @@ def open_sessions(parent, skin, trainee):
 
     win = tk.Toplevel(parent)
     win.title("My sessions")
-    win.geometry("900x560")
+    win.geometry("980x560")
     skin.add(win, bg="bg")
     skin.add(tk.Label(win, text=f"My sessions: {trainee['display_name']}", font=("Segoe UI", 20, "bold"), anchor="w"),
              bg="bg", fg="fg").pack(fill="x", padx=28, pady=(18, 2))
@@ -816,13 +822,13 @@ def open_sessions(parent, skin, trainee):
                       font=("Segoe UI", 10), wraplength=840, justify="left", anchor="w"),
              bg="bg", fg="muted").pack(fill="x", padx=28, pady=(0, 8))
 
-    cols = ("when", "mode", "level", "attempts", "correct", "points", "size")
+    cols = ("when", "mode", "signals", "level", "attempts", "correct", "points", "size")
     tree = ttk.Treeview(win, columns=cols, show="headings", height=12, selectmode="browse")
-    for c, txt, wd in (("when", "Date and time", 190), ("mode", "Mode", 130), ("level", "Level", 80),
-                       ("attempts", "Attempts", 80), ("correct", "Correct", 80), ("points", "Points", 90),
-                       ("size", "Size (MB)", 90)):
+    for c, txt, wd in (("when", "Date and time", 150), ("mode", "Mode", 100), ("signals", "Signals performed", 220),
+                       ("level", "Level", 70), ("attempts", "Attempts", 70), ("correct", "Correct", 70),
+                       ("points", "Points", 70), ("size", "MB", 55)):
         tree.heading(c, text=txt)
-        tree.column(c, width=wd, anchor="w" if c in ("when", "mode") else "center")
+        tree.column(c, width=wd, anchor="w" if c in ("when", "mode", "signals") else "center")
     tree.pack(fill="both", expand=True, padx=28)
     rows = {}
 
@@ -832,8 +838,8 @@ def open_sessions(parent, skin, trainee):
         for s in progress.list_sessions(trainee_dir(trainee["trainee_id"])):
             when = s["when"].strftime("%Y-%m-%d %H:%M") if s["when"] else s["session"]
             mode = s["mode"] + (" (test)" if s["test"] else "")
-            iid = tree.insert("", "end", values=(when, mode, s["level"], s["attempts"], s["correct"],
-                                                 f"{s['points']}/{s['max_points']}", f"{s['size_mb']:.1f}"))
+            iid = tree.insert("", "end", values=(when, mode, s.get("signals") or "-", s["level"], s["attempts"],
+                                                 s["correct"], f"{s['points']}/{s['max_points']}", f"{s['size_mb']:.1f}"))
             rows[iid] = s
         empty.configure(text="" if rows else "No saved sessions yet.")
 
@@ -956,7 +962,7 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
     sig_box = ttk.Combobox(opts, textvariable=sig_var, values=sig_names, state="readonly", width=42, font=("Segoe UI", 11))
     sig_box.grid(row=0, column=1, sticky="w", padx=12, pady=3)
 
-    opt_label("Repetitions (Drill, Combo):", 1)
+    opt_label("Repetitions or rallies:", 1)
     last_reps = str(last.get("reps", 5))
     reps_var = tk.StringVar(value=next((r for r in REP_CHOICES if r.split()[0] == last_reps), "5"))
     reps_box = ttk.Combobox(opts, textvariable=reps_var, values=REP_CHOICES, state="readonly", width=42, font=("Segoe UI", 11))
@@ -982,7 +988,7 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
     whistle_box.grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
     continuous_var = tk.BooleanVar(value=bool(last.get("continuous", False)))
     continuous_box = skin.add(tk.Checkbutton(opts, variable=continuous_var, highlightthickness=0, font=("Segoe UI", 11),
-                                             text="Continuous (Match simulation runs the whole set by itself, timed to be readable)"),
+                                             text="Continuous (Match simulation: the whole set runs by itself with no keys; it still has the number of rallies above)"),
                               bg="bg", fg="fg", selectcolor="card_hi", activebackground="bg", activeforeground="fg")
     continuous_box.grid(row=9, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
@@ -1016,7 +1022,7 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
     def update_state():
         m = mode_var.get()
         sig_box.configure(state="readonly" if m == "drill" else "disabled")
-        reps_box.configure(state="readonly" if m in ("drill", "combo") else "disabled")
+        reps_box.configure(state="readonly" if m in ("drill", "combo", "sim") else "disabled")
         combo_box.configure(state="readonly" if m == "combo" else "disabled")
         whistle_box.configure(state="normal" if m in ("drill", "combo", "challenge") else "disabled")
         continuous_box.configure(state="normal" if m == "sim" else "disabled")
@@ -1058,6 +1064,7 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
         mode_var.set("drill")
         sig_var.set(gg.pretty_label(label))
         update_state()
+        start()                                # start the Drill at once, with the repetitions and level chosen in the menu
 
     def progress_window():
         open_progress(root, skin, trainee, practise)
