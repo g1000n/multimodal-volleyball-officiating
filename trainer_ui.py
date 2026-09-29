@@ -978,7 +978,19 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
     level_var = tk.StringVar(value=last.get("level") if last.get("level") in gg.LEVELS else "standard")
     lv_frame = skin.add(tk.Frame(opts), bg="bg")
     lv_frame.grid(row=3, column=1, sticky="w", padx=12)
-    level_desc = skin.add(tk.Label(opts, text=LEVEL_INFO[level_var.get()], font=("Segoe UI", 10)), bg="bg", fg="muted")
+    level_desc = skin.add(
+    tk.Label(
+        opts,
+        text=LEVEL_INFO[level_var.get()],
+        font=("Segoe UI", 10),
+        width=85,
+        height=2,
+        anchor="w",
+        justify="left"
+    ),
+    bg="bg",
+    fg="muted"
+)
     level_desc.grid(row=4, column=1, sticky="w", padx=12)
 
     whistle_var = tk.BooleanVar(value=bool(last.get("whistle", False)))

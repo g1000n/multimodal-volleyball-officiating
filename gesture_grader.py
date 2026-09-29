@@ -123,9 +123,13 @@ class LevelConfig:
 
 
 LEVEL_CONFIG = {
+
     "beginner": LevelConfig("beginner", "Beginner", 0.55, 0.15, 0.6, 60, 40),
+
     "standard": LevelConfig("standard", "Standard", 0.75, 0.30, 1.0, 75, 55),
-    "referee": LevelConfig("referee", "Referee", 0.90, 0.45, 1.5, 90, 68),
+
+    "referee": LevelConfig("referee", "Referee", 0.90, 0.45, 1.5, 100, 68),
+
 }
 # LEVEL_OVERRIDES in trainer_config.py, e.g. {"referee": {"correct_cut": 92}}. Keys: rec_threshold, margin_required,
 # hold_seconds, correct_cut, almost_cut.
@@ -726,6 +730,30 @@ def _rules_ball_out(g: Geo, lv: str, gcap=None, ctx=None) -> List[Check]:
     worst_fore = worst(lambda A: A.mid(A.forearm_up), max)          # least vertical forearm
     least_raised = worst(lambda A: A.mid(A.upper_from_down), min)   # lowest upper arm (armpit least open)
     worst_elbow = worst(lambda A: A.mid(A.elbow), max)
+
+    # Overall elbow spread relative to shoulder width.
+    # This catches an exaggerated Ball Out where the elbows are pushed
+    # extremely far apart, even though each individual arm looks valid.
+    try:
+        lsx, lsy, lsv = g.p["ls"]
+        rsx, rsy, rsv = g.p["rs"]
+        lex, ley, lev = g.p["le"]
+        rex, rey, rev = g.p["re"]
+
+        shoulder_width = np.maximum(np.hypot(rsx - lsx, rsy - lsy), 1e-6)
+        elbow_width = np.hypot(rex - lex, rey - ley)
+
+        elbow_spread = elbow_width / shoulder_width
+        elbow_spread_mask = (
+            g.valid
+            & (lsv >= 0.4) & (rsv >= 0.4)
+            & (lev >= 0.4) & (rev >= 0.4)
+        )
+        elbow_spread_value = _pct(elbow_spread, elbow_spread_mask, 50)
+    except Exception:
+        elbow_spread_value = float("nan")
+        elbow_spread_mask = np.zeros(len(g.valid), dtype=bool)
+
     wl, wr = L.mid(L.elev), R.mid(R.elev)
     asym = abs(wl - wr) if (math.isfinite(wl) and math.isfinite(wr)) else float("nan")
     nl, nr = g.hand("left").extended_count(), g.hand("right").extended_count()
@@ -737,7 +765,7 @@ def _rules_ball_out(g: Geo, lv: str, gcap=None, ctx=None) -> List[Check]:
            worst_fore, le=pick(lv, 40, 30, 20), unit=" deg", verifiable=both_vis,
            tip="Raise BOTH forearms straight up; keep them vertical, not leaning"),
         _c("arms_raised", "Elbows a little away from the body, armpits slightly open (full marks)", 12, ARMPITS_REQUIRED,
-           least_raised, ge=pick(lv, 10, 20, 30), le=pick(lv, 85, 80, 76), unit=" deg", verifiable=both_vis,
+           least_raised, ge=pick(lv, 5, 10, 20), le=pick(lv, 85, 80, 76), unit=" deg", verifiable=both_vis, # changed to ge=pick(lv, 5, 10, 20) from ge=pick(lv, 10, 20, 30)
            basis="TRAINING",
            # Upper bound calibrated 2026-09-22 from a real Referee-level attempt measuring 67.7 deg (verdict CORRECT
            # when captured); the bound is set a comfortable margin above that, not just above the synthetic full
@@ -748,6 +776,20 @@ def _rules_ball_out(g: Geo, lv: str, gcap=None, ctx=None) -> List[Check]:
         _c("arms_symmetric", "Both arms at the same height", 5, False, asym,
            le=pick(lv, 0.6, 0.4, 0.3), verifiable=both_vis,
            tip="Raise both arms to the same height"),
+
+        _c(
+            "elbow_spread",
+            "Elbows not excessively far apart",
+            8,
+            False,
+            elbow_spread_value,
+            le=pick(lv, 2.0, 1.9, 1.9),
+            unit="× shoulder width",
+            verifiable=bool(elbow_spread_mask.any()),
+            strict=(lv in ("standard", "referee")),
+            basis="TRAINING",
+            tip="Keep your elbows closer to your body. Do not spread your arms almost straight out to both sides."
+        ),
         _c("hands_open", "Hands open (FIVB: hands open)", 6, False, worst_open,
            ge=pick(lv, 2, 3, 4), verifiable=worst_open is not None, strict=(lv == "referee" or OPEN_HAND_STRICT),
            tip="Keep both hands open with the fingers extended"),
