@@ -11,6 +11,7 @@ Camera and microphone helpers shared by trainer.py and the setup screen (device_
 """
 
 import math
+import time
 
 import cv2
 import numpy as np
@@ -138,3 +139,42 @@ class MicMeter:
             except Exception:
                 pass
             self.stream = None
+
+
+class WhistleProbe:
+    """Starts the real whistle detector on a chosen microphone, only to TEST it (the setup screen)."""
+
+    def __init__(self):
+        self.detector = None
+        self.count = 0
+        self.last_time = None
+        self.last_conf = None
+        self.error = ""
+
+    def _on_whistle(self, timestamp, confidence=None):
+        self.count += 1
+        self.last_time = time.time()
+        self.last_conf = confidence
+
+    def start(self, mic_index):
+        self.stop()
+        self.count, self.last_time, self.last_conf, self.error = 0, None, None, ""
+        try:
+            from whistle_detector import WhistleDetector
+            self.detector = WhistleDetector(on_whistle_callback=self._on_whistle, device=mic_index)
+            self.detector.start()
+        except Exception as exc:
+            self.detector = None
+            self.error = str(exc)
+
+    @property
+    def running(self):
+        return self.detector is not None
+
+    def stop(self):
+        if self.detector is not None:
+            try:
+                self.detector.stop()
+            except Exception:
+                pass
+            self.detector = None

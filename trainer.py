@@ -113,6 +113,11 @@ SCOREBOARD_WINDOW_NAME = "Match Testing Scoreboard"     # separate window, Match
 SCOREBOARD_W, SCOREBOARD_H = 640, 300                    # _build_scoreboard_canvas / Session.run()
 MT_WIN_SCORE = 25          # Match Testing win condition, same rule as live_deployment.py's
 MT_WIN_BY_MARGIN = 2       # GAME_WIN_SCORE / GAME_WIN_BY_MARGIN -- deuce-style win-by-2
+MT_TTS_CONFIRM_DELAY_SECONDS = 1.5   # same value as live_deployment.py's TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS: a
+# finished Team to Serve run is held this long before it counts, so a same-side Service Authorization (whose
+# beckon starts from a Team-to-Serve-like pose) can take over and cancel it -- see _mt_check_pending_tts
+MT_TTS_CANCEL_RECORDS = 2  # same-side Service Authorization windows needed to cancel it; with the stable-label
+# lag (2 matching windows) this is 3 consecutive windows, same as live's CANCELLATION_STREAK_NEEDED
 CAMERA_RETRY_SLEEP = 0.3         # camera stopped mid-session: wait this long between reconnect attempts
 CAMERA_RETRY_EVERY = 3           # reopen the camera every this many failed reads
 CAMERA_LOST_SECONDS = 8.0        # give up after this long, save everything and go back to the menu
@@ -707,6 +712,8 @@ class Session:
                         else None)
         self.mt_pending_form_ok = None       # FIVB form-quality (CORRECT/ALMOST) of whichever team_to_serve run
         # is currently sitting in mt_gate.pending_gesture, re-checked if a later whistle confirms it
+        self.mt_pending_tts = None           # a graded Team to Serve run not yet committed -- live_deployment.py's
+        # pending_scoring_label: {"label", "result", "all_levels", "since"} (see _mt_check_pending_tts)
         self.whistle_flash_until = 0.0
         self.whistle_ok = None
         self.banner = ""
@@ -1047,6 +1054,7 @@ class Session:
                 self.mt_run_frames.append(feats)      # every camera frame while a run is presumed active
             if self.mode == "match_test":
                 self._mt_poll_whistle(t)               # whistle logging is match-test only; Practice does not need it
+                self._mt_check_pending_tts()
             if rec is not None:
                 lab = rec["label"]
                 prev_stable = self.stable_label
@@ -1197,60 +1205,117 @@ class Session:
                 row[f"score_{lv}"] = all_levels[lv].score
                 row[f"verdict_{lv}"] = all_levels[lv].verdict
             self.practice_scores.append(row)
+        elif label in SCORING_GESTURES:
+            # Held pending, not committed yet -- exactly like live_deployment.py's pending_scoring_label. A
+            # Service Authorization beckon starts from a Team-to-Serve-like pose, so its first half is often
+            # recognised as a Team to Serve run of the same side; committing that run straight away scored a point
+            # for what was really an authorization. A new Team to Serve replaces an older pending one (live does
+            # the same); the original hold time is kept when it is the same label.
+            prev = self.mt_pending_tts
+            if prev is not None:
+                self._log_event("mt_pending_replaced", f"{prev['label']} replaced by {label} before it committed")
+            since = prev["since"] if prev is not None and prev["label"] == label else self.clock()
+            self.mt_pending_tts = {"label": label, "result": result, "all_levels": all_levels, "since": since}
+            self._mt_set_decision(f"{label}: pending (confirming {MT_TTS_CONFIRM_DELAY_SECONDS:.1f}s)", C_AMBER)
         else:
-            self._log_attempt({"kind": "gesture", "label": label}, res=result, all_levels=all_levels)
-            # Every graded run (not just team_to_serve) is fed into mt_gate, exactly like
-            # live_deployment.py feeds every committed label into decision_engine.py -- this is what lets
-            # a Service Authorization correctly consume its whistle, so a stray earlier whistle can't
-            # spuriously validate an unrelated later Team to Serve. The FIVB form-quality check
-            # (CORRECT/ALMOST) is kept as an ADDITIONAL requirement on top of the whistle gate, not
-            # replaced, so nothing that used to correctly score stops scoring.
-            if self.mt_gate is not None:
-                gate_result = self.mt_gate.on_gesture_detected(label, self.clock())
-                event = gate_result["event"]
-                if event in ("point_awarded", "authorization_acknowledged", "reason_attached"):
-                    self.mt_history.append(label)      # the sequence bar: only real commits appear here
-                form_ok = result.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST)
-                if label in SCORING_GESTURES:
-                    if event == "point_awarded" and form_ok:
-                        # side comes from the label itself, NOT gate_result["side"] -- decision_engine.py
-                        # flips left/right to the audience-facing side for a real match scoreboard, but
-                        # this trainer always means the TRAINEE's own left/right (see gesture_grader.py's
-                        # documented convention). Using gate_result["side"] here would silently reverse it.
-                        side = label.rsplit("_", 1)[1]
-                        self.team[side] += 1
-                        self.serving = side
-                        self._log_event("mt_point_awarded", f"{label} confirmed by whistle")
-                        self._mt_set_decision(f"{label}: point_awarded", C_GREEN)
-                    elif event == "point_awarded" and not form_ok:
-                        # decision_engine confirmed the whistle sequence, but the FIVB form check failed --
-                        # this trainer's own extra requirement, so no point is credited even though the real
-                        # deployed system would have scored one here. Worth being able to see this happening.
-                        self._log_event("mt_withheld", f"{label} whistle-confirmed but form was INCORRECT")
-                        self._mt_set_decision(f"{label}: whistle ok, form INCORRECT (no point)", C_AMBER)
-                    elif event == "awaiting_whistle_confirmation":
-                        self.mt_pending_form_ok = form_ok
-                        self._log_event("mt_pending", f"{label} waiting up to "
-                                        f"{gate_result.get('grace_seconds', '?')}s for a whistle before it can count")
-                        self._mt_set_decision(f"{label}: awaiting whistle "
-                                              f"({gate_result.get('grace_seconds', '?')}s)", C_AMBER)
-                    elif event == "ignored":
-                        self._log_event("mt_ignored", f"{label}: {gate_result.get('reason', '')}")
-                        self._mt_set_decision(f"{label}: ignored ({gate_result.get('reason', '')})", C_RED)
-                elif event == "authorization_acknowledged":
-                    self._mt_set_decision(f"{label}: authorization_acknowledged", C_BLUE)
-                elif event == "reason_attached":
-                    self._mt_set_decision(f"{label}: reason_attached", C_BLUE)
+            pending = self.mt_pending_tts
+            if pending is not None:
+                if label == self._mt_same_side_auth(pending["label"]):
+                    self._mt_cancel_pending_tts()      # the "Team to Serve" was the start of this authorization
+                else:
+                    self._mt_commit_pending_tts()      # live: commit the pending point first, then this gesture
+            self._mt_commit(label, result, all_levels)
+
+    @staticmethod
+    def _mt_same_side_auth(tts_label):
+        return f"service_authorization_{tts_label.rsplit('_', 1)[1]}"
+
+    def _mt_check_pending_tts(self):
+        """Per-frame resolution of a pending Team to Serve, mirroring live_deployment.py's main loop: a same-side
+        Service Authorization that takes over (MT_TTS_CANCEL_RECORDS windows into its own run) cancels it;
+        otherwise it commits once MT_TTS_CONFIRM_DELAY_SECONDS have passed. Unlike live, the delay counts from the
+        END of the Team to Serve run (this trainer only grades a run once it ends), not from when it was first
+        recognised -- so the trainee always gets the full window to move into the beckon."""
+        pending = self.mt_pending_tts
+        if pending is None:
+            return
+        if (self.mt_in_run and self.mt_run_label == self._mt_same_side_auth(pending["label"])
+                and len(self.mt_run_records) >= MT_TTS_CANCEL_RECORDS):
+            self._mt_cancel_pending_tts()
+        elif self.clock() - pending["since"] >= MT_TTS_CONFIRM_DELAY_SECONDS:
+            self._mt_commit_pending_tts()
+
+    def _mt_cancel_pending_tts(self):
+        pending, self.mt_pending_tts = self.mt_pending_tts, None
+        auth = self._mt_same_side_auth(pending["label"])
+        self._log_event("mt_tts_cancelled", f"{pending['label']} was the start of {auth} -- no point")
+        self._mt_set_decision(f"{pending['label']} -> {auth} (no point)", C_BLUE)
+
+    def _mt_commit_pending_tts(self):
+        pending, self.mt_pending_tts = self.mt_pending_tts, None
+        self._mt_commit(pending["label"], pending["result"], pending["all_levels"])
+        if self.mt_gate is not None:
+            # live_deployment.py clears the settle window after a delayed Team to Serve commit, so the reason
+            # gesture right after it is not swallowed as tail-end noise
+            self.mt_gate.last_settle_start_time = None
+
+    def _mt_commit(self, label, result, all_levels):
+        """Logs one graded Match Testing run and feeds it to the scoreboard / decision engine."""
+        self._log_attempt({"kind": "gesture", "label": label}, res=result, all_levels=all_levels)
+        # Every graded run (not just team_to_serve) is fed into mt_gate, exactly like
+        # live_deployment.py feeds every committed label into decision_engine.py -- this is what lets
+        # a Service Authorization correctly consume its whistle, so a stray earlier whistle can't
+        # spuriously validate an unrelated later Team to Serve. The FIVB form-quality check
+        # (CORRECT/ALMOST) is kept as an ADDITIONAL requirement on top of the whistle gate, not
+        # replaced, so nothing that used to correctly score stops scoring.
+        if self.mt_gate is not None:
+            gate_result = self.mt_gate.on_gesture_detected(label, self.clock())
+            event = gate_result["event"]
+            if event in ("point_awarded", "authorization_acknowledged", "reason_attached"):
+                self.mt_history.append(label)      # the sequence bar: only real commits appear here
+            form_ok = result.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST)
+            if label in SCORING_GESTURES:
+                if event == "point_awarded" and form_ok:
+                    # side comes from the label itself, NOT gate_result["side"] -- decision_engine.py
+                    # flips left/right to the audience-facing side for a real match scoreboard, but
+                    # this trainer always means the TRAINEE's own left/right (see gesture_grader.py's
+                    # documented convention). Using gate_result["side"] here would silently reverse it.
+                    side = label.rsplit("_", 1)[1]
+                    self.team[side] += 1
+                    self.serving = side
+                    self._log_event("mt_point_awarded", f"{label} confirmed by whistle")
+                    self._mt_set_decision(f"{label}: point_awarded", C_GREEN)
+                elif event == "point_awarded" and not form_ok:
+                    # decision_engine confirmed the whistle sequence, but the FIVB form check failed --
+                    # this trainer's own extra requirement, so no point is credited even though the real
+                    # deployed system would have scored one here. Worth being able to see this happening.
+                    self._log_event("mt_withheld", f"{label} whistle-confirmed but form was INCORRECT")
+                    self._mt_set_decision(f"{label}: whistle ok, form INCORRECT (no point)", C_AMBER)
+                elif event == "awaiting_whistle_confirmation":
+                    self.mt_pending_form_ok = form_ok
+                    self._log_event("mt_pending", f"{label} waiting up to "
+                                    f"{gate_result.get('grace_seconds', '?')}s for a whistle before it can count")
+                    self._mt_set_decision(f"{label}: awaiting whistle "
+                                          f"({gate_result.get('grace_seconds', '?')}s)", C_AMBER)
                 elif event == "ignored":
                     self._log_event("mt_ignored", f"{label}: {gate_result.get('reason', '')}")
                     self._mt_set_decision(f"{label}: ignored ({gate_result.get('reason', '')})", C_RED)
-            elif label in SCORING_GESTURES and result.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST):
-                # "Require whistle" unchecked: mt_gate is None, whistle is fully observational, same as this
-                # tool's original pre-fix behavior -- FIVB form verdict alone decides scoring. No decision_engine
-                # involved, so the sequence bar / decision chip stay empty in this mode (nothing to show).
-                side = label.rsplit("_", 1)[1]
-                self.team[side] += 1
-                self.serving = side
+            elif event == "authorization_acknowledged":
+                self._mt_set_decision(f"{label}: authorization_acknowledged", C_BLUE)
+            elif event == "reason_attached":
+                self._mt_set_decision(f"{label}: reason_attached", C_BLUE)
+            elif event == "ignored":
+                self._log_event("mt_ignored", f"{label}: {gate_result.get('reason', '')}")
+                self._mt_set_decision(f"{label}: ignored ({gate_result.get('reason', '')})", C_RED)
+        elif label in SCORING_GESTURES and result.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST):
+            # "Require whistle" unchecked: mt_gate is None, whistle is fully observational, same as this
+            # tool's original pre-fix behavior -- FIVB form verdict alone decides scoring (still after the
+            # Team to Serve pending hold above). No decision_engine involved, so the sequence bar stays empty.
+            side = label.rsplit("_", 1)[1]
+            self.team[side] += 1
+            self.serving = side
+            self._log_event("mt_point_awarded", f"{label} (whistle not required)")
+            self._mt_set_decision(f"{label}: point_awarded", C_GREEN)
 
     def _mt_set_decision(self, text, color, seconds=4.0):
         """The small chip shown just above the gesture-history bar -- mirrors live_deployment.py's own
@@ -1263,6 +1328,8 @@ class Session:
         if self.mt_in_run and self.mt_run_label in gg.RULES:
             self._mt_grade_run(self.mt_run_label)
         self.mt_in_run = False
+        if self.mt_pending_tts is not None:
+            self._mt_commit_pending_tts()     # session over: nothing can cancel it any more
 
     def _grade_current(self):
         t_grade = time.perf_counter()

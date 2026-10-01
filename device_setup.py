@@ -14,6 +14,7 @@ can be reopened from the menu ("Camera and mic").
 """
 
 import base64
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -77,7 +78,42 @@ def run_device_setup():
     meter_canvas.pack(fill="x", padx=16, pady=6)
     mic_status = skin.add(tk.Label(mic_card, text="", font=("Segoe UI", 10), anchor="w", justify="left",
                                    wraplength=800), bg="card", fg="muted")
-    mic_status.pack(fill="x", padx=16, pady=(0, 12))
+    mic_status.pack(fill="x", padx=16, pady=(0, 6))
+
+    # ---- whistle test: the real whistle detector on the chosen microphone
+    probe = devices.WhistleProbe()
+    wrow = skin.add(tk.Frame(mic_card), bg="card")
+    wrow.pack(fill="x", padx=16, pady=(0, 6))
+    whistle_status = skin.add(tk.Label(wrow, text="Whistle test: press the button, then blow your whistle.",
+                                       font=("Segoe UI", 10), anchor="w", justify="left", wraplength=560),
+                              bg="card", fg="muted")
+
+    def toggle_whistle_test():
+        if probe.running:
+            probe.stop()
+            whistle_btn.set_text("Start whistle test")
+            start_selected_mic()                       # give the microphone back to the level meter
+            whistle_status.configure(text=f"Whistle test stopped. {probe.count} whistle(s) detected.", fg=palette()["muted"])
+            return
+        i = mic_box.current()
+        if i < 0 or i >= len(st["mics"]):
+            whistle_status.configure(text="Choose a microphone first.", fg=palette()["amber"])
+            return
+        meter.stop()                                   # the detector opens the microphone itself
+        probe.start(st["mics"][i]["index"])
+        if probe.error:
+            whistle_status.configure(
+                text=f"The whistle detector could not start ({probe.error}). In the match simulation you can press W "
+                     "instead of blowing the whistle.", fg=palette()["amber"])
+            start_selected_mic()
+            return
+        whistle_btn.set_text("Stop whistle test")
+        whistle_status.configure(text="Listening... blow your whistle now (about 20 to 50 cm from the microphone).",
+                                 fg=palette()["blue"])
+
+    whistle_btn = FlatButton(wrow, skin, "Start whistle test", toggle_whistle_test)
+    whistle_btn.pack(side="left", padx=(0, 12))
+    whistle_status.pack(side="left", fill="x")
 
     # ------------------------------------------------------------------ camera logic
     def close_camera():
@@ -192,6 +228,12 @@ def run_device_setup():
                                       width=0)
         if meter.heard and not meter.error and st["mics"]:
             mic_status.configure(text="Microphone works: it is picking up sound.", fg=p["green"])
+        if probe.running:
+            if probe.count:
+                ago = time.time() - probe.last_time
+                conf = "" if probe.last_conf is None else f", confidence {float(probe.last_conf):.2f}"
+                whistle_status.configure(text=f"WHISTLE DETECTED ({probe.count} so far, last {ago:.0f} s ago{conf}).",
+                                         fg=p["green"])
         st["job"] = root.after(120, tick)
 
     def finish(save):
@@ -200,6 +242,7 @@ def run_device_setup():
                 root.after_cancel(st["job"])
             except tk.TclError:
                 pass
+        probe.stop()
         meter.stop()
         close_camera()
         if save:

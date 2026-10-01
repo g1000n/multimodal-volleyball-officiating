@@ -154,6 +154,24 @@ th{{background:#eee}}.box{{background:#fff;border:1px solid #ddd;border-radius:6
 </body></html>"""
 
 
+def _session_signals(session_dir):
+    """Short text of the signals performed in a session, read from its attempts.csv (works for older sessions too)."""
+    try:
+        with open(os.path.join(session_dir, "attempts.csv"), newline="", encoding="utf-8") as f:
+            seen = []
+            for r in csv.DictReader(f):
+                if r.get("kind") == "gesture" and r.get("target") and r["target"] not in seen:
+                    seen.append(r["target"])
+    except OSError:
+        return ""
+    if not seen:
+        return ""
+    names = [gg.short_label(s) for s in seen]
+    if len(names) <= 2:
+        return " + ".join(names)
+    return f"{len(names)} signals"
+
+
 def list_sessions(trainee_dir):
     """Every saved session of one trainee, newest first (used by the My sessions window)."""
     import json
@@ -176,6 +194,7 @@ def list_sessions(trainee_dir):
                         correct=s.get("correct", 0), points=s.get("points", 0), max_points=s.get("max_points", 0))
         except (OSError, ValueError):
             pass
+        info["signals"] = _session_signals(d)
         size = 0
         for base, _dirs, files in os.walk(d):
             for f in files:

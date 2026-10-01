@@ -456,6 +456,37 @@ def test_match_test_flicker_is_discarded_and_run_continues_across_a_pause():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_match_test_auth_cancels_pending_team_to_serve():
+    """A Service Authorization beckon whose first half is read as a same-side Team to Serve must NOT score a point:
+    the Team to Serve run is held pending (live_deployment.py's TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS) and the
+    authorization taking over cancels it, with or without "Require the whistle". A genuine Team to Serve with nothing
+    after it still scores."""
+    tmp = tempfile.mkdtemp()
+    old_cwd = os.getcwd()
+    os.chdir(tmp)
+    try:
+        # the rolling window fills at ~2.4 s, so the signals start after that
+        script = [(0.0, 3.0, None), (3.0, 4.8, "team_to_serve_left"), (4.8, 7.0, "service_authorization_left"),
+                  (7.0, 12.0, None)]
+        for gated in (False, True):
+            sess, summary = run_mode("match_test", tmp, None, level="standard", script=script, mt_end_after=130,
+                                     mt_whistle_at=0.3 if gated else None, whistle=gated)
+            gest = [a["target"] for a in sess.attempts if a["kind"] == "gesture"]
+            assert gest == ["service_authorization_left"], gest
+            assert sess.team == {"left": 0, "right": 0}, sess.team
+            assert sess.mt_pending_tts is None
+            with open(os.path.join(sess.dir, "session_log.csv"), encoding="utf-8") as fh:
+                assert ",mt_tts_cancelled," in fh.read()
+
+        script = [(0.0, 3.0, None), (3.0, 5.0, "team_to_serve_left"), (5.0, 10.0, None)]
+        sess, summary = run_mode("match_test", tmp, None, level="standard", script=script, mt_end_after=110)
+        assert sess.team["left"] == 1, sess.team
+        print("match_test auth OK   same-side authorization cancelled the pending Team to Serve; a real one scored")
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_match_test_flush_on_early_quit():
     """Pressing Q mid-hold (session ends early) still grades and saves whatever was in progress, instead of
     silently dropping the performer's last signal."""
@@ -489,6 +520,7 @@ def main():
         test_match_test_mode()
         test_match_test_flicker_is_discarded_and_run_continues_across_a_pause()
         test_match_test_flush_on_early_quit()
+        test_match_test_auth_cancels_pending_team_to_serve()
 
         # practice
         sess, summary = run_mode("practice", tmp, save_dir)

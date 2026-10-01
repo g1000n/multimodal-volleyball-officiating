@@ -17,14 +17,84 @@ live, this script paces itself to the recording's own fps rather than
 ripping through frames as fast as possible.
 
 LIMITATION: this replays VIDEO only, not audio -- whistle events aren't
-in the raw recording. Press W manually if you want to test whistle-gated
-behavior; otherwise, with REQUIRE_WHISTLE_FOR_SCORING False (the default
-here now), scoring proceeds informationally, same as live_deployment.py.
+in the raw recording. With REQUIRE_WHISTLE_FOR_SCORING now True (see
+below), press W manually at the moments a whistle actually occurred in
+the original session to reproduce whistle-gated scoring -- same manual
+burden as running live_deployment.py itself in manual whistle mode,
+which is how every real session has actually been run so far.
 
 --------------------------------------------------------------------
-SYNC PASS (this version) -- this script had drifted out of sync with
+SYNC PASS #2 (this version) -- this script had drifted out of sync with
 live_deployment.py AGAIN, same failure mode as before. Ported over:
 
+1. STREAK_NEEDED_TO_COMMIT: 5 -> 3, matching live_deployment.py's
+   current value. A fast, genuine team_to_serve gesture could finish
+   before 5 consecutive correct inference cycles accumulated.
+
+2. REQUIRE_WHISTLE_FOR_SCORING: False -> True. live_deployment.py's
+   REAL current default is True (matches the thesis paper's whistle-
+   gating objective) -- the previous "matches live_deployment.py's
+   real default" comment justifying False here was itself stale, the
+   exact drift this sync pass exists to catch. Since replayed footage
+   has no audio, this means manually pressing W at the right moments
+   is now required to reproduce scoring during replay -- this is a
+   real usage change, not just a constant flip, and is called out
+   explicitly in the console output at startup.
+
+3. hands_model now uses static_image_mode=False (was True), matching
+   live_deployment.py's performance/tracking-mode fix. This isn't just
+   a speed difference -- static_image_mode=True re-runs full palm
+   detection from scratch every frame instead of cheap frame-to-frame
+   tracking, which can produce different hand-feature values than what
+   the live session that this recording came from actually saw.
+
+4. FAST REASON-STREAK TRACKING, ported in for the first time -- this
+   script never had it, meaning replay was reproducing the EXACT
+   starved-reason-attachment bug live_deployment.py fixed earlier:
+   after a point commits, a few frames of leftover team_to_serve/
+   service_authorization motion get recognized first and build a
+   fresh tolerant streak on THAT label, and the tolerant DECREMENT
+   logic doesn't switch to a genuinely new reason gesture (e.g.
+   ball_out) for several frames, starving reason attachment past
+   REASON_ATTACH_WINDOW in decision_engine.py. Fixed the same way:
+   a dedicated fast, non-tolerant reason_streak_label/
+   reason_streak_count, active only while expected_step ==
+   "reason_gesture", pre-empting the slow/tolerant generic path.
+   REASON_STREAK_NEEDED = 2, matching live_deployment.py's current
+   (lowered from 3) value.
+
+5. expected_step TRACKING, added for the first time -- prerequisite
+   for fix #4 above. Mirrors live_deployment.py exactly: starts as
+   "whistle", set to "reason_gesture" on point_awarded, set back to
+   "whistle" on reason_attached/authorization_acknowledged. Unlike
+   live_deployment.py, this script has no scoring_gesture-vs-
+   authorization phase display, so expected_step here exists purely
+   to gate the reason-streak fix, not for any UI purpose.
+
+6. HONEST awaiting_whistle_confirmation HANDLING in do_commit() --
+   previously this script's do_commit() only checked
+   `if result["event"] != "ignored"` before appending to
+   gesture_history, which wrongly treated a PENDING (unconfirmed)
+   gesture the same as a real commit. Fixed to match
+   live_deployment.py: awaiting_whistle_confirmation gets its own
+   branch, does NOT append to gesture_history, and does NOT advance
+   expected_step. This is a display/history-accuracy fix -- the
+   actual score computed by decision_engine.py was already correct
+   either way, since on_gesture_detected() itself never updates
+   engine.score for a pending result regardless of what do_commit()
+   does with the history list.
+
+   NOTE: unlike live_deployment.py, this script has no on_whistle()
+   callback surfacing a LATE whistle confirmation into gesture_history
+   -- decision_engine.py's own pending_gesture/on_whistle_detected()
+   mechanism still works correctly under the hood (the score updates
+   correctly if a manual W arrives within the grace window), but a
+   late-confirmed gesture won't retroactively appear in this script's
+   on-screen history bar the way it does in live_deployment.py. This
+   is a known, smaller display-only gap, not ported in this pass --
+   flagged here rather than silently left unmentioned.
+
+PREVIOUS SYNC PASS (kept, still correct):
 1. FAST/TOLERANT STREAK SPLIT: live_deployment.py's parallel session
    found that a tolerant streak (added to help ball_in survive brief
    interruptions) broke cancellation -- a pending team_to_serve kept
@@ -44,15 +114,9 @@ live_deployment.py AGAIN, same failure mode as before. Ported over:
    same gesture commit again as soon as something different is seen in
    between, rather than waiting out a fixed cooldown.
 
-4. REQUIRE_WHISTLE_FOR_SCORING back to False (was True for a prior,
-   whistle-specific test) -- matches live_deployment.py's real
-   informational-whistle default, so this replay now behaves like an
-   ordinary live session, not a whistle-gating stress test. Flip to
-   True again only if specifically testing the two-whistle flow.
-
 5. DISPLAY_NAME / constants double-checked against the current
    live_deployment.py to catch any other drift (TEAM_TO_SERVE_CONFIRM_
-   DELAY_SECONDS, etc.).
+   DELAY_SECONDS, etc.) -- confirmed still matching this pass.
 
 NOTE: decision_engine.py's own changes (no-auto-stop, REASON_ATTACH_
 WINDOW, etc.) apply automatically here since this script imports
@@ -64,7 +128,12 @@ USAGE:
 
 Controls (during replay):
   Q / ESC   - quit
-  W         - manual whistle (informational only by default -- see above)
+  W         - manual whistle. With REQUIRE_WHISTLE_FOR_SCORING now
+              True, this is REQUIRED to reproduce scoring -- press it
+              at the moments a whistle actually occurred in the
+              original session (cross-reference against that
+              session's own deployment_strict_<ts>.csv Whistle
+              Detections if you have it, for accurate timing).
   SPACE     - pause/resume. Resuming clears rolling_window/streak/pending
               state, same as live_deployment.py's P key, so stale
               wall-clock timestamps don't cause phantom timeouts.
@@ -104,7 +173,7 @@ from train import (
     apply_tie_breaker,
 )
 from model import GestureCNNLSTM
-from decision_engine import DecisionEngine
+from decision_engine import DecisionEngine, FAULT_REASON_GESTURES
 
 MODEL_PATH = "models/final_model.pt"
 LABEL_MAP_PATH = "models/label_map.json"
@@ -113,9 +182,14 @@ LOG_DIR = "data/live_test_logs"
 # --- Constants matched to the CURRENT live_deployment.py ---
 ROLLING_WINDOW_FRAMES = 24
 INFERENCE_EVERY_N_FRAMES = 3
-STREAK_NEEDED_TO_COMMIT = 5
+# CHANGED: 5 -> 3, matching live_deployment.py's current value. See
+# module docstring's "SYNC PASS #2" item 1.
+STREAK_NEEDED_TO_COMMIT = 3
 FAULT_STREAK_NEEDED_TO_COMMIT = 3
 CANCELLATION_STREAK_NEEDED = 3  # matches live_deployment.py's dedicated fast counter
+# NEW: ported from live_deployment.py. See module docstring's "SYNC
+# PASS #2" item 4 for the bug this fixes.
+REASON_STREAK_NEEDED = 2
 COMMIT_COOLDOWN_SECONDS = 2.0   # no longer the primary duplicate guard -- see seen_different_since_last_commit
 STALE_VOTE_SECONDS = 3.0
 TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS = 1.5  # matches live_deployment.py's current value
@@ -126,11 +200,14 @@ GAME_WIN_BY_MARGIN = 2
 SEEK_SMALL_SECONDS = 5
 SEEK_LARGE_SECONDS = 30
 
-# CHANGED BACK: False, matching live_deployment.py's real default
-# (informational whistle -- scoring is NOT blocked by a missed
-# detection). Set True only if specifically testing the two-whistle
-# enforcement, in which case press W twice per cycle.
-REQUIRE_WHISTLE_FOR_SCORING = False
+# CHANGED: False -> True, matching live_deployment.py's REAL current
+# default (the thesis paper's whistle-gating objective). The previous
+# comment here claiming False "matches live_deployment.py's real
+# informational-whistle default" was itself stale -- exactly the kind
+# of drift this sync pass exists to catch. See module docstring's
+# "SYNC PASS #2" item 2 for what this actually changes for replay
+# usage (manual W presses are now required to reproduce scoring).
+REQUIRE_WHISTLE_FOR_SCORING = True
 
 DISPLAY_NAME = {
     "team_to_serve_left": "Team to Serve Right",
@@ -302,10 +379,14 @@ def main():
               "clock overlay will show video-relative elapsed time instead.")
 
     if REQUIRE_WHISTLE_FOR_SCORING:
-        print("REQUIRE_WHISTLE_FOR_SCORING is True -- press W twice per cycle to score.")
+        print("REQUIRE_WHISTLE_FOR_SCORING is True, matching live_deployment.py's real default.")
+        print("This recording has NO audio -- press W manually at the moments a whistle actually")
+        print("occurred in the original session to reproduce whistle-gated scoring. If you have")
+        print("that session's deployment_strict_<ts>.csv, its Whistle Detections rows give you")
+        print("the real timestamps to press W against.")
     else:
-        print("REQUIRE_WHISTLE_FOR_SCORING is False -- whistle is informational only, "
-              "matching live_deployment.py's real default. Scoring proceeds freely.")
+        print("REQUIRE_WHISTLE_FOR_SCORING is False -- whistle is informational only. "
+              "Scoring proceeds freely.")
     print("Controls: SPACE=pause/resume  A/D=seek 5s  J/L=seek 30s  W=whistle  Q/ESC=quit")
 
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -318,7 +399,10 @@ def main():
 
     pose_model = mp_pose.Pose(static_image_mode=False, model_complexity=0,
                                min_detection_confidence=0.5, min_tracking_confidence=0.5)
-    hands_model = mp_hands.Hands(static_image_mode=True, max_num_hands=2,
+    # CHANGED: static_image_mode=True -> False, matching
+    # live_deployment.py's performance/tracking-mode fix. See module
+    # docstring's "SYNC PASS #2" item 3.
+    hands_model = mp_hands.Hands(static_image_mode=False, max_num_hands=2,
                                   min_detection_confidence=0.1, min_tracking_confidence=0.28)
 
     rolling_window = deque(maxlen=ROLLING_WINDOW_FRAMES)
@@ -333,13 +417,33 @@ def main():
     pending_scoring_label = None
     pending_scoring_since = 0.0
     cancellation_streak_count = 0
+    # NEW: ported from live_deployment.py. See module docstring's
+    # "SYNC PASS #2" items 4 and 5.
+    reason_streak_label = None
+    reason_streak_count = 0
+    expected_step = "whistle"
     paused = False
 
     def do_commit(label, now):
-        nonlocal last_committed_label, last_commit_time, seen_different_since_last_commit
+        nonlocal last_committed_label, last_commit_time, seen_different_since_last_commit, expected_step
         result = engine.on_gesture_detected(label, now)
-        if result["event"] != "ignored":
+        # CHANGED: honest pending-state handling, matching
+        # live_deployment.py. See module docstring's "SYNC PASS #2"
+        # item 6 -- previously this only checked `!= "ignored"`,
+        # which wrongly treated an unconfirmed, still-pending gesture
+        # the same as a real commit.
+        if result["event"] == "ignored":
+            pass
+        elif result["event"] == "awaiting_whistle_confirmation":
+            pass
+        else:
             gesture_history.append(label)
+            if result["event"] == "point_awarded":
+                expected_step = "reason_gesture"
+            elif result["event"] == "reason_attached":
+                expected_step = "whistle"
+            elif result["event"] == "authorization_acknowledged":
+                expected_step = "whistle"
         last_committed_label = label
         last_commit_time = now
         seen_different_since_last_commit = False
@@ -381,6 +485,23 @@ def main():
                 else:
                     cancellation_streak_count = 0
 
+                # NEW: fast reason-streak tracking, ported from
+                # live_deployment.py. See module docstring's "SYNC
+                # PASS #2" item 4.
+                if expected_step == "reason_gesture":
+                    if current_label in FAULT_REASON_GESTURES or current_label == "end_of_set":
+                        if current_label == reason_streak_label:
+                            reason_streak_count += 1
+                        else:
+                            reason_streak_label = current_label
+                            reason_streak_count = 1
+                    else:
+                        reason_streak_label = None
+                        reason_streak_count = 0
+                else:
+                    reason_streak_label = None
+                    reason_streak_count = 0
+
                 if current_label != NOTHING_LABEL:
                     if current_label == streak_label:
                         streak_count += 1
@@ -413,7 +534,23 @@ def main():
                     rolling_window.clear()
                     cancel_check_triggered = True
 
-                if cancel_check_triggered:
+                # NEW: fast reason commit, ported from
+                # live_deployment.py. See module docstring's "SYNC
+                # PASS #2" item 4.
+                reason_check_triggered = False
+                if (not cancel_check_triggered and expected_step == "reason_gesture"
+                        and reason_streak_label is not None and reason_streak_count >= REASON_STREAK_NEEDED):
+                    result = do_commit(reason_streak_label, now)
+                    committed_label_this_frame = reason_streak_label
+                    engine_event_this_frame = result["event"]
+                    engine_reason_this_frame = result.get("reason", "")
+                    reason_streak_label = None
+                    reason_streak_count = 0
+                    streak_label, streak_count = None, 0
+                    rolling_window.clear()
+                    reason_check_triggered = True
+
+                if cancel_check_triggered or reason_check_triggered:
                     pass
 
                 elif pending_scoring_label is not None and (now - pending_scoring_since) >= TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS:
@@ -491,10 +628,15 @@ def main():
 
         def clear_stream_state(reason):
             nonlocal rolling_window, streak_label, streak_count, pending_scoring_label, frame_counter, cancellation_streak_count
+            nonlocal reason_streak_label, reason_streak_count
             rolling_window.clear()
             streak_label, streak_count = None, 0
             pending_scoring_label = None
             cancellation_streak_count = 0
+            # NEW: also reset the reason streak on pause/seek, matching
+            # live_deployment.py's P-key handler.
+            reason_streak_label = None
+            reason_streak_count = 0
             frame_counter = 0
             print(f"  -> cleared streak/rolling-window state ({reason})")
 

@@ -36,8 +36,15 @@ OPTIONAL_FILES = {
     os.path.join("tools", "regrade_attempts.py"): "re-grade saved attempts after changing a threshold",
     os.path.join("tools", "export_rubric.py"): "export the grading rubric as a table",
     os.path.join("tools", "grader_sanity_check.py"): "check the rules against your dataset clips",
+    os.path.join("tools", "show_failed_checks.py"): "see why attempts were not CORRECT, across all sessions",
+    os.path.join("tools", "performance_report.py"): "speed and load per mode, from saved sessions",
+    os.path.join("tools", "freeze_report.py"): "flags to resolve, and the exact settings, before an evaluation",
+    os.path.join("tools", "collect_scores.py"): "combine every trainee's scores into one CSV",
+    os.path.join("tools", "mic_check.py"): "check a microphone and whistle in plain words, no camera needed",
     os.path.join("tests", "test_gesture_grader.py"): "grader tests",
     os.path.join("tests", "test_trainer_smoke.py"): "trainer tests",
+    os.path.join("tests", "test_progress.py"): "My progress screen tests",
+    os.path.join("tests", "test_mic_check.py"): "mic_check.py tests",
 }
 PACKAGES = [("numpy", True), ("cv2", True), ("tkinter", True), ("mediapipe", True), ("torch", True),
             ("sounddevice", False), ("psutil", False)]

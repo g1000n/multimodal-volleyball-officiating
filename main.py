@@ -1,9 +1,11 @@
 """
 main.py
 
-Default behavior: `python main.py` with no arguments just runs the real
-system -- live_deployment.py -- directly. That's the actual "main" use
-case, so it shouldn't require picking an option first.
+Default behavior: `python main.py` with no arguments just runs the
+training tool -- trainer.py -- directly. That's the actual "main" use
+case since the post-defense pivot, so it shouldn't require picking an
+option first. The original live-officiating system is still available
+as `python main.py live` (or option 2 in the menu).
 
 Everything else (replay, full training pipeline, diagnostics/tools/
 tests) is available as an explicit subcommand, or via the interactive
@@ -16,7 +18,8 @@ etc. still work exactly as before; this is just a friendlier front
 door, especially useful for anyone new to the repo.
 
 USAGE:
-    python main.py                       # runs live_deployment.py directly
+    python main.py                       # runs trainer.py directly
+    python main.py live                  # runs live_deployment.py
     python main.py replay <path>         # runs replay_recorded_footage.py
     python main.py train                 # runs the full training pipeline
     python main.py diagnostics           # pick a script from diagnostics/
@@ -120,12 +123,13 @@ MENU = """
 ==================================================
   Volleyball Officiating System -- Main Menu
 ==================================================
-  1. Live deployment (needs a camera connected)
-  2. Replay a recorded session
-  3. Run the full training pipeline
-  4. Run a diagnostic script (diagnostics/)
-  5. Run a tool/utility script (tools/)
-  6. Run a test (tests/)
+  1. Training tool (needs a camera connected)
+  2. Live deployment (needs a camera connected)
+  3. Replay a recorded session
+  4. Run the full training pipeline
+  5. Run a diagnostic script (diagnostics/)
+  6. Run a tool/utility script (tools/)
+  7. Run a test (tests/)
   0. Exit
 ==================================================
 """
@@ -137,16 +141,18 @@ def run_menu():
         choice = input("Choose an option: ").strip()
 
         if choice == "1":
-            run([sys.executable, "live_deployment.py"])
+            run([sys.executable, "trainer.py"])
         elif choice == "2":
-            run_replay()
+            run([sys.executable, "live_deployment.py"])
         elif choice == "3":
-            run_full_pipeline()
+            run_replay()
         elif choice == "4":
-            pick_from_folder("diagnostics", "Diagnostic scripts:")
+            run_full_pipeline()
         elif choice == "5":
-            pick_from_folder("tools", "Tool/utility scripts:")
+            pick_from_folder("diagnostics", "Diagnostic scripts:")
         elif choice == "6":
+            pick_from_folder("tools", "Tool/utility scripts:")
+        elif choice == "7":
             pick_from_folder("tests", "Test scripts:")
         elif choice == "0":
             print("Bye!")
@@ -161,12 +167,14 @@ def main():
     # DEFAULT: no arguments -- just run the real system directly.
     # This is the actual "main" use case, shouldn't need a menu first.
     if not args:
-        run([sys.executable, "live_deployment.py"])
+        run([sys.executable, "trainer.py"])
         return
 
     command = args[0]
 
-    if command == "replay":
+    if command == "live":
+        run([sys.executable, "live_deployment.py"])
+    elif command == "replay":
         if len(args) >= 2:
             run([sys.executable, "replay_recorded_footage.py", args[1]])
         else:
@@ -183,8 +191,8 @@ def main():
         run_menu()
     else:
         print(f"Unrecognized command: '{command}'")
-        print("Usage: python main.py [replay <path> | train | diagnostics | tools | tests | menu]")
-        print("(no arguments = run live_deployment.py directly)")
+        print("Usage: python main.py [live | replay <path> | train | diagnostics | tools | tests | menu]")
+        print("(no arguments = run trainer.py directly)")
 
 
 if __name__ == "__main__":
