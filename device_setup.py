@@ -48,8 +48,11 @@ def run_device_setup():
     bar = skin.add(tk.Frame(root), bg="bg")
     bar.pack(fill="x", padx=32, pady=16, side="bottom")
 
+    # ---- the two cards scroll when the window is shorter than them (laptops); the buttons above stay pinned
+    area = trainer_ui.ScrollArea(root, skin).pack(fill="both", expand=True)
+
     # ---- camera card ----
-    cam_card = skin.add(tk.Frame(root, highlightthickness=1), bg="card", highlightbackground="border")
+    cam_card = skin.add(tk.Frame(area.inner, highlightthickness=1), bg="card", highlightbackground="border")
     cam_card.pack(fill="x", padx=32, pady=(0, 10))
     row = skin.add(tk.Frame(cam_card), bg="card")
     row.pack(fill="x", padx=16, pady=(12, 4))
@@ -66,7 +69,7 @@ def run_device_setup():
     cam_status.pack(fill="x", padx=16, pady=(0, 12))
 
     # ---- microphone card ----
-    mic_card = skin.add(tk.Frame(root, highlightthickness=1), bg="card", highlightbackground="border")
+    mic_card = skin.add(tk.Frame(area.inner, highlightthickness=1), bg="card", highlightbackground="border")
     mic_card.pack(fill="x", padx=32, pady=(0, 10))
     row2 = skin.add(tk.Frame(mic_card), bg="card")
     row2.pack(fill="x", padx=16, pady=(12, 4))

@@ -341,6 +341,18 @@ def draw_skeleton(ui, feats, placement, mirror, target_side=None):
             put(ui, tag, x - 7, y + 7, 0.65, OV_ON, 2)
 
 
+def fit_cv_window(name, w, h):
+    """Size an OpenCV window to (w, h) or less, so it fits the screen with its title bar and the taskbar (a laptop
+    at 1366x768, or any screen Windows scales to 125-150%). The picture inside is letterboxed to whatever size."""
+    try:
+        import ctypes
+        sw, sh = ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)
+    except Exception:                                  # not Windows: keep the requested size
+        sw, sh = w + 40, h + 120
+    scale = min(1.0, (sw - 40) / w, (sh - 120) / h)
+    cv2.resizeWindow(name, max(320, int(w * scale)), max(180, int(h * scale)))
+
+
 def show_letterboxed(window, image):
     ih, iw = image.shape[:2]
     try:
@@ -963,7 +975,7 @@ class Session:
         # were replayed into this session's decision engine when this started at 0.0
         if self.mode == "match_test":
             cv2.namedWindow(SCOREBOARD_WINDOW_NAME, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(SCOREBOARD_WINDOW_NAME, SCOREBOARD_W, SCOREBOARD_H)
+            fit_cv_window(SCOREBOARD_WINDOW_NAME, SCOREBOARD_W, SCOREBOARD_H)
         self._flush_camera()
         if self.uses_whistle:
             self.whistle.start()
@@ -2772,7 +2784,7 @@ def main(argv=None):
                 break
             set_cv_theme(trainer_ui.current_theme())
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(WINDOW_NAME, 1280, 720)
+            fit_cv_window(WINDOW_NAME, 1280, 720)
             while True:
                 summary = Session(backend, trainee, choice, whistle).run()
                 last_summary = summary["one_line"]

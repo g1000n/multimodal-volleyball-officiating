@@ -288,21 +288,25 @@ Cite these when the manuscript explains a number. All measured on this project's
 
 **Assigned Drill signals (P5; P6 and P7 use the same):** G-01 Team to Serve left · G-02 Team to Serve right ·
 G-03 Service Authorization left · G-04 Service Authorization right · G-05 Ball Out · G-06 Ball In · G-07 Double
-Contact · G-08 End of Set · G-09 Ball In (weakest class, repeated) · G-10 Service Authorization left (repeated);
+Contact · G-08 End of Set · G-09 Ball In (weakest in Table 6, recall 0.57; repeated) · G-10 Team to Serve left (second weakest in Table 6,
+precision 0.72, F1 0.83; repeated);
 more participants continue from G-01's signal.
 
 **Deviations, logged live (P5–P10):** an attempt where the participant performed a different signal from the one
-prompted is written on the participant record (step, attempt, what they did) and excluded under the counting rules.
+prompted, or was out of frame, is written on the participant record (step, attempt, what happened) and excluded
+under the counting rules.
 
 **Counting rules (fixed before any data):** recognition rate per signal = P5 + P8 Challenge attempts; excluded: P4,
-P6, P7, NO READING attempts, and logged deviations; report recognition **with and without** the exclusions; Combo
+P6, P7 and logged deviations; **NO READING counts as a miss** unless the participant was logged out of frame or not
+performing (count it separately; it is in `session_log.csv`, not `attempts.csv`); report recognition **with and
+without** the exclusions; Combo
 (P9) and Simulation (P10) pairs reported separately; consistency = P5 attempts 1–5; whistle false alarms = the D4
 no-whistle minute plus detections beyond whistles blown in P9–P10 for every participant; DRY-01 and DEMO data never
 enter participant results.
 
 **Before the first participant:** one dry session on a teammate (code DRY-01, excluded) to check timing, OBS audio
-and the data folders; send the validator the tracked-changes form (37 IT items, 18 post-validation rewordings) and
-disclose if re-confirmation is still pending.
+and the data folders; send the validator the **General Audience form first** (answered tomorrow), then the others
+(37 IT items, 18 post-validation rewordings); disclose exactly what changed if re-confirmation is still pending.
 
 After each participant: rename the recording; confirm `data/trainer_sessions/G-xx/` exists (that folder holds
 everything they did); enter the record in the Google Sheet; wipe the whistle; restart the app.

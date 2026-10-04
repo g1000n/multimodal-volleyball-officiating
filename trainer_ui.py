@@ -418,19 +418,123 @@ class FlatButton(tk.Label):
             pass
 
 
+def _fit_size(widget, w, h):
+    """(w, h) shrunk to fit the screen this window is on, leaving room for the taskbar and title bar."""
+    sw, sh = widget.winfo_screenwidth(), widget.winfo_screenheight()
+    return min(w, max(640, sw - 40)), min(h, max(480, sh - 90)), sw, sh
+
+
+def fit_window(win, w, h):
+    """Size a window to (w, h) or the screen, whichever is smaller, centred."""
+    w, h, sw, sh = _fit_size(win, w, h)
+    win.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h - 60) // 2)}")
+
+
 def _base_root(title, w, h):
     root = tk.Tk()
     root.title(title)
-    h = min(h, max(560, root.winfo_screenheight() - 90))   # never taller than the screen
-    root.geometry(f"{w}x{h}")
-    root.minsize(min(w, 760), min(h, 560))
+    fit_window(root, w, h)                        # never wider or taller than the screen (laptops)
+    root.minsize(min(w, 640), min(h, 480))
     try:
-        root.tk.call("tk", "scaling", 1.25)
+        # 125% text on a large monitor; normal size on a laptop screen, which Windows usually scales up already
+        root.tk.call("tk", "scaling", 1.25 if root.winfo_screenheight() >= 900 else 1.0)
     except tk.TclError:
         pass
     skin = Skin(root)
     skin.apply()
     return root, skin
+
+
+class ScrollArea:
+    """A region that scrolls vertically when its content is taller than the window, instead of the content being cut
+    off at the bottom (laptop screens). Put widgets in `.inner`; `on_width` callbacks get the visible width so text
+    can re-wrap. The scrollbar only appears when it is needed."""
+
+    def __init__(self, parent, skin, bg="bg"):
+        self.outer = skin.add(tk.Frame(parent), bg=bg)
+        self.canvas = skin.add(tk.Canvas(self.outer, highlightthickness=0, bd=0), bg=bg)
+        self.bar = tk.Scrollbar(self.outer, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.bar.set)
+        self.inner = skin.add(tk.Frame(self.canvas), bg=bg)
+        self._item = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.on_width = []
+        self.inner.bind("<Configure>", self._on_inner)
+        self.canvas.bind("<Configure>", self._on_canvas)
+        self.canvas.bind("<Enter>", lambda _e: self.canvas.bind_all("<MouseWheel>", self._on_wheel))
+        self.canvas.bind("<Leave>", lambda _e: self.canvas.unbind_all("<MouseWheel>"))
+
+    def pack(self, **kw):
+        self.outer.pack(**kw)
+        return self
+
+    def _overflows(self):
+        return self.inner.winfo_reqheight() > self.canvas.winfo_height() + 1
+
+    def _show_bar(self):
+        if self._overflows():
+            if not self.bar.winfo_ismapped():
+                self.bar.pack(side="right", fill="y", before=self.canvas)
+        elif self.bar.winfo_ismapped():
+            self.bar.pack_forget()
+            self.canvas.yview_moveto(0)
+
+    def _on_inner(self, _e):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._show_bar()
+
+    def _on_canvas(self, e):
+        self.canvas.itemconfigure(self._item, width=e.width)
+        for cb in self.on_width:
+            try:
+                cb(e.width)
+            except tk.TclError:
+                pass
+        self._show_bar()
+
+    def _on_wheel(self, e):
+        if self._overflows():
+            self.canvas.yview_scroll(int(-e.delta / 120), "units")
+
+
+def _flow_buttons(bar, buttons, gap=8):
+    """Lay buttons out left to right, starting a new row whenever the next one would not fit the bar's width."""
+    state = {"width": None}
+
+    def layout(_e=None):
+        width = bar.winfo_width()
+        if width <= 1 or width == state["width"]:
+            return
+        state["width"] = width
+        rows, used = [[]], 0
+        for b in buttons:
+            need = b.winfo_reqwidth() + gap
+            if rows[-1] and used + need > width:
+                rows.append([])
+                used = 0
+            rows[-1].append(b)
+            used += need
+        for b in buttons:
+            b.grid_forget()
+        for r, items in enumerate(rows):
+            for c, b in enumerate(items):
+                b.grid(row=r, column=c, padx=(0, gap), pady=(0 if r == 0 else gap, 0), sticky="w")
+
+    for c, b in enumerate(buttons):               # first layout: one row, re-flowed once the width is known
+        b.grid(row=0, column=c, padx=(0, gap), sticky="w")
+    bar.bind("<Configure>", layout, add="+")
+
+
+def _rewrap_on_resize(root, labels, margin=70):
+    """Long labels packed in the window itself re-wrap to its width (a fixed wraplength overflowed narrow screens)."""
+    def on_configure(e):
+        if e.widget is root:
+            for lab in labels:
+                try:
+                    lab.configure(wraplength=max(280, e.width - margin))
+                except tk.TclError:
+                    pass
+    root.bind("<Configure>", on_configure, add="+")
 
 
 def ask_yes_no(title, text):
@@ -485,12 +589,13 @@ def run_welcome():
     _theme_button(head, skin).pack(side="right")
     skin.add(tk.Label(head, text="Welcome, future referee!", font=("Segoe UI", 24, "bold"), anchor="w"),
              bg="bg", fg="fg").pack(side="left")
-    skin.add(tk.Label(root, text="Learn and practise the official FIVB referee hand signals, with instant feedback "
+    intro = skin.add(tk.Label(root, text="Learn and practise the official FIVB referee hand signals, with instant feedback "
                                  "on whether you performed each one correctly. It is a training aid and does not replace a coach.\n"
                                  "To start: type your name, read the notice below and tick the box, press \"I agree, "
                                  "continue\", then choose a mode and press \"Start session\".",
                       font=("Segoe UI", 12), wraplength=850, justify="left"),
-             bg="bg", fg="muted").pack(anchor="w", padx=32, pady=(4, 14))
+             bg="bg", fg="muted")
+    intro.pack(anchor="w", padx=32, pady=(4, 14))
 
     row = skin.add(tk.Frame(root), bg="bg")
     row.pack(fill="x", padx=32)
@@ -502,10 +607,24 @@ def run_welcome():
     entry.pack(side="left", padx=12, ipady=5)
     entry.focus_set()
 
+    # The buttons and the agreement box are packed (from the bottom) BEFORE the notice, so on a short laptop screen
+    # the scrollable notice shrinks instead of pushing "I agree, continue" off the window.
+    footer = skin.add(tk.Frame(root), bg="bg")
+    footer.pack(fill="x", padx=32, pady=16, side="bottom")
+    agree_var = tk.BooleanVar(value=False)
+    agree_box = skin.add(tk.Checkbutton(root, variable=agree_var, font=("Segoe UI", 11), wraplength=840, justify="left",
+                                        highlightthickness=0, command=lambda: refresh(),
+                                        text="I have read this notice. I agree that my training sessions will be filmed "
+                                             "and saved as described, and I am 18 or older (or have a parent/guardian's "
+                                             "consent)."),
+                         bg="bg", fg="fg", selectcolor="card_hi", activebackground="bg", activeforeground="fg")
+    agree_box.pack(anchor="w", padx=32, side="bottom")
+    _rewrap_on_resize(root, [intro, agree_box], margin=80)
+
     box = skin.add(tk.Frame(root, highlightthickness=1), bg="card", highlightbackground="border")
     box.pack(fill="both", expand=True, padx=32, pady=14)
     text = skin.add(tk.Text(box, wrap="word", font=("Segoe UI", 10), relief="flat", padx=16, pady=12,
-                            highlightthickness=0), bg="card", fg="fg")
+                            highlightthickness=0, height=6), bg="card", fg="fg")
     scroll = tk.Scrollbar(box, command=text.yview)
     text.configure(yscrollcommand=scroll.set)
     scroll.pack(side="right", fill="y")
@@ -513,16 +632,6 @@ def run_welcome():
     text.insert("1.0", CONSENT_TEXT)
     text.configure(state="disabled")
 
-    agree_var = tk.BooleanVar(value=False)
-    skin.add(tk.Checkbutton(root, variable=agree_var, font=("Segoe UI", 11), wraplength=840, justify="left",
-                            highlightthickness=0, command=lambda: refresh(),
-                            text="I have read this notice. I agree that my training sessions will be filmed and saved "
-                                 "as described, and I am 18 or older (or have a parent/guardian's consent)."),
-             bg="bg", fg="fg", selectcolor="card_hi", activebackground="bg",
-             activeforeground="fg").pack(anchor="w", padx=32)
-
-    footer = skin.add(tk.Frame(root), bg="bg")
-    footer.pack(fill="x", padx=32, pady=16)
     status = skin.add(tk.Label(footer, text="", font=("Segoe UI", 10), anchor="w"), bg="bg", fg="muted")
     status.pack(side="left")
 
@@ -566,7 +675,7 @@ def run_welcome():
 def open_learn(parent, skin, start_label=None):
     win = tk.Toplevel(parent)
     win.title("Learn the signals")
-    win.geometry("980x640")
+    fit_window(win, 980, 640)
     skin.add(win, bg="bg")
 
     labels = ["__setup__"] + list(gg.SIGNALS.keys())
@@ -685,7 +794,7 @@ def open_progress(parent, skin, trainee, on_practice=None):
     data = progress.build_progress(trainee_dir(trainee["trainee_id"]))
     win = tk.Toplevel(parent)
     win.title("My progress")
-    win.geometry("900x820")
+    fit_window(win, 900, 820)
     skin.add(win, bg="bg")
 
     skin.add(tk.Label(win, text=f"My progress: {trainee['display_name']}", font=("Segoe UI", 20, "bold"), anchor="w"),
@@ -819,7 +928,7 @@ def open_sessions(parent, skin, trainee):
 
     win = tk.Toplevel(parent)
     win.title("My sessions")
-    win.geometry("980x560")
+    fit_window(win, 980, 560)
     skin.add(win, bg="bg")
     skin.add(tk.Label(win, text=f"My sessions: {trainee['display_name']}", font=("Segoe UI", 20, "bold"), anchor="w"),
              bg="bg", fg="fg").pack(fill="x", padx=28, pady=(18, 2))
@@ -934,12 +1043,17 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
 
     bar = skin.add(tk.Frame(root), bg="bg")
     bar.pack(fill="x", padx=32, pady=14, side="bottom")
-    skin.add(tk.Label(root, text=gg.DISCLAIMER, font=("Segoe UI", 9), wraplength=830, justify="left", anchor="w"),
-             bg="bg", fg="muted").pack(fill="x", padx=32, side="bottom")
+    disclaimer = skin.add(tk.Label(root, text=gg.DISCLAIMER, font=("Segoe UI", 9), wraplength=830, justify="left",
+                                   anchor="w"), bg="bg", fg="muted")
+    disclaimer.pack(fill="x", padx=32, side="bottom")
+    _rewrap_on_resize(root, [disclaimer])
+    # mode cards + options scroll when the window is shorter than them (laptops); the buttons above stay pinned
+    area = ScrollArea(root, skin).pack(fill="both", expand=True)
+    wrapped = []                                  # labels that re-wrap to the visible width
 
     last = read_settings().get("last_choice") or {}
     mode_var = tk.StringVar(value=last.get("mode") if last.get("mode") in [m[0] for m in MODES] else "drill")
-    cards = skin.add(tk.Frame(root), bg="bg")
+    cards = skin.add(tk.Frame(area.inner), bg="bg")
     cards.pack(fill="x", padx=32)
     for key, title, desc in MODES:
         f = skin.add(tk.Frame(cards, highlightthickness=1), bg="card", highlightbackground="border")
@@ -948,11 +1062,13 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
                                 highlightthickness=0, command=lambda: update_state()),
                  bg="card", fg="fg", selectcolor="card_hi", activebackground="card",
                  activeforeground="fg").pack(anchor="w", padx=12, pady=(6, 0))
-        skin.add(tk.Label(f, text=desc, font=("Segoe UI", 10), wraplength=740, justify="left"),
-                 bg="card", fg="muted").pack(anchor="w", padx=40, pady=(0, 6))
+        desc_label = skin.add(tk.Label(f, text=desc, font=("Segoe UI", 10), wraplength=740, justify="left"),
+                              bg="card", fg="muted")
+        desc_label.pack(anchor="w", padx=40, pady=(0, 6))
+        wrapped.append((desc_label, 120))
 
-    opts = skin.add(tk.Frame(root), bg="bg")
-    opts.pack(fill="x", padx=32, pady=(10, 0))
+    opts = skin.add(tk.Frame(area.inner), bg="bg")
+    opts.pack(fill="x", padx=32, pady=(10, 12))
 
     sig_names = [gg.pretty_label(l) for l in real_labels if l in gg.SIGNALS]
     sig_labels = [l for l in real_labels if l in gg.SIGNALS]
@@ -1010,6 +1126,13 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
                                              text="Continuous (Match simulation: the whole set runs by itself with no keys; it still has the number of rallies above)"),
                               bg="bg", fg="fg", selectcolor="card_hi", activebackground="bg", activeforeground="fg")
     continuous_box.grid(row=9, column=0, columnspan=2, sticky="w", pady=(2, 0))
+    wrapped.extend([(whistle_box, 90), (continuous_box, 90)])
+
+    def rewrap(width):
+        for lab, margin in wrapped:
+            lab.configure(wraplength=max(280, width - margin))
+        level_desc.configure(width=0, wraplength=max(240, width - 330))   # beside the option names column
+    area.on_width.append(rewrap)
 
     intent_var = tk.StringVar(value=INTENT_CHOICES[0][1])
     note_var = tk.StringVar()
@@ -1101,11 +1224,13 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
             result["value"] = {"action": "deleted"}
             root.destroy()
 
-    FlatButton(bar, skin, "Start session", start, kind="primary", big=True).pack(side="right")
-    FlatButton(bar, skin, "Learn the signals", learn).pack(side="right", padx=(0, 8))
-    FlatButton(bar, skin, "Progress and sessions", progress_window).pack(side="right", padx=(0, 8))
-    FlatButton(bar, skin, "Camera and mic", devices).pack(side="right", padx=(0, 8))
-    FlatButton(bar, skin, "Delete my data", delete).pack(side="left")
+    # The buttons flow onto a second row when the window is too narrow for one (laptop screens), instead of
+    # overlapping or being squashed.
+    _flow_buttons(bar, [FlatButton(bar, skin, "Start session", start, kind="primary", big=True),
+                        FlatButton(bar, skin, "Learn the signals", learn),
+                        FlatButton(bar, skin, "Progress and sessions", progress_window),
+                        FlatButton(bar, skin, "Camera and mic", devices),
+                        FlatButton(bar, skin, "Delete my data", delete)])
 
     skin.apply()
     root.mainloop()
