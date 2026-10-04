@@ -16,10 +16,11 @@ Contents
 7. What every session saves
 8. Tools and tests
 9. Decisions made, with the evidence (cite these in the paper)
-10. Evaluation: forms, procedure, what to record
-11. Manuscript alignment: what the paper must say
-12. Known limitations and open items
-13. Rules for changing the code
+10. Evaluation: forms, design, setup, participant session, demonstration, expert clips, item maps, referee tally, records to results
+11. How the system fulfils the study's objectives
+12. Manuscript alignment: what the paper must say
+13. Known limitations and open items
+14. Rules for changing the code
 
 ---
 
@@ -197,7 +198,7 @@ py tools/regrade_attempts.py --level standard
 
 PowerShell: never type `<...>` literally; it is a placeholder. Running the grader tests regenerates
 `data/grading_rubric.md/.csv`. `pilot_check` only counts recognition/consistency from sessions labelled "I will
-perform correctly" (TEST_MODE); evaluator sessions need a separate compile step (open item, §12).
+perform correctly" (TEST_MODE); evaluator sessions need a separate compile step (open item, §13).
 
 ## 9. Decisions made, with the evidence
 
@@ -219,26 +220,173 @@ Cite these when the manuscript explains a number. All measured on this project's
 
 ## 10. Evaluation
 
-**Forms.** `new_evaluation_forms_REVISED_clean.docx` (give to evaluators) and `…_REVISED_tracked-changes.docx`
-(for the adviser / validator), next to the original `new_evaluation_forms.docx` — currently in Gion's Downloads,
-share them. 18 items were reworded after content validation to describe the final system (IT 2, 3, 4, 7, 9, 11, 12,
-18, 19, 35; Referee 5, 9, 11; Scorekeeper 5, 6; General 5, 10), keeping item numbers, sub-characteristics and the
-scale; an Evaluation Protocol was added. Only the IT forms were validated by Dr. Collo; the other three were adapted
-from them — say exactly that in the manuscript. The IT form has **37** items (the manuscript still says 29).
+### 10.1 The forms
 
-**Procedure.** The testing-day page (Claude artifact, ask Gion for the link): setup, participant session B1–B12,
-expert steps C1–C7, record sheets, and every item of all four forms mapped to the step where it is observed.
-Design: each general participant uses the tool as a trainee and answers the General form from their own use;
-experts watch participant sessions plus a researcher-performed Part C, and answer from observation (IT evaluators
-read "I" as "the performer"). If an expert cannot attend: one unedited continuous recording of a researcher doing
-Parts B and C (screen + mic audio + a phone filming the body), never a compilation of participants' clips, and not
-participants' videos (consent covers research use, not outside viewing).
+- Files (in Gion's Downloads; share them): `new_evaluation_forms_REVISED_clean.docx` (give to evaluators) and
+  `new_evaluation_forms_REVISED_tracked-changes.docx` (for the adviser / validator), next to the original
+  `new_evaluation_forms.docx`.
+- Four forms, all on a 1–5 Likert scale, ISO/IEC 25010:2023 characteristics (Functional Suitability, Performance
+  Efficiency, Reliability, Interaction Capability): **IT Professional 37 items, Volleyball Referee 21, Volleyball
+  Scorekeeper 17, General Audience 21**, each with open-ended questions and an overall validation result.
+- Shared criteria used in items: 3-second rule (verdict within 3 s of finishing the signal = arms back down);
+  5/4 consistency (same signal 5 times → same verdict at least 4 times); 10/8 accuracy; 10-minute / 20-attempt
+  capacity; allowed whistle window (up to 10 s before the signal or 6 s after it).
+- Validation: Dr. Dexter Collo validated the **IT** forms ("Validated with Minor Revisions"); the referee,
+  scorekeeper and general forms were **adapted** from it, not independently validated. After validation, 18 items
+  were reworded to match the final system (IT 2, 3, 4, 7, 9, 11, 12, 18, 19, 35; Referee 5, 9, 11; Scorekeeper 5,
+  6; General 5, 10), keeping item numbers, sub-characteristics and the scale. The forms' header note says so. Do
+  not add new items (a proposed "wrong arm scores for the opposite team" item was rejected: it describes the live
+  system, not the trainer).
+- The revised forms also contain an embedded protocol written for "each role uses the tool alone". **The testing
+  procedure below supersedes it.**
 
-**Record by hand (cannot be recovered from logs):** referee tally sheet (own call per attempt), which attempts were
-deliberately wrong, whistles actually blown and the no-whistle minute's times, the facilitator log (date, place,
-face-to-face/remote, help given, problems), respondent background, signed qualification sheets, setup photos.
+### 10.2 Design
 
-## 11. Manuscript alignment
+- **One researcher** runs every session (facilitator, recorder, laptop).
+- **General participants** (volleyball players, fans, beginners) each use the tool **as trainees**, one at a time,
+  and answer the General Audience form from their own use. Never from watching someone else.
+- **One demonstration session** (researcher or one consenting volunteer, code `DEMO`) shows the few things only
+  experts are asked about.
+- **Expert evaluators** (IT, referee, scorekeeper) answer **later, from clips** cut from the recordings. IT
+  evaluators read "I" in their items as "the performer in the clip".
+- **No blank items:** every item on every form maps to a step or clip (10.6). Before collecting a form, check every
+  item is answered; if someone is unsure, they redo / rewatch the mapped step, then answer.
+- Participants are identified by a **code** (`G-01`, `G-02`, …) typed in the app instead of a name, so all their
+  data lands in `data/trainer_sessions/G-01/`. Their real name appears only on the paper sign-in sheet.
+- Locations may differ (rooms, a court) if the camera setup is identical and each session's location is recorded.
+
+### 10.3 Setup (every location)
+
+- iPhone on a tripod at **chest height** (1.2–1.4 m), **2–2.5 m** from the performer, straight on. Frame **head to
+  hips** (the grader measures wrists against the shoulder-to-hip distance) with room above the head and to both
+  sides. Tape mark on the floor. Plain wall, light from the front, nobody else in frame, clear space ~3 × 2 m.
+- Laptop: Camo Studio running; `py main.py`; **Camera and mic** = Camo camera + **Microphone (Camo) [Windows
+  DirectSound]**; whistle test passes; `TEST_MODE = False`; app restarted for every participant.
+- **Per-location check (5 min):** framing; whistle test; 3-rep Drill with "Require the whistle"; **30 s of normal
+  noise with no whistle — nothing may flash** (on a court, other courts' whistles can trigger it); setup photo.
+- Recording: **OBS** (whole screen + microphone so whistles are audible) for every participant, from the consent
+  screen to the summary, saved as `G-01_<date>.mkv`. A phone filming the full body is required for the
+  demonstration's trainee script (the referee judges form from it).
+
+### 10.4 Participant session P1–P13 (about 40–45 min), difficulty Standard throughout
+
+| Step | What the participant does | Researcher records |
+|---|---|---|
+| P1 | Signs the sign-in sheet (code, name, date, signature, **yes/no: recording may be shown to the expert evaluators**); gets their code; briefing read aloud | code, background (player/fan/beginner/coach, years), location, start time |
+| P2 | Researcher starts OBS and the app. Participant reads the welcome screen and consent notice, types their code, ticks, continues | read the notice? questions? |
+| P3 | Learn the signals: looks through all of them | help needed? |
+| P4 | Practice: three different signals (at least one left-arm, one right-arm), ~3 s each, arms down between; Q to end | name followed each signal? |
+| P5 | Drill, one chosen signal, **10 reps**: countdown → GO → signal, hold ~2 s, arms down; result shows at once, next starts by itself. All 10 the same way. After **each** result read "Recognised as" and the first tip. On attempt 6 press P mid-signal, wait, P again (not counted, repeats). After 10: D/A to step through attempts, read "Correct per signal" and "Needs more practice", SPACE | signal; tally of "Recognised as" correct out of 10; pause worked? |
+| P6 | Drill "1 (free practice, retries)": one attempt, R, again, Q → summary shows both. Drill 5 reps: Q after the 2nd result → summary shows 2 | both checks |
+| P7 | Drill 2 reps: attempt 1 deliberately sloppy (e.g. arm half raised); attempt 2 step out of frame at GO until a message appears, then come back and do it properly | **deliberate attempts** (this Drill, attempts 1–2); message shown |
+| P8 | Challenge: every signal once | any never recognised? |
+| P9 | Combo, random calls, 2 reps, **Require the whistle** ticked: whistle → Team to Serve (hold 2 s) → the reason | whistles blown; WHISTLE! each time? |
+| P10 | Match Simulation, 3 rallies, **Require the whistle**, Continuous off: read story, SPACE, whistle, signal(s); watch bottom message and score | whistles blown; final score |
+| P11 | Reads the summary; researcher stops OBS | end time |
+| P12 | Answers the General Audience form alone, every item | items they wanted to retry |
+| P13 | Researcher checks every item is answered; unsure items → redo the mapped step | steps redone |
+
+After each participant: rename the recording; confirm `data/trainer_sessions/G-xx/` exists (that folder holds
+everything they did); enter the record in the Google Sheet; wipe the whistle; restart the app.
+
+### 10.5 Demonstration D1–D7 (once, ~25 min, code DEMO, recorded with OBS + phone)
+
+| Step | Do |
+|---|---|
+| D1 | **Trainee script**: Drill, Team to Serve – left arm, 10 reps in this order: 1 clean · 2 clean · 3 elbow clearly bent · 4 arm well below shoulder · 5 clean · 6 right arm instead of left · 7 clean but lowered after under 0.5 s · 8 clean · 9 both arms raised · 10 clean |
+| D2 | Open D1's report (Progress and sessions → My sessions → Open report): Detected, Verdict shown (s after arms down), All levels columns; then a 3-rep Drill at **Referee** level |
+| D3 | Match Simulation, 3 rallies, whistle ticked: rally 1 proper; rally 2 Team to Serve **without** whistle; rally 3 whistle but wrong arm; press H once |
+| D4 | Match Testing, whistle ticked: (a) whistle → Service Authorization (no point); (b) whistle → Team to Serve → Ball Out (point after ~1.5 s); (c) Team to Serve, no whistle, 10 s still (no point); (d) 5 whistles (5 flashes); (e) **1 minute without a whistle**: talk, clap, bounce a ball, signals (no flash) |
+| D5 | Practice: alternate Service Authorization and Team to Serve with the same arm, 3 times each |
+| D6 | Drill, unplug the iPhone mid-attempt; after 3 NO READINGs the tool asks to check the camera; reconnect, SPACE |
+| D7 | Show "Delete my data" on the menu (don't press); run `py tools/performance_report.py --since <today>` on screen |
+
+### 10.6 Expert clips and item maps
+
+Each clip is **one continuous uncut stretch** of a step; participant clips only from participants who said "yes"
+on the sign-in sheet, taken from the **first eligible participant** (a fixed rule, not the best-looking session).
+
+| Clip | Source | Shows |
+|---|---|---|
+| E1 | P2–P3 | welcome, consent (cannot continue until ticked), Learn the signals |
+| E2 | P4 | Practice name follows signal, left and right arm |
+| E3 | P5 | Drill 10: options, results, Recognised as, tips, pause, summary review |
+| E4 | P6 | retry keeps both attempts; ending early keeps attempts |
+| E5 | P7 | sloppy attempt graded down; out of frame → NO READING |
+| E6 | P8 | Challenge |
+| E7 | P9 | Combo with whistle |
+| E8 | P10 | Match Simulation: whistle, commits, score, serving |
+| E9 | P11 | summary |
+| E10 | D1 (screen + phone) | trainee script with known mistakes |
+| E11 | D2 | report vs reality, all levels, Referee level |
+| E12 | D3 | no point without whistle or with wrong arm; hint |
+| E13 | D4 | Match Testing whistle gating, 5 whistles, no-whistle minute |
+| E14 | D5 | Service Authorization vs Team to Serve |
+| E15 | D6 | camera unplugged: message, reconnect, data kept |
+| E16 | D7 | Delete my data visible; performance report |
+| Full | one whole uncut participant recording + session numbers (10.8) | whole-session items |
+
+**General Audience (participants, steps):** 1 P5 · 2 P5 · 3 P3, P4–P10 · 4 P5, P7 · 5 P5, P7 · 6 P10 · 7 P5 ·
+8 whole session · 9 whole session · 10 P5 (attempts 1–5) · 11 P7 · 12 P7 · 13 P2 · 14 P2–P11 · 15 P4–P10 ·
+16 P5, P11 · 17 P5 · 18 P2 · 19 P5, P6 · 20 P11 · 21 whole session.
+
+**IT Professional (clips):** 1 E3 · 2 E13 · 3 E8, E12, E13 · 4 E12, E13 · 5 E11 · 6 E6 · 7 Full, E2–E9, E13 ·
+8 E10 · 9 E10 · 10 E11 · 11 E8, E12, E13 · 12 E12 · 13 E3 + session numbers · 14 E16, Full · 15 E16, Full ·
+16 Full + session numbers · 17 E3 · 18 E5 · 19 E5 · 20 E15 · 21 Full · 22 E3 · 23 E3 · 24 E1 · 25 E5, E10 ·
+26 E10 · 27 E1 · 28 E3 · 29 E2 · 30 E6, E7 · 31 E8, E12, E13 · 32 E16 · 33 Full + help-given numbers · 34 E3 ·
+35 E4 · 36 E4 · 37 E9.
+
+**Volleyball Referee (clips):** 1 E1 · 2 E10 + tally sheet · 3 E10 · 4 E1 · 5 E7, E8 · 6 E11, Full · 7 E10 ·
+8 E2, E3 · 9 E8 · 10 Full · 11 E3 · 12 E5, E13 · 13 E5 · 14 E1 · 15 E2, E3 · 16 E3, E10 · 17 E1 · 18 E2, E14 ·
+19 Full, E4 · 20 E9 · 21 Full.
+
+**Volleyball Scorekeeper (clips):** 1 E10 · 2 E8, E12 · 3 E8, E12 · 4 E1 · 5 E7 · 6 E10 · 7 E3 · 8 E8, E13 ·
+9 Full · 10 E3 · 11 E5 · 12 E14 · 13 E3 · 14 E9 · 15 E6, E7, E8 · 16 E9 · 17 E1.
+
+### 10.7 Referee tally (while the referee watches E10)
+
+The expert check of the grader. Only the 10 scripted D1 attempts. For each attempt the researcher **pauses before
+the verdict appears** (phone video preferred), the referee writes **Correct / Almost / Incorrect**, the researcher
+resumes and writes the tool's verdict, then marks Match (yes if identical). Paper, then typed into the Google Sheet.
+Becomes **agreement = matches ÷ 10 × 100** plus a 3 × 3 table (referee call × tool verdict). Referee item 2 is
+answered from it.
+
+### 10.8 Records → results
+
+Paper during sessions, typed into one Google Sheet the same day:
+
+| Tab | Columns | Result |
+|---|---|---|
+| Participants | code, date, **location** (+ noise/light note), background, years, start, end, help given, problems, steps redone | respondent count and composition; locations; help needed per step (learnability) |
+| Whistles | code/DEMO, step, whistles blown, flashes seen, no-whistle minute start–end | detection rate = detected ÷ blown × 100; false alarms in the no-whistle minute |
+| Deliberate attempts | code, session folder, attempt numbers, what was done | excluded from recognition accuracy |
+| Referee tally | attempt, performed, referee call, tool verdict, match | grader agreement |
+| Performance | output of `tools/performance_report.py` | FPS, slowest frame, verdicts within 3 s, CPU, RAM |
+| Form responses | one row per respondent, one column per item | item, characteristic and overall means; validation result frequencies; open-ended themes (manuscript's Software Quality Evaluation Analysis) |
+
+From the app logs across all participants (compile after testing — the compile tool is still an open item):
+recognition rate per signal (target vs detected, deliberate attempts excluded), consistency of P5 attempts 1–5,
+feedback within 3 s, crashes. All descriptive statistics, matching the manuscript's approach. Back up
+`data/trainer_sessions/` and the recordings after every testing day.
+
+## 11. How the system fulfils the study's objectives
+
+General objective: a multimodal real-time training tool that helps referee and scorekeeper trainees learn and
+practise official hand signals and whistle cues, using gesture recognition, whistle detection and automated score
+tracking to give structured feedback and a training score.
+
+| Objective | Fulfilled by | Evidence |
+|---|---|---|
+| 1. Classification model for a trainee's referee gestures | CNN-LSTM (8 classes + nothing) running live in every mode | offline metrics (existing Results tables); recognition rate per signal from participants' logs |
+| 2. Model that detects a trainee's whistle cue | SVM / RF / HGB soft-voting ensemble with band-pass, energy and physics gates; training-tool threshold 0.55 (§9) | offline metrics (existing tables); detection rate and false alarms from the whistle records |
+| 3. Multimodal decision engine validating service-related signals against a whistle within a temporal window, integrated with FIVB rule-based grading (correct / almost / incorrect) | `decision_engine.py` in Match Simulation and Match Testing with "Require the whistle" (10 s before / 6 s after; Team to Serve pending 1.5 s); `gesture_grader.py` three-level FIVB rubric | clips E8, E12, E13; referee tally agreement |
+| 4. Automated score tracking interface showing recognised signal, verdict, feedback, and a scoreboard of the trainee's accuracy | result screen ("Recognised as" + confidence, verdict, breakdown, checklist, tips); top bar score and accuracy; team scoreboard and serving indicator in Simulation / Testing; summary and report | clips E3, E8, E9 |
+| 5. Evaluate (a) models with accuracy, precision, recall, F1; (b) ISO/IEC 25010:2023 quality | (a) the existing offline evaluation; (b) the four forms via this procedure | form means plus the session numbers in 10.8 |
+
+Keep "Require the whistle" ticked in Combo, Simulation and Testing during evaluation: objective 3 is only exercised
+when it is on.
+
+## 12. Manuscript alignment
 
 Claims checked against the code. Line numbers refer to the current revision ("Copy of Ma'am Rivera for the
 REVISIONS_MANUSCRIPT…").
@@ -261,7 +409,7 @@ REVISIONS_MANUSCRIPT…").
 Live-system tables (7A/7B response time, 11 score match, etc.) describe `live_deployment.py` and stay as live-system
 results; do not present them as training-tool results.
 
-## 12. Known limitations and open items
+## 13. Known limitations and open items
 
 - Service Authorization vs Team to Serve confusion is real in the model; Match Testing's pending window hides it,
   Drill/Combo/Challenge do not.
@@ -276,7 +424,7 @@ results; do not present them as training-tool results.
   it).
 - Untracked repo files (appendix tools, diagnostics, `data/grading_rubric.*`) were left out of commits on purpose.
 
-## 13. Rules for changing the code
+## 14. Rules for changing the code
 
 - Run both test suites with the venv before committing; they must pass.
 - Read `gesture_grader.py` and `trainer_ui.py` fresh before editing; teammates edit them directly.
