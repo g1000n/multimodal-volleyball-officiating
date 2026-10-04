@@ -97,6 +97,25 @@ def list_microphones():
     return out, ""
 
 
+def resolve_saved_mic(settings):
+    """The microphone chosen under "Camera and mic", found again by NAME. Device numbers can change when a phone
+    microphone (e.g. an iPhone through WO Mic) or a USB mic is reconnected, so the saved number alone could silently
+    point at a different input. Returns (index or None, warning text or "")."""
+    want_name, want_api = settings.get("mic_name"), settings.get("mic_hostapi")
+    index = settings.get("mic_index")
+    if not want_name:
+        return index, ""                                     # saved by an older version: number only
+    mics, _err = list_microphones()
+    same = [m for m in mics if m["name"] == want_name]
+    match = (next((m for m in same if m["index"] == index), None)
+             or next((m for m in same if m["hostapi"] == want_api), None)
+             or (same[0] if same else None))
+    if match is not None:
+        return match["index"], ""
+    return None, (f"The microphone chosen for whistle detection ({want_name}) is not connected. Connect it and check "
+                  f"it under Camera and mic; until then the default microphone is used (W still works as a whistle).")
+
+
 class MicMeter:
     """Opens an input stream and exposes a 0..1 loudness level (log scale, -60 dB to 0 dB)."""
 
@@ -161,8 +180,10 @@ class WhistleProbe:
         self.count, self.last_time, self.last_conf, self.error = 0, None, None, ""
         try:
             from whistle_detector import WhistleDetector
-            self.detector = WhistleDetector(on_whistle_callback=self._on_whistle, device=mic_index)
-            self.detector.start()
+            import trainer_config as _tc
+            self.detector = WhistleDetector(on_whistle_callback=self._on_whistle, device=mic_index,
+                                            threshold=getattr(_tc, "WHISTLE_THRESHOLD", 0.70))   # same as sessions
+            self.detector.start(confirm_open=True)      # the setup screen then shows why, instead of a dead test
         except Exception as exc:
             self.detector = None
             self.error = str(exc)

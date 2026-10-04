@@ -121,6 +121,10 @@ COMBO_CHOICES = [
     ("double_contact", "Team to Serve, then Double Contact"),
 ]
 
+# modes where "Require the whistle" can be ticked. Drill / Combo / Challenge: a whistle step is added before the
+# signal. Match simulation / Match testing: decision_engine.py gates every point and authorisation on the whistle.
+WHISTLE_OPTION_MODES = ("drill", "combo", "challenge", "sim", "match_test")
+
 REP_CHOICES = ["1 (free practice, retries)", "3", "5", "10"]
 
 # Labels for evaluation tests: lets the team log deliberately correct / wrong attempts as evidence.
@@ -482,7 +486,9 @@ def run_welcome():
     skin.add(tk.Label(head, text="Welcome, future referee!", font=("Segoe UI", 24, "bold"), anchor="w"),
              bg="bg", fg="fg").pack(side="left")
     skin.add(tk.Label(root, text="Learn and practise the official FIVB referee hand signals, with instant feedback "
-                                 "on whether you performed each one correctly. It is a training aid and does not replace a coach.",
+                                 "on whether you performed each one correctly. It is a training aid and does not replace a coach.\n"
+                                 "To start: type your name, read the notice below and tick the box, press \"I agree, "
+                                 "continue\", then choose a mode and press \"Start session\".",
                       font=("Segoe UI", 12), wraplength=850, justify="left"),
              bg="bg", fg="muted").pack(anchor="w", padx=32, pady=(4, 14))
 
@@ -995,7 +1001,8 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
 
     whistle_var = tk.BooleanVar(value=bool(last.get("whistle", False)))
     whistle_box = skin.add(tk.Checkbutton(opts, variable=whistle_var, highlightthickness=0, font=("Segoe UI", 11),
-                                          text="Require the whistle first (Team to Serve and Authorization to Serve)"),
+                                          text="Require the whistle (Team to Serve and Authorization to Serve). Match simulation / testing: "
+                                               "no point or authorisation counts without it"),
                            bg="bg", fg="fg", selectcolor="card_hi", activebackground="bg", activeforeground="fg")
     whistle_box.grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
     continuous_var = tk.BooleanVar(value=bool(last.get("continuous", False)))
@@ -1036,7 +1043,7 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
         sig_box.configure(state="readonly" if m == "drill" else "disabled")
         reps_box.configure(state="readonly" if m in ("drill", "combo", "sim") else "disabled")
         combo_box.configure(state="readonly" if m == "combo" else "disabled")
-        whistle_box.configure(state="normal" if m in ("drill", "combo", "challenge") else "disabled")
+        whistle_box.configure(state="normal" if m in WHISTLE_OPTION_MODES else "disabled")
         continuous_box.configure(state="normal" if m == "sim" else "disabled")
 
     update_state()
@@ -1055,7 +1062,7 @@ def run_menu(trainee: dict, real_labels, last_summary: str = ""):
         result["value"] = {"action": "start", "mode": mode_var.get(), "gesture": label, "level": level_var.get(),
                            "reps": reps, "combo": combo_key, "intent": intent,
                            "note": note_var.get().strip() if TEST_MODE else "",
-                           "whistle": bool(whistle_var.get()) and mode_var.get() in ("drill", "combo", "challenge"),
+                           "whistle": bool(whistle_var.get()) and mode_var.get() in WHISTLE_OPTION_MODES,
                            "continuous": bool(continuous_var.get()) and mode_var.get() == "sim"}
         # remember the choices (also for the next time the app is opened); the test label is never remembered
         remembered = {k: v for k, v in result["value"].items() if k not in ("action", "intent", "note")}

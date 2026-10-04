@@ -189,7 +189,11 @@ def run_device_setup():
                  for m in st["mics"]]
         mic_box.configure(values=names)
         want = saved.get("mic_index")
-        pos = next((k for k, m in enumerate(st["mics"]) if m["index"] == want), None)
+        # find the saved mic by name first: device numbers change when a phone or USB mic is reconnected
+        pos = next((k for k, m in enumerate(st["mics"]) if saved.get("mic_name") and m["name"] == saved["mic_name"]
+                    and m["hostapi"] == saved.get("mic_hostapi")), None)
+        if pos is None:
+            pos = next((k for k, m in enumerate(st["mics"]) if m["index"] == want), None)
         if pos is None:
             pos = next((k for k, m in enumerate(st["mics"]) if m["default"]), 0)
         mic_box.current(pos)
@@ -257,6 +261,8 @@ def run_device_setup():
                 patch["camera_index"] = result["camera"]
             if result["mic"] is not None:
                 patch["mic_index"] = result["mic"]
+                patch["mic_name"] = st["mics"][mi]["name"]          # so it can be found again after a reconnect
+                patch["mic_hostapi"] = st["mics"][mi]["hostapi"]
             trainer_ui.write_settings(patch)
             result["saved"] = True
         else:

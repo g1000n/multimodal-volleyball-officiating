@@ -84,6 +84,8 @@ except ImportError:
 INPUT_ALREADY_MIRRORED = getattr(_cfg, "INPUT_ALREADY_MIRRORED", False)  # camera source already mirrors the picture
 MIRROR_DISPLAY = getattr(_cfg, "MIRROR_DISPLAY", True)                   # show yourself like a mirror (display only)
 WHISTLE_DEVICE_INDEX = getattr(_cfg, "WHISTLE_DEVICE_INDEX", None)       # sounddevice index of your mic
+WHISTLE_THRESHOLD = getattr(_cfg, "WHISTLE_THRESHOLD", 0.70)            # model probability for a whistle window
+# (whistle_detector.DEFAULT_THRESHOLD is 0.70; the training tool may use its own operating point -- see trainer_config)
 
 UI_W, UI_H = 1280, 720
 TOP_H = 56
@@ -113,6 +115,11 @@ SCOREBOARD_WINDOW_NAME = "Match Testing Scoreboard"     # separate window, Match
 SCOREBOARD_W, SCOREBOARD_H = 640, 300                    # _build_scoreboard_canvas / Session.run()
 MT_WIN_SCORE = 25          # Match Testing win condition, same rule as live_deployment.py's
 MT_WIN_BY_MARGIN = 2       # GAME_WIN_SCORE / GAME_WIN_BY_MARGIN -- deuce-style win-by-2
+EARLY_FINISH = True              # end a capture as soon as the signal was seen and the arms are back at the ready
+# position, instead of always waiting out CAPTURE_SECONDS -- otherwise the verdict can appear several seconds after the
+# trainee finished, which breaks the evaluation forms' 3-second feedback rule
+READY_FRAMES = 6                 # camera frames the arms must be back at the ready position (about 0.2-0.6 s)
+FEEDBACK_TARGET_SECONDS = 3.0    # the forms' 3-second rule: logged per attempt as feedback_latency_s
 MT_TTS_CONFIRM_DELAY_SECONDS = 1.5   # same value as live_deployment.py's TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS: a
 # finished Team to Serve run is held this long before it counts, so a same-side Service Authorization (whose
 # beckon starts from a Team-to-Serve-like pose) can take over and cancel it -- see _mt_check_pending_tts
@@ -121,8 +128,8 @@ MT_TTS_CANCEL_RECORDS = 2  # same-side Service Authorization windows needed to c
 CAMERA_RETRY_SLEEP = 0.3         # camera stopped mid-session: wait this long between reconnect attempts
 CAMERA_RETRY_EVERY = 3           # reopen the camera every this many failed reads
 CAMERA_LOST_SECONDS = 8.0        # give up after this long, save everything and go back to the menu
-CSV_COLS = ["ph_time", "kind", "target", "level", "intent", "note", "verdict", "score", "points", "best_prob", "margin",
-            "hold_s", "confused_with", "failed_checks", "check_values", "feedback",
+CSV_COLS = ["ph_time", "kind", "target", "detected", "level", "intent", "note", "verdict", "score", "points", "best_prob", "margin",
+            "hold_s", "confused_with", "failed_checks", "check_values", "feedback", "feedback_latency_s",
             # the SAME captured movement, graded at every level, so a report can show all three side by side
             "score_beginner", "verdict_beginner", "score_standard", "verdict_standard", "score_referee", "verdict_referee"]
 
@@ -171,6 +178,16 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
 CLEAN_LINE = "Clean signal. Nice work."
+
+
+def detected_label(r):
+    """What the model actually saw during an attempt, for the result screen and the attempt log: the target when it
+    was recognised, otherwise the signal that dominated instead (or nothing). Empty for a NO_READING attempt."""
+    if r is None or r.verdict == gg.VERDICT_NO_READING:
+        return ""
+    if r.recognized:
+        return r.target
+    return r.confused_with or gg.NOTHING_LABEL
 
 
 def feedback_view(r):
@@ -437,8 +454,9 @@ class WhistleHub:
         try:
             from whistle_detector import WhistleDetector
             device = self.device if self.device is not None else WHISTLE_DEVICE_INDEX
-            self.detector = WhistleDetector(on_whistle_callback=self._on_whistle, device=device)
-            self.detector.start()
+            self.detector = WhistleDetector(on_whistle_callback=self._on_whistle, device=device,
+                                            threshold=WHISTLE_THRESHOLD)
+            self.detector.start(confirm_open=True)      # raises if the mic cannot be opened, instead of failing silently
             print("Whistle detection ACTIVE (mic). Press W as a backup.")
         except Exception as exc:  # missing model, no mic, sounddevice error ...
             self.detector = None
@@ -678,7 +696,14 @@ class Session:
         self.camera_lost = False
         self.error = None
         self.error_trace = ""
-        self.perf = {"frame_ms": [], "extract_ms": [], "classify_ms": [], "grade_ms": [], "cpu_proc": [], "cpu_sys": [], "ram_mb": []}
+        self.perf = {"frame_ms": [], "extract_ms": [], "classify_ms": [], "grade_ms": [], "cpu_proc": [], "cpu_sys": [], "ram_mb": [],
+                     "feedback_latency_s": []}
+        # "signal finished" tracking for the 3-second rule: when the arms were last seen raised, and the recent frames
+        self._cap_times = []
+        self._arms_up_t = None
+        self._recent = deque(maxlen=READY_FRAMES)       # Match Testing: the last few frames, for the same check
+        self._recent_t = deque(maxlen=READY_FRAMES)
+        self.last_latency = None
         self.results = []               # AttemptResult per signal of the current step (1, or 2 for a pair)
         self.attempt_no = 0
         self.auto_go = False            # becomes True after the trainee presses SPACE once
@@ -712,6 +737,12 @@ class Session:
                         else None)
         self.mt_pending_form_ok = None       # FIVB form-quality (CORRECT/ALMOST) of whichever team_to_serve run
         # is currently sitting in mt_gate.pending_gesture, re-checked if a later whistle confirms it
+        # Match Simulation with "Require the whistle" ticked: the same DecisionEngine decides whether each call's whistle
+        # counts (whistle up to TEMPORAL_WINDOW before the signal, or up to WHISTLE_CONFIRMATION_GRACE_SECONDS after
+        # it). A point / authorisation then needs BOTH the engine's commit and a passing FIVB form verdict, exactly
+        # like Match Testing. Unticked: form verdict alone decides, the whistle is graded as its own attempt only.
+        self.sim_gate = DecisionEngine() if self.mode == "sim" and choice.get("whistle", False) else None
+        self.sim_gate_event = None           # what the engine did with the current step's call (shown in the commit)
         self.mt_pending_tts = None           # a graded Team to Serve run not yet committed -- live_deployment.py's
         # pending_scoring_label: {"label", "result", "all_levels", "since"} (see _mt_check_pending_tts)
         self.whistle_flash_until = 0.0
@@ -760,8 +791,10 @@ class Session:
         return self.t_intro
 
     def _sync_serving(self):
+        """Sets the opening server from the story. After that the serving indicator only moves when the trainee's own
+        Team to Serve call is committed (see _grade_current), so it never shows a call that was not made."""
         st = self.step
-        if st is not None and st.get("commit") == "serve":
+        if self.serving is None and st is not None and st.get("commit") == "serve":
             self.serving = st["side"]
 
     def _begin_step(self):
@@ -809,7 +842,7 @@ class Session:
         self.review_i = idxs[(cur + delta) % len(idxs)]
 
     # ---- attempt logging ----
-    def _log_attempt(self, step, res=None, whistle_ok=None, whistle_state=None, all_levels=None):
+    def _log_attempt(self, step, res=None, whistle_ok=None, whistle_state=None, all_levels=None, latency=None):
         kind = step["kind"]
         if kind == "whistle":
             state = whistle_state or ("ok" if whistle_ok else "none")
@@ -817,7 +850,7 @@ class Session:
             pts = {"ok": 10, "late": 5, "none": 0}[state]
             fb = {"ok": "", "late": "The whistle came after you started the signal. Blow it first (FIVB 22.2).",
                   "none": "No whistle detected."}[state]
-            row = {"ph_time": now_ph_str(), "kind": "whistle", "target": "whistle", "level": self.level,
+            row = {"ph_time": now_ph_str(), "kind": "whistle", "target": "whistle", "detected": state, "level": self.level,
                    "verdict": verdict, "score": pts * 10, "points": pts, "best_prob": "",
                    "margin": "", "hold_s": "", "confused_with": "", "failed_checks": "", "check_values": "",
                    "intent": self.intent, "note": self.note, "feedback": fb,
@@ -825,14 +858,16 @@ class Session:
                    "score_referee": "", "verdict_referee": ""}
         else:
             failed = [c.id for c in res.checks if c.status == "fail"]
-            row = {"ph_time": now_ph_str(), "kind": "gesture", "target": step["label"], "level": self.level,
+            row = {"ph_time": now_ph_str(), "kind": "gesture", "target": step["label"], "detected": detected_label(res),
+                   "level": self.level,
                    "verdict": res.verdict, "score": res.score, "points": res.points,
                    "best_prob": f"{res.best_prob:.3f}", "margin": f"{res.margin:.3f}",
                    "hold_s": f"{res.hold_seconds:.2f}", "confused_with": res.confused_with or "",
                    "failed_checks": ";".join(failed), "intent": self.intent, "note": self.note,
                    "check_values": ";".join(
                        f"{c.id}={'' if c.value is None else round(c.value, 2)}[{c.need}]:{c.status}" for c in res.checks),
-                   "feedback": " | ".join(res.feedback)}
+                   "feedback": " | ".join(res.feedback),
+                   "feedback_latency_s": "" if latency is None else f"{latency:.2f}"}
             for lv in gg.LEVELS:
                 lv_res = (all_levels or {}).get(lv)
                 row[f"score_{lv}"] = lv_res.score if lv_res is not None else ""
@@ -872,12 +907,15 @@ class Session:
             d["score_sum"] += a["score"]
         gest = [a for a in att if a["kind"] == "gesture"]
         avg = (sum(a["score"] for a in gest) / len(gest)) if gest else 0.0
+        # signals where fewer than half of the attempts were CORRECT, weakest first (the whistle is not a signal)
+        needs = sorted((k for k, d in per.items() if k != "whistle" and d["correct"] < d["n"] / 2.0),
+                       key=lambda k: (per[k]["correct"] / per[k]["n"], per[k]["score_sum"] / per[k]["n"]))
         acc = 100.0 * correct / n if n else 0.0
         one = (f"{self.mode} ({self.cfg.name}): {correct}/{n} correct, {self.points}/{self.max_points} points"
                if n else f"{self.mode}: no graded attempts")
         return {"mode": self.mode, "level": self.level, "attempts": n, "correct": correct, "almost": almost,
                 "incorrect": n - correct - almost, "points": self.points, "max_points": self.max_points,
-                "accuracy_pct": round(acc, 1), "avg_gesture_score": round(avg, 1), "per_signal": per,
+                "accuracy_pct": round(acc, 1), "avg_gesture_score": round(avg, 1), "per_signal": per, "needs_practice": needs,
                 "team_points": dict(self.team) if self.mode == "sim" else None, "one_line": one}
 
     # ---- main loop ----
@@ -911,6 +949,7 @@ class Session:
         self._log_event("session_start", f"mode={self.mode}; level={self.level}; repetitions={self.reps}; "
                         f"whistle_option={bool(self.choice.get('whistle'))}; continuous={self.continuous}; "
                         f"whistle_detector={'auto (microphone)' if getattr(self.whistle, 'auto_active', False) else 'not running (W key)'}; "
+                        f"whistle_threshold={WHISTLE_THRESHOLD:.2f}; "
                         f"intent={self.intent}")
         if self.queue and self.mode != "practice":
             self._set_phase("intro")
@@ -1030,6 +1069,7 @@ class Session:
             return sum(x) / len(x) if x else 0.0
 
         fm = self.perf["frame_ms"]
+        lat = self.perf["feedback_latency_s"]
         q = max(1, len(fm) // 4)
         fps = lambda ms: (1000.0 / mean(ms)) if ms else 0.0
         return {"frames": len(fm), "seconds": round(sum(fm) / 1000.0, 1), "fps_mean": round(fps(fm), 1),
@@ -1044,7 +1084,11 @@ class Session:
                 "cpu_process_max_pct": round(max(self.perf["cpu_proc"]), 1) if self.perf["cpu_proc"] else 0.0,
                 "cpu_system_mean_pct": round(mean(self.perf["cpu_sys"]), 1),
                 "ram_mean_mb": round(mean(self.perf["ram_mb"]), 1),
-                "ram_max_mb": round(max(self.perf["ram_mb"]), 1) if self.perf["ram_mb"] else 0.0}
+                "ram_max_mb": round(max(self.perf["ram_mb"]), 1) if self.perf["ram_mb"] else 0.0,
+                # the forms' 3-second rule: seconds from "arms back down" to the verdict, per graded attempt
+                "feedback_n": len(lat), "feedback_mean_s": round(mean(lat), 2),
+                "feedback_max_s": round(max(lat), 2) if lat else 0.0,
+                "feedback_within_3s": sum(1 for x in lat if x <= FEEDBACK_TARGET_SECONDS)}
 
     # ---- state machine ----
     def _update(self, t, feats, rec):
@@ -1053,6 +1097,9 @@ class Session:
             if self.mode in ("match_test", "practice") and self.mt_in_run:
                 self.mt_run_frames.append(feats)      # every camera frame while a run is presumed active
             if self.mode == "match_test":
+                self._recent.append(feats)
+                self._recent_t.append(t)
+                self._ready_status(list(self._recent), t)
                 self._mt_poll_whistle(t)               # whistle logging is match-test only; Practice does not need it
                 self._mt_check_pending_tts()
             if rec is not None:
@@ -1095,6 +1142,7 @@ class Session:
         elif self.phase == "countdown":
             if t - self.phase_t0 >= self.cd_seconds:
                 self.cap_frames, self.cap_records = [], []
+                self._cap_times, self._arms_up_t, self.last_latency, self._last_ready = [], None, None, None
                 self.cap_seconds = CAPTURE_SECONDS_PAIR if step is not None and step["kind"] == "pair" else CAPTURE_SECONDS
                 if step is not None and step.get("whistle"):
                     self.cap_seconds += WHISTLE_EXTRA_SECONDS
@@ -1114,7 +1162,9 @@ class Session:
                     evs = getattr(self.whistle, "events_since", lambda _t: [])(self.phase_t0)
                     src = evs[0]["source"] if evs else "?"
                     self._log_event("whistle_heard", f"source={src}; {t - self.phase_t0:.2f} s after GO")
-            if t - self.phase_t0 >= self.cap_seconds:
+            self._cap_times.append(t)
+            ready = self._last_ready = self._ready_status(self.cap_frames, t)
+            if t - self.phase_t0 >= self.cap_seconds or (EARLY_FINISH and self._signal_finished(step, ready)):
                 self._grade_current()
         elif self.phase == "wait_whistle":
             if self.whistle.heard_since(self.phase_t0):
@@ -1140,6 +1190,7 @@ class Session:
             elapsed = w - self._t0 if self._t0 is not None else w
             self._log_event("whistle_heard", f"match test whistle #{self.mt_whistle_count} at {elapsed:.2f}s")
             self.mt_whistle_pointer = w + 1e-6      # advance past it so the next poll finds the NEXT whistle, if any
+            self.whistle_flash_until = t + 1.0     # show "WHISTLE!" so the performer can see it was heard
             if self.mt_gate is not None:
                 # A team_to_serve run graded a moment ago with no whistle yet is sitting in decision_engine.py's
                 # own pending_gesture, waiting on exactly this. Capture which label (if any) BEFORE calling
@@ -1188,11 +1239,21 @@ class Session:
         all_levels = gg.grade_at_all_levels(label, frames, recs, self.be.label_to_idx, aspect=self.aspect,
                                             step_seconds=step_s)
         result = all_levels[self.level]
+        mt_latency = None
+        if self.mode == "match_test" and len(self._recent) >= READY_FRAMES and gg.ready_position_check(
+                np.asarray(list(self._recent), dtype=float), self.level, self.aspect).status == "pass":
+            # arms down: the run ended by lowering them; measured from the last frame they were still up
+            mt_latency = self._record_latency(self._arms_up_t if self._arms_up_t is not None
+                                              and self._arms_up_t < self._recent_t[-1] else None)
         old_cap_frames, old_cap_records = self.cap_frames, self.cap_records
         self.cap_frames, self.cap_records = frames, recs
         self._save_attempt_npz([label], [None], [result], step_s)
         self.cap_frames, self.cap_records = old_cap_frames, old_cap_records
         if result.verdict == gg.VERDICT_NO_READING:
+            if self.mode == "match_test":       # not graded, but say so instead of dropping it silently
+                self._log_event("mt_no_reading", f"{label}: {result.feedback[0] if result.feedback else ''}")
+                self._mt_set_decision("NO READING: step back so your head, shoulders and arms are in frame",
+                                      C_AMBER)
             return
         self.mt_last_result = result
         self.results = [result]
@@ -1215,7 +1276,8 @@ class Session:
             if prev is not None:
                 self._log_event("mt_pending_replaced", f"{prev['label']} replaced by {label} before it committed")
             since = prev["since"] if prev is not None and prev["label"] == label else self.clock()
-            self.mt_pending_tts = {"label": label, "result": result, "all_levels": all_levels, "since": since}
+            self.mt_pending_tts = {"label": label, "result": result, "all_levels": all_levels, "since": since,
+                                   "latency": mt_latency}
             self._mt_set_decision(f"{label}: pending (confirming {MT_TTS_CONFIRM_DELAY_SECONDS:.1f}s)", C_AMBER)
         else:
             pending = self.mt_pending_tts
@@ -1224,7 +1286,7 @@ class Session:
                     self._mt_cancel_pending_tts()      # the "Team to Serve" was the start of this authorization
                 else:
                     self._mt_commit_pending_tts()      # live: commit the pending point first, then this gesture
-            self._mt_commit(label, result, all_levels)
+            self._mt_commit(label, result, all_levels, mt_latency)
 
     @staticmethod
     def _mt_same_side_auth(tts_label):
@@ -1253,15 +1315,15 @@ class Session:
 
     def _mt_commit_pending_tts(self):
         pending, self.mt_pending_tts = self.mt_pending_tts, None
-        self._mt_commit(pending["label"], pending["result"], pending["all_levels"])
+        self._mt_commit(pending["label"], pending["result"], pending["all_levels"], pending.get("latency"))
         if self.mt_gate is not None:
             # live_deployment.py clears the settle window after a delayed Team to Serve commit, so the reason
             # gesture right after it is not swallowed as tail-end noise
             self.mt_gate.last_settle_start_time = None
 
-    def _mt_commit(self, label, result, all_levels):
+    def _mt_commit(self, label, result, all_levels, latency=None):
         """Logs one graded Match Testing run and feeds it to the scoreboard / decision engine."""
-        self._log_attempt({"kind": "gesture", "label": label}, res=result, all_levels=all_levels)
+        self._log_attempt({"kind": "gesture", "label": label}, res=result, all_levels=all_levels, latency=latency)
         # Every graded run (not just team_to_serve) is fed into mt_gate, exactly like
         # live_deployment.py feeds every committed label into decision_engine.py -- this is what lets
         # a Service Authorization correctly consume its whistle, so a stray earlier whistle can't
@@ -1331,6 +1393,60 @@ class Session:
         if self.mt_pending_tts is not None:
             self._mt_commit_pending_tts()     # session over: nothing can cancel it any more
 
+    def _ready_status(self, frames, t):
+        """Ready-position check on the last READY_FRAMES frames ("pass" / "fail" / "unverified"). Remembers the last
+        moment the arms were raised, which is when the trainee "finished the signal" for the 3-second rule."""
+        if len(frames) < READY_FRAMES:
+            return "unverified"
+        status = gg.ready_position_check(np.asarray(frames[-READY_FRAMES:], dtype=float), self.level, self.aspect).status
+        if status == "fail":
+            self._arms_up_t = t
+        return status
+
+    def _signal_end(self, step, ready, final=False):
+        """When the trainee finished the step's signal (the LAST one of a pair), or None if not finished yet.
+        1. Arms: the arms were up after the signal was first recognised and are now back at the ready position. The end
+           is the last frame whose READY_FRAMES window still showed them up (the check is a median, so this is at most
+           half a window late -- a delay measured from it can only come out slightly too long, never too short).
+        2. Model, for a signal held low that the arm check cannot see (Ball In): the model saw the signal and then
+           NOTHING for two windows in a row (one is enough once the capture is over, final=True). The end is the last window that still saw it, minus half a model window
+           (that window was at least half the signal), again so the delay is never under-reported."""
+        if step is None:
+            return None
+        target = step["labels"][-1] if step["kind"] == "pair" else None
+        hit = (lambda lab: lab == target) if target else (lambda lab: lab != gg.NOTHING_LABEL)
+        recs = self.cap_records
+        idx = [i for i, r in enumerate(recs) if hit(r["label"])]
+        if not idx:
+            return None
+        first_t = recs[idx[0]]["t"]
+        # the arms must have been up AFTER that signal was first recognised: the pause between the two signals of a
+        # pair (arms briefly down) must not count as the end
+        if ready == "pass" and self._arms_up_t is not None and self._arms_up_t >= first_t:
+            return self._arms_up_t
+        tail = recs[idx[-1] + 1:]
+        need = 1 if final else 2
+        if len(tail) >= need and all(r["label"] == gg.NOTHING_LABEL for r in tail[-need:]):
+            times = self._cap_times
+            dt = (times[-1] - times[0]) / (len(times) - 1) if len(times) >= 2 else 0.1
+            return recs[idx[-1]]["t"] - (ROLLING_WINDOW_FRAMES / 2.0) * dt
+        return None
+
+    def _signal_finished(self, step, ready):
+        """Early end of a capture (EARLY_FINISH). A step that needs the whistle keeps the full window until the whistle
+        was heard, so a slightly late whistle is not cut off."""
+        if step is not None and step.get("whistle") and not self._whistle_seen:
+            return False
+        return self._signal_end(step, ready) is not None
+
+    def _record_latency(self, end_t):
+        """Seconds from the end of the signal to now (the verdict is computed now and drawn on the next frame)."""
+        if end_t is None:
+            return None
+        lat = round(max(0.0, self.clock() - end_t), 2)
+        self.perf["feedback_latency_s"].append(lat)
+        return lat
+
     def _grade_current(self):
         t_grade = time.perf_counter()
         step = self.step
@@ -1359,8 +1475,8 @@ class Session:
                                                       aspect=self.aspect, step_seconds=step_s, context=step.get("ctx"))]
         self.results, self.result = results, results[0]
         self.perf["grade_ms"].append((time.perf_counter() - t_grade) * 1000.0)
-        if step["kind"] == "pair" and step.get("winner"):
-            self.serving = step["winner"]           # the story is the truth: the winner serves next
+        self.last_latency = self._record_latency(self._signal_end(step, getattr(self, "_last_ready", None),
+                                                                   final=True))
         # the whistle: heard during this capture, and before the first signal started?
         self.whistle_state = None
         if step.get("whistle"):
@@ -1377,20 +1493,56 @@ class Session:
         self.capture_windows.append({"start": self.phase_t0, "end": self.clock(), "step": self.attempt_no,
                                      "labels": "+".join(labels), "state": self.whistle_state, "onset": onset_est})
         self._log_event("verdict", "; ".join(f"{l}={r.verdict} {r.score}/100" for l, r in zip(labels, results))
-                        + (f"; whistle={self.whistle_state}" if self.whistle_state else ""))
+                        + (f"; whistle={self.whistle_state}" if self.whistle_state else "")
+                        + f"; capture {self.clock() - self.phase_t0:.1f}s"
+                        + ("" if self.last_latency is None else f"; feedback {self.last_latency:.2f}s after arms down"))
         if not any(r.verdict == gg.VERDICT_NO_READING for r in results):
             if self.whistle_state is not None:
                 self._log_attempt({"kind": "whistle"}, whistle_state=self.whistle_state)
+            self.sim_gate_event = self._sim_gate_step(labels, recs) if self.sim_gate is not None else None
+            gate_ok = self.sim_gate_event is None or self.sim_gate_event in ("point_awarded",
+                                                                             "authorization_acknowledged")
             for label, res, all_levels in zip(labels, results, all_levels_by_i):
-                self._log_attempt({"kind": "gesture", "label": label}, res=res, all_levels=all_levels)
+                self._log_attempt({"kind": "gesture", "label": label}, res=res, all_levels=all_levels,
+                                  latency=self.last_latency)
                 if (self.mode == "sim" and res.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST)
-                        and label.startswith("team_to_serve_")):        # a close call still counts
-                    self.team[label.rsplit("_", 1)[1]] += 1
+                        and label.startswith("team_to_serve_") and gate_ok):        # a close call still counts
+                    side = label.rsplit("_", 1)[1]
+                    self.team[side] += 1
+                    self.serving = side                 # the serving indicator follows the committed call only
             if self.mode == "sim":
                 self.commit = self._make_commit(step, labels, results)
                 self.commit_log.append(f"{self.commit['title']}: {self.commit['lines'][0]}")
                 del self.commit_log[:-3]
         self._set_phase("result")
+
+    def _sim_gate_step(self, labels, recs):
+        """Match Simulation with the whistle required: replays this capture's whistle and its first signal through
+        decision_engine.py in time order (the signal at the moment the model first recognised it) and returns the
+        engine's event for that signal -- "point_awarded", "authorization_acknowledged", or something else when the
+        whistle did not count. Each call is its own whistle-then-signal cycle, so whistle state from an earlier step
+        is cleared first (a whistle blown for the previous call must not validate this one). end_of_set is not
+        whistle-gated by the engine, so it returns None (form alone decides, as before)."""
+        first = labels[0]
+        if first not in SCORING_GESTURES and not first.startswith("service_authorization_"):
+            return None
+        g = self.sim_gate
+        g.last_whistle_time, g.pending_gesture, g.last_settle_start_time = None, None, None
+        events = []
+        wt = self.whistle.first_since(self.phase_t0)
+        if wt is not None:
+            events.append((wt, 0, None))
+        gt = next((r["t"] for r in recs if r["label"] == first), None)
+        if gt is not None:
+            events.append((gt, 1, first))
+        outcome = "not_recognised" if gt is None else "no_whistle"
+        for ts, _order, label in sorted(events):
+            res = g.on_gesture_detected(label, ts) if label else g.on_whistle_detected(ts)
+            if res is not None and res["event"] in ("point_awarded", "authorization_acknowledged"):
+                outcome = res["event"]
+        self._log_event("sim_gate", f"{first}: {outcome}"
+                        + ("" if wt is None or gt is None else f"; whistle {wt - gt:+.2f}s from the signal"))
+        return outcome
 
     def _make_commit(self, step, labels, results):
         """The message a scoreboard would show after the call (match simulation): what was committed, or why not.
@@ -1400,8 +1552,12 @@ class Session:
         wl = {"ok": "Whistle: on time.", "late": "Whistle: heard, but after the signal started.",
               "none": "Whistle: not heard."}.get(self.whistle_state)
         expected = "Correct call: " + self._step_names(step) + "."
-        passes = lambda r: r.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST)
+        form_ok = lambda r: r.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST)
+        gate_ok = self.sim_gate_event in (None, "point_awarded", "authorization_acknowledged")
+        passes = lambda r: form_ok(r) and gate_ok
         close = lambda r: " (close, not perfect)" if r.verdict == gg.VERDICT_ALMOST else ""
+        no_whistle = ("No whistle counted with your call (Require the whistle is on), so nothing was recorded."
+                      if form_ok(results[0]) and not gate_ok else None)
         if step["kind"] == "pair":
             W = _side_word(step["winner"])
             if passes(results[0]):
@@ -1411,7 +1567,7 @@ class Session:
                          + ("." if results[1].verdict != gg.VERDICT_INCORRECT else " (not confirmed).")]
             else:
                 title, ok = "NOT COMMITTED", False
-                lines = ["Your call was not clear or not correct, so no point was recorded.", expected]
+                lines = [no_whistle or "Your call was not clear or not correct, so no point was recorded.", expected]
         elif step.get("commit") == "serve":
             W = _side_word(step["side"])
             if passes(results[0]):
@@ -1419,7 +1575,7 @@ class Session:
                 lines = [f"The team on your {W} may serve{close(results[0])}.", score]
             else:
                 title, ok = "NOT AUTHORISED", False
-                lines = ["The authorisation was not clear or not correct.", expected]
+                lines = [no_whistle or "The authorisation was not clear or not correct.", expected]
         else:
             if passes(results[0]):
                 title, ok = "SET ENDED", True
@@ -1481,7 +1637,13 @@ class Session:
             return False
         if ch == "m":
             self.mirror_display = not self.mirror_display
-        elif ch == "p" and self.phase in ("practice", "intro", "result"):
+        elif ch == "p" and self.phase in ("practice", "intro", "result", "countdown", "capture"):
+            if self.phase in ("countdown", "capture"):
+                # pausing mid-attempt: this attempt is dropped (never graded or logged), earlier ones are kept, and the
+                # same step starts again after resuming
+                self._log_event("attempt_cancelled", f"paused during {self.phase}; not graded")
+                self.cap_frames, self.cap_records = [], []
+                self._set_phase("intro")
             self.paused = not self.paused
             self._log_event("paused" if self.paused else "resumed")
         elif ch == "t":
@@ -1971,7 +2133,9 @@ class Session:
                     mark = {"Required": "R", "Important": "I", "Scored": "S"}[it["effect"]]
                     put(ui, fit(f"[{mark}] {it['label']}", w, 0.4), x, y, 0.4, C_TEXT if mark != "S" else C_MUTED, 1)
                 y += 16
-                put(ui, "R required  I important  S scored.  100 is not needed.", x, y, 0.38, C_MUTED, 1)
+                need = ("only 100 counts as correct" if self.cfg.correct_cut >= 100
+                        else f"{self.cfg.correct_cut}+ counts as correct")
+                put(ui, f"R required  I important  S scored.  {need}.", x, y, 0.38, C_MUTED, 1)
             if not compact and s.get("not_graded") and y < UI_H - 120:
                 y += 24
                 put(ui, "Not graded by the camera", x, y, 0.43, C_AMBER, 1)
@@ -2083,8 +2247,17 @@ class Session:
             return
         put(ui, f"Signal score {r.score}/100   +{r.points} session pts", x, y + 40, 0.56, C_TEXT, 2)
         cut = gg.LEVEL_CONFIG[r.level].correct_cut
-        put(ui, fit(f"Counts as CORRECT from {cut}. 100 is not needed.", w, 0.42), x, y + 58, 0.42, C_MUTED, 1)
-        y += 72
+        cut_txt = ("Only 100 counts as CORRECT at this level." if cut >= 100
+                   else f"Counts as CORRECT from {cut}. 100 is not needed.")
+        put(ui, fit(cut_txt, w, 0.42), x, y + 58, 0.42, C_MUTED, 1)
+        seen = detected_label(r)
+        seen_txt = "nothing" if seen == gg.NOTHING_LABEL else gg.short_label(seen)
+        put(ui, fit(f"Recognised as: {seen_txt}", w, 0.45), x, y + 80, 0.45,
+            C_GREEN if seen == r.target else C_AMBER, 1)
+        put(ui, "Confidence", x, y + 102, 0.45, C_MUTED, 1)     # the model's best probability for the target
+        bar(ui, x + 110, y + 92, w - 170, 10, r.best_prob, C_GREEN if r.best_prob >= 0.5 else C_MUTED)
+        put(ui, f"{r.best_prob:.2f}", x + w - 52, y + 102, 0.45, C_TEXT, 1)
+        y += 116
         rows = [("Recognition", r.parts["recognition"], gg.W_RECOGNITION), ("Distinctness", r.parts["distinctness"], gg.W_DISTINCT),
                 ("Hold", r.parts["hold"], gg.W_HOLD), ("FIVB form", r.parts["form"], gg.W_FORM),
                 ("Ready pos.", r.parts["ready_position"], gg.W_READY)]
@@ -2184,6 +2357,14 @@ class Session:
             put(ui, k, xx, y, 0.5, C_MUTED, 1)
             put(ui, v, xx, y + 36, 0.95, C_TEXT, 2)
         y += 70
+        per_txt = "   ".join(f"{gg.short_label(k)} {d['correct']}/{d['n']}" for k, d in s["per_signal"].items()
+                               if k != "whistle")
+        if per_txt:
+            put(ui, fit("Correct per signal:  " + per_txt, SIDE_X - 80, 0.47), 40, y, 0.47, C_TEXT, 1)
+            y += 22
+            needs = ", ".join(gg.short_label(k) for k in s.get("needs_practice", [])) or "none, well done"
+            put(ui, fit("Needs more practice:  " + needs, SIDE_X - 80, 0.47), 40, y, 0.47, C_AMBER, 1)
+            y += 30
         if s.get("team_points"):
             put(ui, f"Scoreboard from your correct calls:  team on your LEFT {s['team_points']['left']}  -  {s['team_points']['right']} RIGHT",
                 40, y, 0.55, C_AMBER, 1)
@@ -2369,12 +2550,12 @@ def write_report(path, trainee, summary, attempts, whistle_rows=None, practice_l
         return " &nbsp; ".join(parts)
 
     rows = "".join(
-        f"<tr><td>{e(a['ph_time'])}</td><td>{e(a['target'])}</td>"
+        f"<tr><td>{e(a['ph_time'])}</td><td>{e(a['target'])}</td><td>{e(str(a.get('detected', '')))}</td>"
         f"<td style='font-weight:bold;color:{ {'CORRECT': '#2e7d32', 'ALMOST': '#e65100', 'INCORRECT': '#c62828'}.get(a['verdict'], '#333') }'>{e(a['verdict'])}</td>"
         f"<td>{a['score']}</td><td>{a['points']}</td><td>{e(str(a['hold_s']))}</td>"
         f"<td style='font-size:12px'>{all_levels_cell(a)}</td>"
         f"<td>{e(a['failed_checks'])}</td>"
-        f"<td>{e(a['feedback'])}</td></tr>" for a in attempts) or "<tr><td colspan='9'>(no graded attempts)</td></tr>"
+        f"<td>{e(a['feedback'])}</td><td>{e(str(a.get('feedback_latency_s', '')))}</td></tr>" for a in attempts)         or "<tr><td colspan='11'>(no graded attempts)</td></tr>"
     per = "".join(f"<tr><td>{e(k)}</td><td>{v['correct']}/{v['n']}</td><td>{v['score_sum'] / max(1, v['n']):.0f}</td></tr>"
                   for k, v in summary["per_signal"].items())
     team = ""
@@ -2455,9 +2636,10 @@ th{{background:#eee}}.box{{background:#fff;border:1px solid #ddd;border-radius:6
 {practice_scores_html}
 {practice_html}
 <h2>By signal</h2><table><tr><th>Signal</th><th>Correct</th><th>Avg score</th></tr>{per}</table>
+<p><b>Needs more practice</b> (fewer than half CORRECT): {e(", ".join(gg.short_label(k) for k in summary.get("needs_practice", [])) or "none")}</p>
 <h2>Attempts</h2><p style="color:#666;font-size:12px">"All levels" shows how the SAME captured movement would be judged at every difficulty
 (B=Beginner, S=Standard, R=Referee; C/A/I = Correct/Almost/Incorrect), not just the level this session used.</p>
-<table><tr><th>Time</th><th>Target</th><th>Verdict</th><th>Score</th><th>Points</th><th>Hold (s)</th><th>All levels</th><th>Failed checks</th><th>Feedback</th></tr>{rows}</table>
+<table><tr><th>Time</th><th>Target</th><th>Detected</th><th>Verdict</th><th>Score</th><th>Points</th><th>Hold (s)</th><th>All levels</th><th>Failed checks</th><th>Feedback</th><th>Verdict shown (s after arms down)</th></tr>{rows}</table>
 </body></html>"""
     with open(path, "w", encoding="utf-8") as f:
         f.write(doc)
@@ -2507,7 +2689,9 @@ def main(argv=None):
             import device_setup
             device_setup.run_device_setup()
     whistle = WhistleHub()
-    whistle.device = trainer_ui.read_settings().get("mic_index")
+    whistle.device, mic_warning = devices.resolve_saved_mic(trainer_ui.read_settings())
+    if mic_warning:
+        trainer_ui.show_message("Microphone not found", mic_warning, error=True)
     last_summary = ""
     try:
         while True:
@@ -2518,7 +2702,9 @@ def main(argv=None):
                 device_setup.run_device_setup()
                 settings = trainer_ui.read_settings()
                 whistle.stop()
-                whistle.device = settings.get("mic_index")
+                whistle.device, mic_warning = devices.resolve_saved_mic(settings)
+                if mic_warning:
+                    trainer_ui.show_message("Microphone not found", mic_warning, error=True)
                 try:
                     backend.reopen_camera(pick_camera_index(args.camera, settings.get("camera_index") or 0))
                 except Exception as exc:

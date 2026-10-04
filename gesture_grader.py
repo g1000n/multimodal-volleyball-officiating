@@ -128,6 +128,7 @@ LEVEL_CONFIG = {
 
     "standard": LevelConfig("standard", "Standard", 0.75, 0.30, 1.0, 75, 55),
 
+    # Referee: only a perfect 100 counts as CORRECT (team decision 2026-10-04; was 90). Beginner/Standard never need 100.
     "referee": LevelConfig("referee", "Referee", 0.90, 0.45, 1.5, 100, 68),
 
 }
@@ -228,11 +229,12 @@ SIGNALS: Dict[str, dict] = {
         "fivb": "Raise the forearms vertically, hands open, palms towards the body.",
         "howto": [
             "Stand about 2 m from the camera, square to it, so BOTH hands stay visible and do not overlap.",
-            "Raise both arms to the same height. For the full form lift the elbows out to about shoulder height so the armpits are open (referee guidance); elbows kept nearer the body still count, with fewer points.",
+            "Raise both arms to the same height. Lift the elbows a little away from your body so the armpits are slightly open (referee guidance), but do not spread them out to the sides: keep the elbows less than about twice your shoulder width apart.",
             "Bend both elbows so both forearms point straight up, hands open with the fingers extended, palms toward your face.",
             "Hold about 2 seconds, then lower both arms.",
         ],
         "mistakes": ["Only one arm raised", "Elbows tucked against the body (armpits closed)",
+                     "Elbows spread far out to the sides",
                      "Forearms leaning instead of vertical", "Arms straight overhead", "Hands closed"],
         "not_graded": "Palm direction (palms toward the body) cannot be measured reliably by one 2D camera; check it with your instructor. The open armpits are referee guidance, not FIVB text, and only earn marks.",
     },
@@ -289,7 +291,8 @@ _TAUGHT = {
     "team_to_serve_left": _TTS_TAUGHT, "team_to_serve_right": _TTS_TAUGHT,
     "service_authorization_left": _SA_TAUGHT, "service_authorization_right": _SA_TAUGHT,
     "ball_in": {"arm_extended": 2, "arm_lowered": 2, "hand_open": 2, "other_arm_relaxed": 3, "ready_position": 4},
-    "ball_out": {"forearms_vertical": 3, "arms_raised": 2, "arms_symmetric": 2, "hands_open": 3, "elbows_bent": 3,
+    "ball_out": {"forearms_vertical": 3, "arms_raised": 2, "arms_symmetric": 2, "elbow_spread": 2, "hands_open": 3,
+                 "elbows_bent": 3,
                  "ready_position": 4},
     "double_contact": {"hand_raised": 2, "hand_side": 2, "two_fingers": 3, "other_arm_down": 4, "ready_position": 4},
     "end_of_set": {"forearms_crossed": 2, "at_chest": 2, "elbows_bent": 2, "hands_open": 3, "ready_position": 4},
@@ -761,10 +764,13 @@ def _rules_ball_out(g: Geo, lv: str, gcap=None, ctx=None) -> List[Check]:
     worst_open = float(min(seen)) if seen else None
     both_vis = L.vis_frac >= MIN_ARM_VISIBLE_FRAC and R.vis_frac >= MIN_ARM_VISIBLE_FRAC
     return [
-        _c("forearms_vertical", "BOTH forearms vertical (FIVB: raise the forearms vertically)", 12, True,
+        # Weights 10/10/4/7/5/4 = 40 (W_FORM): the earlier 12/12/5/8/6/5 summed to 48 once elbow_spread was added.
+        # Rescaled 2026-10-04 so the rubric table adds up; re-grading all 61 recorded real Ball Outs at every level gave
+        # identical scores and verdicts (form points are already normalised to W_FORM).
+        _c("forearms_vertical", "BOTH forearms vertical (FIVB: raise the forearms vertically)", 10, True,
            worst_fore, le=pick(lv, 40, 30, 20), unit=" deg", verifiable=both_vis,
            tip="Raise BOTH forearms straight up; keep them vertical, not leaning"),
-        _c("arms_raised", "Elbows a little away from the body, armpits slightly open (full marks)", 12, ARMPITS_REQUIRED,
+        _c("arms_raised", "Elbows a little away from the body, armpits slightly open (full marks)", 10, ARMPITS_REQUIRED,
            least_raised, ge=pick(lv, 5, 10, 20), le=pick(lv, 85, 80, 76), unit=" deg", verifiable=both_vis, # changed to ge=pick(lv, 5, 10, 20) from ge=pick(lv, 10, 20, 30)
            basis="TRAINING",
            # Upper bound calibrated 2026-09-22 from a real Referee-level attempt measuring 67.7 deg (verdict CORRECT
@@ -773,14 +779,14 @@ def _rules_ball_out(g: Geo, lv: str, gcap=None, ctx=None) -> List[Check]:
            # this be tightened with confidence instead of guessed.
            tip="Lift your elbows a LITTLE away from your body, as in the FIVB picture; not fully flat down and not a "
                "stiff sideways T with the arms at shoulder height"),
-        _c("arms_symmetric", "Both arms at the same height", 5, False, asym,
+        _c("arms_symmetric", "Both arms at the same height", 4, False, asym,
            le=pick(lv, 0.6, 0.4, 0.3), verifiable=both_vis,
            tip="Raise both arms to the same height"),
 
         _c(
             "elbow_spread",
             "Elbows not excessively far apart",
-            8,
+            7,
             False,
             elbow_spread_value,
             le=pick(lv, 2.0, 1.9, 1.9),
@@ -790,10 +796,10 @@ def _rules_ball_out(g: Geo, lv: str, gcap=None, ctx=None) -> List[Check]:
             basis="TRAINING",
             tip="Keep your elbows closer to your body. Do not spread your arms almost straight out to both sides."
         ),
-        _c("hands_open", "Hands open (FIVB: hands open)", 6, False, worst_open,
+        _c("hands_open", "Hands open (FIVB: hands open)", 5, False, worst_open,
            ge=pick(lv, 2, 3, 4), verifiable=worst_open is not None, strict=(lv == "referee" or OPEN_HAND_STRICT),
            tip="Keep both hands open with the fingers extended"),
-        _c("elbows_bent", "Elbows bent, forearms up (not arms straight overhead)", 5, True, worst_elbow,
+        _c("elbows_bent", "Elbows bent, forearms up (not arms straight overhead)", 4, True, worst_elbow,
            le=pick(lv, 150, 135, 125), unit=" deg", verifiable=both_vis,
            tip="Keep your elbows bent with the forearms vertical; do not stretch your arms overhead"),
     ]
@@ -1247,6 +1253,7 @@ def scoring_note(level: str = "standard") -> str:
     cfg = LEVEL_CONFIG[level]
     return (f"Also scored: the system must recognise the signal ({W_RECOGNITION} points) and how clearly ({W_DISTINCT}), "
             f"how long you hold it ({W_HOLD}), and lowering your arms afterwards ({W_READY}, minor). "
-            f"You do not need 100/100: {cfg.correct_cut} or more counts as CORRECT at {cfg.name} level and "
-            f"{cfg.almost_cut} or more is ALMOST. Each attempt adds session points to your total "
+            + (f"At {cfg.name} level only a perfect 100/100 counts as CORRECT, and " if cfg.correct_cut >= 100 else
+               f"You do not need 100/100: {cfg.correct_cut} or more counts as CORRECT at {cfg.name} level and ")
+            + f"{cfg.almost_cut} or more is ALMOST. Each attempt adds session points to your total "
             f"(CORRECT 10, ALMOST 5, INCORRECT 0).")

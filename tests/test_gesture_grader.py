@@ -130,9 +130,11 @@ def g_ball_in(deg=15, fingers=OPEN):
     return fn
 
 
-def g_ball_out(one_arm=False, fingers=OPEN, out_frac=0.5, down_frac=0.5):
-    """Default (out_frac=0.5, down_frac=0.5) is a moderate, natural elbows-away-from-body pose (about 45 degrees
-    from hanging), matching the FIVB picture rather than a full sideways T."""
+def g_ball_out(one_arm=False, fingers=OPEN, out_frac=0.35, down_frac=0.5):
+    """Default (out_frac=0.35, down_frac=0.5) is a moderate, natural elbows-away-from-body pose (about 35 degrees
+    from hanging, elbows about 1.7x shoulder width apart), matching the FIVB picture rather than a full sideways T.
+    It stays inside the elbow-spread limit (1.9x at Standard and Referee); 0.5 would sit exactly at 2.0x, which the
+    grader deliberately caps at ALMOST as an over-spread Ball Out."""
     def fn(i, m):
         out = []
         for side in ("left", "right"):
@@ -492,7 +494,10 @@ def test_end_of_set_overlapping_wrists_count_as_crossed():
 def test_close_attempts_still_pass_and_100_is_not_needed():
     for lv in gg.LEVELS:
         cfg = gg.LEVEL_CONFIG[lv]
-        assert cfg.correct_cut <= 90 and cfg.almost_cut < cfg.correct_cut       # 100 is never required
+        assert cfg.almost_cut < cfg.correct_cut
+    # Beginner and Standard never require 100; Referee deliberately does (team decision 2026-10-04)
+    assert gg.LEVEL_CONFIG["beginner"].correct_cut <= 90 and gg.LEVEL_CONFIG["standard"].correct_cut <= 90
+    assert gg.LEVEL_CONFIG["referee"].correct_cut == 100
     assert gg.LEVEL_CONFIG["standard"].correct_cut <= 75
     r = run(g_tts("left", deg=70), "team_to_serve_left")
     assert r.score < 100 or r.verdict == gg.VERDICT_CORRECT

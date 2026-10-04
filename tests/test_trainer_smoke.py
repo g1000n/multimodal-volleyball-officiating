@@ -487,6 +487,72 @@ def test_match_test_auth_cancels_pending_team_to_serve():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_sim_whistle_gate():
+    """Match Simulation with "Require the whistle": a call only scores when decision_engine.py accepts its whistle AND
+    the form passes. Without the option, form alone decides (the whistle is graded as its own attempt)."""
+    tmp = tempfile.mkdtemp()
+    old_cwd = os.getcwd()
+    os.chdir(tmp)
+    try:
+        def sim(**kw):
+            return run_mode("sim", tmp, None, level="beginner", hands_off=True, continuous=True, **kw)
+        sess, summary = sim(whistle=True)                          # whistle blown 0.3 s into every capture
+        assert sum(summary["team_points"].values()) == 3, summary
+        sess, summary = sim(whistle=True, whistle_at=None)         # never blown
+        assert summary["team_points"] == {"left": 0, "right": 0}, summary
+        assert any("No whistle counted" in l for l in sess.commit_log), sess.commit_log
+        opening = sess.queue[0]["side"]
+        assert sess.serving == opening, (sess.serving, opening)  # no committed call -> server never changed
+        sess, summary = sim(whistle_at=None)                       # option off: whistle not required
+        assert sum(summary["team_points"].values()) == 3, summary
+        with open(os.path.join(sess.dir, "attempts.csv"), newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        assert all(r["detected"] == r["target"] for r in rows if r["kind"] == "gesture"), rows
+        assert "needs_practice" in summary
+        print("sim gate   OK   whistle required: 3 pts with it, 0 without; option off: 3 pts")
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_pause_mid_attempt_and_feedback_latency():
+    """P during a capture drops that attempt (never graded or logged) and repeats the step after resuming. Every graded
+    attempt logs feedback_latency_s (signal end -> verdict), and a capture ends early once the arms are back down."""
+    tmp = tempfile.mkdtemp()
+    old_cwd = os.getcwd()
+    os.chdir(tmp)
+    try:
+        clock = FakeClock()
+        be = FakeBackend(clock)
+        choice = {"action": "start", "mode": "drill", "gesture": "team_to_serve_left", "level": "beginner", "reps": 2}
+        sess = TestSession(be, {"trainee_id": "tester", "display_name": "Tester"}, choice, FakeHub(clock),
+                           clock=clock, rng=random.Random(3))
+        sess.hands_off = True
+        base_key = sess._key
+        state = {"paused_at": None}
+
+        def key():
+            if state["paused_at"] is None and sess.phase == "capture" and clock() - sess.phase_t0 > 1.0:
+                state["paused_at"] = clock()
+                return ord("p")
+            if sess.paused and clock() - state["paused_at"] > 1.0:
+                return ord("p")                        # resume
+            return base_key()
+        sess._key = key
+        summary = sess.run()
+        gest = [a for a in sess.attempts if a["kind"] == "gesture"]
+        assert len(gest) == 2, gest                    # the paused attempt was not counted; both reps still ran
+        with open(os.path.join(sess.dir, "session_log.csv"), encoding="utf-8") as fh:
+            assert ",attempt_cancelled," in fh.read()
+        lat = [float(a["feedback_latency_s"]) for a in gest]
+        assert all(x <= trainer.FEEDBACK_TARGET_SECONDS for x in lat), lat
+        assert summary["performance"]["feedback_within_3s"] == 2, summary["performance"]
+        print("pause/latency OK   paused attempt dropped; feedback", lat, "s after arms down")
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_match_test_flush_on_early_quit():
     """Pressing Q mid-hold (session ends early) still grades and saves whatever was in progress, instead of
     silently dropping the performer's last signal."""
@@ -521,6 +587,8 @@ def main():
         test_match_test_flicker_is_discarded_and_run_continues_across_a_pause()
         test_match_test_flush_on_early_quit()
         test_match_test_auth_cancels_pending_team_to_serve()
+        test_sim_whistle_gate()
+        test_pause_mid_attempt_and_feedback_latency()
 
         # practice
         sess, summary = run_mode("practice", tmp, save_dir)

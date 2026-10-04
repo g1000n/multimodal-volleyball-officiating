@@ -268,6 +268,11 @@ class WhistleDetector:
         self._running = False
         self._thread = None
         self._audio_queue = queue.Queue()
+        # Set once the microphone stream has opened (or failed to). The stream is opened inside the audio thread, so
+        # without this a microphone that cannot be opened (e.g. a Windows WDM-KS or WASAPI input that refuses SR) made
+        # the thread die silently while start() had already returned -- callers believed detection was running.
+        self._opened = threading.Event()
+        self.error = ""
 
         self.last_prob = 0.0
         self.last_rms = 0.0
@@ -285,14 +290,26 @@ class WhistleDetector:
         ])
         print(f"Whistle detection logging to: {self.log_path}")
 
-    def start(self):
+    def start(self, confirm_open=False, timeout=3.0):
+        """confirm_open=True: wait until the microphone stream is actually open and raise RuntimeError if it could
+        not be opened, instead of returning while the audio thread fails in the background. Default False keeps the
+        original behaviour for existing callers (live_deployment.py)."""
         try:
             import sounddevice as sd
         except ImportError:
             raise ImportError("sounddevice not installed -- run: pip install sounddevice")
         self._running = True
+        self._opened.clear()
+        self.error = ""
         self._thread = threading.Thread(target=self._audio_loop, args=(sd,), daemon=True)
         self._thread.start()
+        if confirm_open:
+            self._opened.wait(timeout)
+            if self.error:
+                err = self.error
+                self.stop()
+                raise RuntimeError(f"the microphone could not be opened at {SR} Hz ({err}). "
+                                   f"Choose another entry for this microphone, e.g. its DirectSound or MME version")
 
     def stop(self):
         self._running = False
@@ -302,6 +319,16 @@ class WhistleDetector:
         print(f"\nWhistle log saved to: {self.log_path}")
 
     def _audio_loop(self, sd):
+        try:
+            self._audio_loop_inner(sd)
+        except Exception as exc:          # stream could not open, or the audio loop crashed: record it, never hide it
+            self.error = str(exc)
+            self._running = False
+            print(f"Whistle detector stopped: {exc}")
+        finally:
+            self._opened.set()
+
+    def _audio_loop_inner(self, sd):
         step_samples = int(STEP_SEC * SR)
         audio_buffer = np.zeros(int(WINDOW_SEC * SR))
 
@@ -320,6 +347,7 @@ class WhistleDetector:
         last_event_end = 0.0
 
         with sd.InputStream(device=self.device, channels=1, samplerate=SR, blocksize=step_samples, callback=callback):
+            self._opened.set()
             while self._running:
                 try:
                     raw = self._audio_queue.get(timeout=0.5)
