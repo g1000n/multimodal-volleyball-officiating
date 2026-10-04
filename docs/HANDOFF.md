@@ -276,7 +276,7 @@ Cite these when the manuscript explains a number. All measured on this project's
 | P2 | Researcher starts OBS and the app. Participant reads the welcome screen and consent notice, types their code, ticks, continues | read the notice? questions? |
 | P3 | Learn the signals: looks through all of them | help needed? |
 | P4 | Practice: three different signals (at least one left-arm, one right-arm), ~3 s each, arms down between; Q to end | name followed each signal? |
-| P5 | Drill, one chosen signal, **10 reps**: countdown → GO → signal, hold ~2 s, arms down; result shows at once, next starts by itself. All 10 the same way. After **each** result read "Recognised as" and the first tip. On attempt 6 press P mid-signal, wait, P again (not counted, repeats). After 10: D/A to step through attempts, read "Correct per signal" and "Needs more practice", SPACE | signal; tally of "Recognised as" correct out of 10; pause worked? |
+| P5 | Drill, the signal **assigned to the code** (rotation below), **10 reps**: countdown → GO → signal, hold ~2 s, arms down; result shows at once, next starts by itself. All 10 the same way. After **each** result read "Recognised as" and the first tip. On attempt 6 press P mid-signal, wait, P again (not counted, repeats). After 10: D/A to step through attempts, read "Correct per signal" and "Needs more practice", SPACE | assigned signal; tally of "Recognised as" correct out of 10; pause worked? |
 | P6 | Drill "1 (free practice, retries)": one attempt, R, again, Q → summary shows both. Drill 5 reps: Q after the 2nd result → summary shows 2 | both checks |
 | P7 | Drill 2 reps: attempt 1 deliberately sloppy (e.g. arm half raised); attempt 2 step out of frame at GO until a message appears, then come back and do it properly | **deliberate attempts** (this Drill, attempts 1–2); message shown |
 | P8 | Challenge: every signal once | any never recognised? |
@@ -285,6 +285,24 @@ Cite these when the manuscript explains a number. All measured on this project's
 | P11 | Reads the summary; researcher stops OBS | end time |
 | P12 | Answers the General Audience form alone, every item | items they wanted to retry |
 | P13 | Researcher checks every item is answered; unsure items → redo the mapped step | steps redone |
+
+**Assigned Drill signals (P5; P6 and P7 use the same):** G-01 Team to Serve left · G-02 Team to Serve right ·
+G-03 Service Authorization left · G-04 Service Authorization right · G-05 Ball Out · G-06 Ball In · G-07 Double
+Contact · G-08 End of Set · G-09 Ball In (weakest class, repeated) · G-10 Service Authorization left (repeated);
+more participants continue from G-01's signal.
+
+**Deviations, logged live (P5–P10):** an attempt where the participant performed a different signal from the one
+prompted is written on the participant record (step, attempt, what they did) and excluded under the counting rules.
+
+**Counting rules (fixed before any data):** recognition rate per signal = P5 + P8 Challenge attempts; excluded: P4,
+P6, P7, NO READING attempts, and logged deviations; report recognition **with and without** the exclusions; Combo
+(P9) and Simulation (P10) pairs reported separately; consistency = P5 attempts 1–5; whistle false alarms = the D4
+no-whistle minute plus detections beyond whistles blown in P9–P10 for every participant; DRY-01 and DEMO data never
+enter participant results.
+
+**Before the first participant:** one dry session on a teammate (code DRY-01, excluded) to check timing, OBS audio
+and the data folders; send the validator the tracked-changes form (37 IT items, 18 post-validation rewordings) and
+disclose if re-confirmation is still pending.
 
 After each participant: rename the recording; confirm `data/trainer_sessions/G-xx/` exists (that folder holds
 everything they did); enter the record in the Google Sheet; wipe the whistle; restart the app.
