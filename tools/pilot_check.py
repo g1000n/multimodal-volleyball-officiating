@@ -5,7 +5,7 @@ One pass/fail table for the measurable items of the evaluation forms, from your 
 before the real evaluators come. Every number traces back to a session folder, so you can show where it came from.
 
     python tools/pilot_check.py --since 20261003_090000
-    python tools/pilot_check.py --since 20261003_090000 --noise-session 20261003_101500_match_test
+    python tools/pilot_check.py --since 20261003_090000 --noise-session 20261003_101500_match_test --expected-whistles 5
 
 What it checks (IT-form item numbers in brackets):
   * recognition: per signal, attempts where the model saw the signal that was asked for (detected == target)
@@ -49,6 +49,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--since", default="", help="only sessions whose folder name sorts at or after this (YYYYMMDD_HHMMSS)")
     ap.add_argument("--noise-session", default="", help="folder name of the session run with background noise and NO whistle")
+    ap.add_argument("--expected-whistles", type=int, default=0,
+                    help="whistles blown ON PURPOSE at the start of the noise session (e.g. 5); detections after them "
+                         "are the false alarms")
     args = ap.parse_args()
 
     sessions = sorted(d for d in glob.glob(os.path.join(ROOT, "*", "*")) if os.path.isdir(d)
@@ -128,7 +131,8 @@ def main():
     print(f"  slowest single frame: {worst_frame:.0f} ms   {verdict(worst_frame < 200)}  (about 200 ms or more is a visible stutter)")
     for name, first, last in slowdowns:
         drop = (first - last) / first if first else 0.0
-        print(f"  {name:38s} fps {first:.1f} -> {last:.1f} ({drop:+.0%} drop)   {verdict(drop <= 0.10)}")
+        change = f"{drop:.0%} slower" if drop > 0 else f"{-drop:.0%} faster"
+        print(f"  {name:38s} fps {first:.1f} -> {last:.1f} ({change} by the end)   {verdict(drop <= 0.10)}")
 
     if args.noise_session:
         print("\nWHISTLE FALSE ALARMS in the no-whistle noise session (needs 0)   [item 2]")
@@ -143,9 +147,15 @@ def main():
                       "   FAIL\n  (set WHISTLE_DEVICE_INDEX / pick the mic under Camera and mic, then run the noise test again)")
                 return 0
             ev = read_csv(os.path.join(matches[0], "whistle_events.csv"))
-            auto = [e for e in ev if e.get("source") == "auto"]
-            print(f"  {len(auto)} microphone whistle(s) detected   {verdict(not auto)}")
-            for e in auto:
+            auto = sorted((e for e in ev if e.get("source") == "auto"),
+                          key=lambda e: float(e.get("seconds_from_session_start") or 0))
+            n = args.expected_whistles
+            if n:
+                caught = auto[:n]
+                print(f"  intentional whistles detected: {len(caught)}/{n}   {verdict(len(caught) >= 0.8 * n)}")
+            false = auto[n:]
+            print(f"  false alarms after them: {len(false)}   {verdict(not false)}")
+            for e in false:
                 print(f"    at {e.get('seconds_from_session_start')} s, confidence {e.get('confidence')}")
     return 0
 

@@ -553,6 +553,30 @@ def test_pause_mid_attempt_and_feedback_latency():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_match_test_ignores_whistles_from_earlier_sessions():
+    """The whistle hub lives for the whole app run. A Match Testing session must only read whistles blown during
+    itself: earlier sessions' whistles used to be replayed into its decision engine at start ("whistle #1 at -1198 s")."""
+    tmp = tempfile.mkdtemp()
+    old_cwd = os.getcwd()
+    os.chdir(tmp)
+    try:
+        clock = FakeClock()
+        hub = FakeHub(clock)
+        for back in (60.0, 30.0, 5.0):                       # whistles from earlier sessions of the same run
+            hub.times.append(clock() - back)
+        be = FakeBackend(clock, script=[(0.0, 9.0, None)])
+        choice = {"action": "start", "mode": "match_test", "gesture": None, "level": "standard", "whistle": True}
+        sess = TestSession(be, {"trainee_id": "tester", "display_name": "Tester"}, choice, hub, clock=clock,
+                           rng=random.Random(3))
+        sess.mt_end_after = 40
+        sess.run()
+        assert sess.mt_whistle_count == 0, sess.mt_whistle_count
+        print("match_test OK   whistles from earlier sessions are not replayed")
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_match_test_flush_on_early_quit():
     """Pressing Q mid-hold (session ends early) still grades and saves whatever was in progress, instead of
     silently dropping the performer's last signal."""
@@ -589,6 +613,7 @@ def main():
         test_match_test_auth_cancels_pending_team_to_serve()
         test_sim_whistle_gate()
         test_pause_mid_attempt_and_feedback_latency()
+        test_match_test_ignores_whistles_from_earlier_sessions()
 
         # practice
         sess, summary = run_mode("practice", tmp, save_dir)
@@ -704,7 +729,7 @@ def main():
         import csv as _csv2
         with open(os.path.join(sess.dir, "whistle_events.csv"), newline="", encoding="utf-8") as fh:
             wrows = list(_csv2.DictReader(fh))
-        assert len(wrows) == 2 and all(r["source"] == "manual" and r["judged_as"].startswith("on time") for r in wrows), wrows
+        assert len(wrows) == 2 and all(r["source"] == "manual" and r["judged_as"].startswith("heard") for r in wrows), wrows
         assert all(r["attempt_no"] and r["signal"] == "team_to_serve_left" and r["seconds_after_go"] for r in wrows), wrows
         with open(os.path.join(sess.dir, "session_log.csv"), newline="", encoding="utf-8") as fh:
             events = [r["event"] for r in _csv2.DictReader(fh)]
@@ -762,14 +787,14 @@ def main():
         assert summary["attempts"] == 17 and summary["correct"] == 17, summary
         print("sim cont.  OK  ", summary["one_line"])
 
-        # whistle states: late and missing
+        # whistle states: a whistle anywhere in the attempt counts (no timing grade); missing = INCORRECT
         sess, summary = run_mode("drill", tmp, save_dir, gesture="team_to_serve_left", hands_off=True, reps=2,
                                  whistle=True, whistle_at=3.8)
-        assert [a["verdict"] for a in sess.attempts if a["kind"] == "whistle"] == ["ALMOST", "ALMOST"], sess.attempts
+        assert [a["verdict"] for a in sess.attempts if a["kind"] == "whistle"] == ["CORRECT", "CORRECT"], sess.attempts
         sess, summary = run_mode("drill", tmp, save_dir, gesture="team_to_serve_left", hands_off=True, reps=2,
                                  whistle=True, whistle_at=None)
         assert [a["verdict"] for a in sess.attempts if a["kind"] == "whistle"] == ["INCORRECT", "INCORRECT"]
-        print('whistle st OK   on time / late / not heard')
+        print('whistle st OK   heard anywhere in the attempt / not heard')
         print("sim        OK  ", sim_summary["one_line"], sim_summary["team_points"])
 
         # outputs written

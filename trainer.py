@@ -106,7 +106,13 @@ AFTER_WHISTLE_COUNTDOWN = 1.0    # the signal follows the whistle right away (FI
 TIMINGS = {"drill": (2.5, 3.0, 3.0), "combo": (2.5, 3.5, 3.0), "challenge": (1.8, 2.2, 2.0),
            "sim": (5.0, 5.5, 2.0)}          # the match simulation timings are only used when "continuous" is on
 WHISTLE_EXTRA_SECONDS = 1.5      # a step that starts with the whistle gets this much longer to capture
-WHISTLE_ONSET_OFFSET = 1.2       # a window is recognised about half a window (1.2 s) after the signal started
+WHISTLE_ONSET_OFFSET = 1.2       # fallback only: a signal is recognised about half a model window after it started
+# (1.2 s at the old 10 fps); the real value is computed from the capture's own frame rate, see _onset_offset()
+WHISTLE_DETECT_DELAY = 0.75      # the microphone detector confirms a whistle about this long after it started: a
+# 1.5 s window stepped every 0.5 s, two windows in a row to confirm. Measured 2026-10-04 on 37 confirmed whistles
+# (median 0.5 s from the first whistle window to confirmation, + about 0.25 s inside that first window).
+WHISTLE_GRACE_SECONDS = 1.5     # after the signal ends, how long a whistle-required step still waits for its whistle
+NO_READING_CAMERA_CHECK = 3      # this many NO READINGs in a row: stop retrying and ask to check the camera
 WHISTLE_TOLERANCE = 0.6          # the whistle may come this late after the estimated start and still count as first
 AUTO_INTRO_SECONDS = 2.5
 AUTO_RESULT_SECONDS = 3.0
@@ -118,6 +124,8 @@ MT_WIN_BY_MARGIN = 2       # GAME_WIN_SCORE / GAME_WIN_BY_MARGIN -- deuce-style 
 EARLY_FINISH = True              # end a capture as soon as the signal was seen and the arms are back at the ready
 # position, instead of always waiting out CAPTURE_SECONDS -- otherwise the verdict can appear several seconds after the
 # trainee finished, which breaks the evaluation forms' 3-second feedback rule
+LOW_SIGNALS = {"ball_in"}        # held with the arm pointing down: "arms back at the ready position" is true DURING
+# the signal, so only the model (signal no longer seen) can tell when it ended
 READY_FRAMES = 6                 # camera frames the arms must be back at the ready position (about 0.2-0.6 s)
 FEEDBACK_TARGET_SECONDS = 3.0    # the forms' 3-second rule: logged per attempt as feedback_latency_s
 MT_TTS_CONFIRM_DELAY_SECONDS = 1.5   # same value as live_deployment.py's TEAM_TO_SERVE_CONFIRM_DELAY_SECONDS: a
@@ -431,6 +439,7 @@ class WhistleHub:
         self._events = []           # every whistle event of the run: {"t", "source": "auto" | "manual", "confidence"}
         self.detector = None
         self.device = None          # microphone index chosen in the setup screen (None = use trainer_config)
+        self.error = ""             # why the microphone detector is not running (logged at session start)
 
     def _record(self, source, confidence=None):
         now = time.time()
@@ -448,6 +457,13 @@ class WhistleHub:
         with self._lock:
             return [dict(e) for e in self._events if e["t"] >= t]
 
+    def start_time(self, t):
+        """When the whistle heard at t actually started: a microphone detection is confirmed about
+        WHISTLE_DETECT_DELAY after the whistle began; a W key press is taken as is."""
+        with self._lock:
+            ev = next((e for e in self._events if e["t"] == t), None)
+        return t - WHISTLE_DETECT_DELAY if ev is not None and ev["source"] == "auto" else t
+
     def start(self):
         if self.detector is not None:
             return
@@ -460,6 +476,7 @@ class WhistleHub:
             print("Whistle detection ACTIVE (mic). Press W as a backup.")
         except Exception as exc:  # missing model, no mic, sounddevice error ...
             self.detector = None
+            self.error = str(exc)
             print(f"Whistle detector unavailable ({exc}). Use the W key as the whistle.")
 
     def stop(self):
@@ -694,6 +711,8 @@ class Session:
         self.sleep = time.sleep
         self._last_ui = None
         self.camera_lost = False
+        self.no_reading_streak = 0      # NO READINGs in a row: a virtual camera (Camo) keeps sending a placeholder
+        # picture when the phone is unplugged, so a lost camera shows up as "no person", never as a failed read
         self.error = None
         self.error_trace = ""
         self.perf = {"frame_ms": [], "extract_ms": [], "classify_ms": [], "grade_ms": [], "cpu_proc": [], "cpu_sys": [], "ram_mb": [],
@@ -940,6 +959,8 @@ class Session:
         writer = cv2.VideoWriter(os.path.join(self.dir, "session.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
                                  RECORD_FPS, (UI_W, UI_H))
         self._t0 = self.clock()
+        self.mt_whistle_pointer = self._t0     # the hub keeps every whistle of the app run: earlier sessions' whistles
+        # were replayed into this session's decision engine when this started at 0.0
         if self.mode == "match_test":
             cv2.namedWindow(SCOREBOARD_WINDOW_NAME, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(SCOREBOARD_WINDOW_NAME, SCOREBOARD_W, SCOREBOARD_H)
@@ -950,7 +971,9 @@ class Session:
                         f"whistle_option={bool(self.choice.get('whistle'))}; continuous={self.continuous}; "
                         f"whistle_detector={'auto (microphone)' if getattr(self.whistle, 'auto_active', False) else 'not running (W key)'}; "
                         f"whistle_threshold={WHISTLE_THRESHOLD:.2f}; "
-                        f"intent={self.intent}")
+                        + (f"whistle_detector_error={getattr(self.whistle, 'error', '')}; "
+                           if self.uses_whistle and getattr(self.whistle, "error", "") else "")
+                        + f"intent={self.intent}")
         if self.queue and self.mode != "practice":
             self._set_phase("intro")
             self._sync_serving()
@@ -1136,7 +1159,9 @@ class Session:
         elif self.phase == "result":
             if self.auto and t - self.phase_t0 >= self.t_result:
                 if any(r.verdict == gg.VERDICT_NO_READING for r in self.results):
-                    self._set_phase("intro")      # not counted: automatically try the same step again
+                    if self.no_reading_streak < NO_READING_CAMERA_CHECK:
+                        self._set_phase("intro")  # not counted: automatically try the same step again
+                    # else: stay on the "check the camera" message until SPACE (see _draw_side_result)
                 else:
                     self._advance()
         elif self.phase == "countdown":
@@ -1403,6 +1428,16 @@ class Session:
             self._arms_up_t = t
         return status
 
+    def _onset_offset(self):
+        """How long after a signal starts the model first recognises it: about half the rolling window, at the frame
+        rate this capture actually ran at (the fixed 1.2 s assumed 10 fps; a laptop at 15-18 fps is nearer 0.7 s)."""
+        times = self._cap_times
+        if len(times) >= 10:
+            dt = (times[-1] - times[0]) / (len(times) - 1)
+            if dt > 0:
+                return (ROLLING_WINDOW_FRAMES / 2.0) * dt
+        return WHISTLE_ONSET_OFFSET
+
     def _signal_end(self, step, ready, final=False):
         """When the trainee finished the step's signal (the LAST one of a pair), or None if not finished yet.
         1. Arms: the arms were up after the signal was first recognised and are now back at the ready position. The end
@@ -1419,10 +1454,15 @@ class Session:
         idx = [i for i, r in enumerate(recs) if hit(r["label"])]
         if not idx:
             return None
+        # the signal must have been held: two windows in a row. A single window of e.g. Ball In while the arm comes
+        # down from Team to Serve ended a Combo / Simulation capture before the real reason signal was shown.
+        if not any(b - a == 1 and recs[a]["label"] == recs[b]["label"] for a, b in zip(idx, idx[1:])):
+            return None
         first_t = recs[idx[0]]["t"]
         # the arms must have been up AFTER that signal was first recognised: the pause between the two signals of a
         # pair (arms briefly down) must not count as the end
-        if ready == "pass" and self._arms_up_t is not None and self._arms_up_t >= first_t:
+        low_signal = (target or (recs[idx[-1]]["label"])) in LOW_SIGNALS
+        if not low_signal and ready == "pass" and self._arms_up_t is not None and self._arms_up_t >= first_t:
             return self._arms_up_t
         tail = recs[idx[-1] + 1:]
         need = 1 if final else 2
@@ -1433,11 +1473,15 @@ class Session:
         return None
 
     def _signal_finished(self, step, ready):
-        """Early end of a capture (EARLY_FINISH). A step that needs the whistle keeps the full window until the whistle
-        was heard, so a slightly late whistle is not cut off."""
-        if step is not None and step.get("whistle") and not self._whistle_seen:
+        """Early end of a capture (EARLY_FINISH). A step that needs the whistle, with no whistle heard yet, waits
+        WHISTLE_GRACE_SECONDS after the signal ended (the detector confirms a whistle ~0.75 s late) instead of the whole
+        window -- otherwise a forgotten whistle left the trainee waiting up to ~6 s for the verdict."""
+        end = self._signal_end(step, ready)
+        if end is None:
             return False
-        return self._signal_end(step, ready) is not None
+        if step is not None and step.get("whistle") and not self._whistle_seen:
+            return self.clock() - end >= WHISTLE_GRACE_SECONDS
+        return True
 
     def _record_latency(self, end_t):
         """Seconds from the end of the signal to now (the verdict is computed now and drawn on the next frame)."""
@@ -1474,22 +1518,26 @@ class Session:
             all_levels_by_i = [gg.grade_at_all_levels(step["label"], self.cap_frames, recs, self.be.label_to_idx,
                                                       aspect=self.aspect, step_seconds=step_s, context=step.get("ctx"))]
         self.results, self.result = results, results[0]
+        if any(r.verdict == gg.VERDICT_NO_READING for r in results):
+            self.no_reading_streak += 1
+            if self.no_reading_streak == NO_READING_CAMERA_CHECK:
+                self._log_event("camera_check", f"{self.no_reading_streak} NO READINGs in a row: asked to check the camera")
+        else:
+            self.no_reading_streak = 0
         self.perf["grade_ms"].append((time.perf_counter() - t_grade) * 1000.0)
         self.last_latency = self._record_latency(self._signal_end(step, getattr(self, "_last_ready", None),
                                                                    final=True))
         # the whistle: heard during this capture, and before the first signal started?
         self.whistle_state = None
+        onset_est = next((r["t"] - self._onset_offset() for r in recs if r["label"] == labels[0]), None)
         if step.get("whistle"):
             wt = self.whistle.first_since(self.phase_t0)
-            onset = next((r["t"] - WHISTLE_ONSET_OFFSET for r in recs if r["label"] == labels[0]), None)
-            if wt is None:
-                self.whistle_state = "none"
-            elif onset is None or wt <= onset + WHISTLE_TOLERANCE:
-                self.whistle_state = "ok"
-            else:
-                self.whistle_state = "late"
+            onset = onset_est
+            # Presence only (team decision 2026-10-04): FIVB 22.2.3 sets the ORDER (whistle, then the signals) but no
+            # time limit, and the panel did not ask for whistle timing to be graded. A whistle heard anywhere in this
+            # attempt counts. The estimated whistle-to-signal gap is still logged (whistle_events.csv) for reference.
+            self.whistle_state = "none" if wt is None else "ok"
         self._save_attempt_npz(labels, ctxs, results, step_s)
-        onset_est = next((r["t"] - WHISTLE_ONSET_OFFSET for r in recs if r["label"] == labels[0]), None)
         self.capture_windows.append({"start": self.phase_t0, "end": self.clock(), "step": self.attempt_no,
                                      "labels": "+".join(labels), "state": self.whistle_state, "onset": onset_est})
         self._log_event("verdict", "; ".join(f"{l}={r.verdict} {r.score}/100" for l, r in zip(labels, results))
@@ -1531,7 +1579,7 @@ class Session:
         events = []
         wt = self.whistle.first_since(self.phase_t0)
         if wt is not None:
-            events.append((wt, 0, None))
+            events.append((getattr(self.whistle, "start_time", lambda x: x)(wt), 0, None))
         gt = next((r["t"] for r in recs if r["label"] == first), None)
         if gt is not None:
             events.append((gt, 1, first))
@@ -1549,7 +1597,7 @@ class Session:
         A close call (ALMOST) is committed too; it does not have to be perfect."""
         a, b = self.team["left"], self.team["right"]
         score = f"Score: LEFT {a} - {b} RIGHT."
-        wl = {"ok": "Whistle: on time.", "late": "Whistle: heard, but after the signal started.",
+        wl = {"ok": "Whistle: heard.", "late": "Whistle: heard, but after the signal started.",
               "none": "Whistle: not heard."}.get(self.whistle_state)
         expected = "Correct call: " + self._step_names(step) + "."
         form_ok = lambda r: r.verdict in (gg.VERDICT_CORRECT, gg.VERDICT_ALMOST)
@@ -2095,7 +2143,7 @@ class Session:
         state = self.whistle_state
         if state is None:
             return
-        text, color = {"ok": ("Whistle: on time. +10 points", C_GREEN),
+        text, color = {"ok": ("Whistle: heard. +10 points", C_GREEN),
                        "late": ("Whistle: heard, but after you started. Blow it first. +5 points", C_AMBER),
                        "none": ("Whistle: not heard. 0 points", C_RED)}[state]
         put(ui, fit(text, SIDE_W - 36, 0.44), x, UI_H - 70, 0.44, color, 1)
@@ -2242,8 +2290,15 @@ class Session:
         color = VERDICT_COLOR[r.verdict]
         put(ui, VERDICT_TEXT[r.verdict], x, y + 6, 1.15, color, 3)
         if r.verdict == gg.VERDICT_NO_READING:
-            for i, line in enumerate(wrap(r.feedback[0], w, 0.55)):
+            lines = wrap(r.feedback[0], w, 0.55)
+            for i, line in enumerate(lines):
                 put(ui, line, x, y + 50 + i * 22, 0.55, C_TEXT, 1)
+            if self.no_reading_streak >= NO_READING_CAMERA_CHECK and self.phase == "result":
+                msg = (f"No one has been seen for {self.no_reading_streak} attempts in a row. If the camera picture is "
+                       "frozen, black or shows a placeholder, the camera is disconnected: reconnect it, then press "
+                       "SPACE to try again, or Q to stop. Your results so far are saved.")
+                for i, line in enumerate(wrap(msg, w, 0.55)):
+                    put(ui, line, x, y + 70 + (len(lines) + i) * 22, 0.55, C_AMBER, 1 if i else 2)
             return
         put(ui, f"Signal score {r.score}/100   +{r.points} session pts", x, y + 40, 0.56, C_TEXT, 2)
         cut = gg.LEVEL_CONFIG[r.level].correct_cut
@@ -2423,7 +2478,7 @@ class Session:
                     row["judged_as"] = "extra whistle in the same capture"
                 else:
                     judged.add(win["step"])
-                    row["judged_as"] = {"ok": "on time (10 points)", "late": "late (5 points)",
+                    row["judged_as"] = {"ok": "heard (10 points)", "late": "late (5 points)",
                                         "none": "not heard"}.get(win["state"], "heard")
             rows.append(row)
         return rows
