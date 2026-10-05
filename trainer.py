@@ -140,7 +140,14 @@ CAMERA_LOST_SECONDS = 8.0        # give up after this long, save everything and 
 CSV_COLS = ["ph_time", "kind", "target", "detected", "level", "intent", "note", "verdict", "score", "points", "best_prob", "margin",
             "hold_s", "confused_with", "failed_checks", "check_values", "feedback", "feedback_latency_s",
             # the SAME captured movement, graded at every level, so a report can show all three side by side
-            "score_beginner", "verdict_beginner", "score_standard", "verdict_standard", "score_referee", "verdict_referee"]
+            "score_beginner", "verdict_beginner", "score_standard", "verdict_standard", "score_referee", "verdict_referee",
+            "step_no"]   # the attempt number shown on screen (a repeated step keeps its number); matches the records sheet
+
+# Up / Down arrow and Page Up / Page Down (Windows waitKeyEx codes, plus Linux ones) scroll the side card; they are
+# mapped to codes above 255 so they never collide with a letter key
+KEY_SCROLL_UP, KEY_SCROLL_DOWN = 1001, 1002
+SCROLL_KEYS = {2490368: KEY_SCROLL_UP, 2162688: KEY_SCROLL_UP, 65362: KEY_SCROLL_UP, 65365: KEY_SCROLL_UP,
+               2621440: KEY_SCROLL_DOWN, 2228224: KEY_SCROLL_DOWN, 65364: KEY_SCROLL_DOWN, 65366: KEY_SCROLL_DOWN}
 
 PH_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
@@ -805,7 +812,10 @@ class Session:
             self._wheel_hooked = True
 
     def _key(self):
-        return cv2.waitKey(1) & 0xFF
+        k = cv2.waitKeyEx(1)                      # Ex: arrow / Page keys arrive whole (they scroll the side card)
+        if k in SCROLL_KEYS:
+            return SCROLL_KEYS[k]
+        return 255 if k == -1 else k & 0xFF
 
     # ---- helpers ----
     @property
@@ -923,6 +933,7 @@ class Session:
                 row[f"score_{lv}"] = lv_res.score if lv_res is not None else ""
                 row[f"verdict_{lv}"] = lv_res.verdict if lv_res is not None else ""
             pts = res.points
+        row["step_no"] = self.step_i + 1
         if row["verdict"] != gg.VERDICT_NO_READING:
             self.points += pts
             self.max_points += 10
@@ -1574,7 +1585,8 @@ class Session:
         self._log_event("verdict", "; ".join(f"{l}={r.verdict} {r.score}/100" for l, r in zip(labels, results))
                         + (f"; whistle={self.whistle_state}" if self.whistle_state else "")
                         + f"; capture {self.clock() - self.phase_t0:.1f}s"
-                        + ("" if self.last_latency is None else f"; feedback {self.last_latency:.2f}s after arms down"))
+                        + ("" if self.last_latency is None else f"; feedback {self.last_latency:.2f}s after arms down")
+                        + f"; step {self.step_i + 1}")
         if not any(r.verdict == gg.VERDICT_NO_READING for r in results):
             if self.whistle_state is not None:
                 self._log_attempt({"kind": "whistle"}, whistle_state=self.whistle_state)
@@ -1702,6 +1714,9 @@ class Session:
         if key in (255, -1):
             return False
         ch = chr(key).lower() if 0 <= key < 256 else ""
+        if key in (KEY_SCROLL_UP, KEY_SCROLL_DOWN):          # arrow / Page keys: scroll the side card (laptops)
+            self.side_scroll = getattr(self, "side_scroll", 0) + (-48 if key == KEY_SCROLL_UP else 48)
+            return False
         if key == 27 or ch == "q":
             self._log_event("end_requested", "Q pressed")
             if self.mode in ("match_test", "practice"):
@@ -2251,7 +2266,7 @@ class Session:
             cv2.rectangle(ui, (UI_W - 6, ty), (UI_W - 2, ty + th), C_MUTED, -1)
             if off < max_off:
                 panel(ui, SIDE_X + 1, UI_H - 22, UI_W - 8, UI_H, C_PANEL)
-                put(ui, "More below: scroll with the mouse wheel", x, UI_H - 7, 0.4, C_AMBER, 1)
+                put(ui, "More below: press the Down arrow, or scroll", x, UI_H - 7, 0.4, C_AMBER, 1)
 
     def _on_mouse(self, event, _x, _y, flags, _param):
         if event == cv2.EVENT_MOUSEWHEEL:

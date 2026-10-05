@@ -90,6 +90,7 @@ The app remembers the mic **by name**, finds it again after the phone reconnects
 | `live_deployment.py` | the original live officiating system (unchanged by the training-tool work except where stated) |
 | `tools/pilot_check.py` | pass/fail table for a dry run (recognition, consistency, feedback time, stability, whistle false alarms) |
 | `tools/performance_report.py` | fps, slowest frame, verdicts within 3 s, CPU, RAM per mode |
+| `tools/compile_results.py` | **the evaluation's results**: every laptop's session logs + the records sheet (.xlsx) → recognition per signal (all / with exclusions / per setup), NO READING, consistency, feedback time, P9/P10, whistle detection, help, crashes, and a list of problems to fix first |
 | `tools/evaluate_sessions.py`, `tools/regrade_attempts.py` | grader accuracy vs labelled intent; re-grade saved attempts with current rules |
 | `tests/test_trainer_smoke.py`, `tests/test_gesture_grader.py` | automated tests (§8) |
 
@@ -191,6 +192,7 @@ scored — useful for calibrating the threshold). **Back up `data/trainer_sessio
 ```
 py tools/pilot_check.py --since 20261004_180000 --noise-session <folder> --expected-whistles 5
 py tools/performance_report.py --since <YYYYMMDD_HHMMSS>
+py tools/compile_results.py --sheet Evaluation_Records.xlsx --root data/trainer_sessions --root <other laptop's copy>
 py tools/regrade_attempts.py --level standard
 .venv\Scripts\python.exe tests\test_trainer_smoke.py      # expect 34 "OK" lines, no traceback
 .venv\Scripts\python.exe tests\test_gesture_grader.py     # expect all PASS (45)
