@@ -52,6 +52,7 @@ import html
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -270,6 +271,18 @@ def fit(text, max_w, scale=0.5, thick=1):
     while len(text) > 4 and tw(text + "...", scale, thick) > max_w:
         text = text[:-1]
     return text + "..."
+
+
+def label_lines(text, max_w, scale=0.45, thick=1, max_lines=2):
+    """A check name on the side panel: whole if it fits, else without its (bracketed) part, else wrapped over at most
+    max_lines lines. Never cut mid-word with '...' unless even that does not fit."""
+    if tw(text, scale, thick) <= max_w:
+        return [text]
+    short = re.sub(r"\s*\([^)]*\)", "", text).strip()
+    if tw(short, scale, thick) <= max_w:
+        return [short]
+    lines = wrap(short, max_w, scale, thick)
+    return lines[:max_lines - 1] + [fit(" ".join(lines[max_lines - 1:]), max_w, scale, thick)]
 
 
 def draw_icon(img, status, cx, cy, r=8):
@@ -2189,13 +2202,14 @@ class Session:
                 y += 26
                 put(ui, "What is checked", x, y, 0.5, C_BLUE, 1)
                 for it in gg.graded_summary(label):
-                    y += 17
                     mark = {"Required": "R", "Important": "I", "Scored": "S"}[it["effect"]]
-                    put(ui, fit(f"[{mark}] {it['label']}", w, 0.4), x, y, 0.4, C_TEXT if mark != "S" else C_MUTED, 1)
-                y += 16
-                need = ("only 100 counts as correct" if self.cfg.correct_cut >= 100
-                        else f"{self.cfg.correct_cut}+ counts as correct")
-                put(ui, f"R required  I important  S scored.  {need}.", x, y, 0.38, C_MUTED, 1)
+                    for line in label_lines(f"[{mark}] {it['label']}", w, 0.4):
+                        y += 17
+                        put(ui, line, x, y, 0.4, C_TEXT if mark != "S" else C_MUTED, 1)
+                need = "Only 100 is correct" if self.cfg.correct_cut >= 100 else f"{self.cfg.correct_cut}+ is correct"
+                for line in wrap(f"R required, I important, S scored. {need}.", w, 0.38):
+                    y += 16
+                    put(ui, line, x, y, 0.38, C_MUTED, 1)
             if not compact and s.get("not_graded") and y < UI_H - 120:
                 y += 24
                 put(ui, "Not graded by the camera", x, y, 0.43, C_AMBER, 1)
@@ -2334,22 +2348,36 @@ class Session:
             put(ui, f"{val:.0f}/{mx}", x + w - 52, y + 12, 0.45, C_TEXT, 1)
             y += 22
         y += 8
+        # The panel is a fixed-size image (a bigger window only scales it), so lay out to fit: the tips are what the
+        # trainee needs most, so they get their room first; passed checks fold into one line when space is short, and
+        # a tip that still does not fit is left for the session report rather than cut mid-sentence.
+        bottom = UI_H - 78
+        heading, items = feedback_view(r)
+        tips = [(kind, wrap(text, w, 0.46 if kind != "cam" else 0.42)) for text, kind in items]
+        tips_h = (20 if heading else 0) + 19 * sum(len(lines) for _k, lines in tips)
+        rows = [(c, label_lines(c.label, w - 30, 0.45)) for c in r.checks]
+        if y + 28 + 21 * sum(len(lines) for _c, lines in rows) + tips_h > bottom:
+            passed = [c for c, _l in rows if c.status == "pass"]
+            rows = [(c, lines) for c, lines in rows if c.status != "pass"]
+            if passed:
+                rows.append((None, [f"{len(passed)} other check{'s' if len(passed) > 1 else ''} passed"]))
         put(ui, "Checklist", x, y + 8, 0.5, C_BLUE, 1)
         y += 18
-        for c in r.checks:
-            draw_icon(ui, c.status, x + 8, y + 8, 7)
-            put(ui, fit(c.label, w - 30, 0.45), x + 24, y + 12, 0.45, C_TEXT if c.status == "pass" else C_MUTED, 1)
-            y += 21
+        for c, lines in rows:
+            draw_icon(ui, "pass" if c is None else c.status, x + 8, y + 8, 7)
+            for line in lines:
+                put(ui, line, x + 24, y + 12, 0.45, C_TEXT if c is None or c.status == "pass" else C_MUTED, 1)
+                y += 21
         y += 10
-        heading, items = feedback_view(r)
         if heading:
             put(ui, heading, x, y + 8, 0.5, C_AMBER, 1)
             y += 20
-        for text, kind in items:
+        for kind, lines in tips:
             col = {"ok": C_GREEN, "tip": C_TEXT, "cam": C_MUTED}[kind]
-            for j, line in enumerate(wrap(text, w, 0.46 if kind != "cam" else 0.42)):
-                if y > UI_H - 78:
-                    return
+            if y + 19 * len(lines) > bottom:
+                put(ui, "More tips in the session report.", x, y + 12, 0.42, C_MUTED, 1)
+                return
+            for j, line in enumerate(lines):
                 put(ui, ("- " if (j == 0 and kind == "tip") else "  " if kind == "tip" else "") + line, x, y + 12,
                     0.46 if kind != "cam" else 0.42, col, 1)
                 y += 19

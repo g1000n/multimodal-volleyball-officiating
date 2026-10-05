@@ -667,13 +667,16 @@ def _rules_authorization(g: Geo, lv: str, side: str, gcap=None, ctx=None) -> Lis
     speed = A.peak_speed(dt)
     return [
         _c("arm_bent", f"{S} elbow bent for the sweeping motion", 7, False, A.mid(A.elbow),
-           le=pick(lv, 150, 145, 140), unit=" deg", arm=A, basis="TRAINING", strict=(lv != "beginner"),
+           # strict (caps at ALMOST) only at Referee: one frontal camera sees the elbow open as the hand sweeps out,
+           # so proper sweeps measure 148-161 deg (HANDOFF section 9); a straight arm is still caught by hand_moves and
+           # the model. Below Referee a fail costs its points and shows the tip.
+           le=pick(lv, 150, 145, 140), unit=" deg", arm=A, basis="TRAINING", strict=(lv == "referee"),
            tip=f"Bend your {side} elbow; a nearly straight arm is sloppy and reads as Team to Serve"),
         _c("hand_moves", "Hand moves (FIVB: move the hand to indicate the direction)", 11, True,
            A.motion(), ge=pick(lv, 0.5, 1.0, 1.4), arm=A,
            tip="Make a clearer sweeping motion with your hand; a still pose is not this signal"),
         _c("at_chest", "Whole sweep stays at chest (upper arm) level", 9, False,
-           A.band_excess(A.wr_frac, lo_band, hi_band), le=pick(lv, 0.25, 0.15, 0.10), arm=A, strict=True,
+           A.band_excess(A.wr_frac, lo_band, hi_band), le=pick(lv, 0.25, 0.20, 0.10), arm=A, strict=True,
            basis="TRAINING",
            tip="Keep the WHOLE sweep at chest height, about the level of your upper arm: not up above the shoulders and not down at the belly"),
         _c("sweep_pace", "Sweep at an unhurried pace (not a flick)", 4, False, speed,
