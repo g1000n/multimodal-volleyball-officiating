@@ -797,6 +797,12 @@ class Session:
     # ---- hooks overridable for tests ----
     def _show(self, ui):
         show_letterboxed(WINDOW_NAME, ui)
+        if not getattr(self, "_wheel_hooked", False):     # mouse wheel scrolls the side card (after the window exists)
+            try:
+                cv2.setMouseCallback(WINDOW_NAME, self._on_mouse)
+            except cv2.error:
+                pass
+            self._wheel_hooked = True
 
     def _key(self):
         return cv2.waitKey(1) & 0xFF
@@ -2144,8 +2150,10 @@ class Session:
                     y += 34
                 if step["kind"] == "pair":
                     self._draw_side_pair_card(ui, x0 + pad, y, w, step)
-                else:
+                elif self.phase == "capture":
                     self._draw_side_card(ui, x0 + pad, y, w, step)
+                else:
+                    self._draw_side_card_scrolled(ui, x0 + pad, y, w, step)
         elif self.phase in ("wait_whistle", "whistle_result"):
             ok = getattr(self, "whistle_ok", None)
             put(ui, "WHISTLE", x0 + pad, y, 0.85, C_AMBER, 2)
@@ -2173,7 +2181,7 @@ class Session:
                        "none": ("Whistle: not heard. 0 points", C_RED)}[state]
         put(ui, fit(text, SIDE_W - 36, 0.44), x, UI_H - 70, 0.44, color, 1)
 
-    def _draw_side_card(self, ui, x, y, w, step):
+    def _draw_side_card(self, ui, x, y, w, step, room=UI_H - 120):
         label = step["label"]
         s = gg.SIGNALS.get(label, {})
         hide = self.mode == "sim" and not self._reveal()
@@ -2210,7 +2218,7 @@ class Session:
                 for line in wrap(f"R required, I important, S scored. {need}.", w, 0.38):
                     y += 16
                     put(ui, line, x, y, 0.38, C_MUTED, 1)
-            if not compact and s.get("not_graded") and y < UI_H - 120:
+            if not compact and s.get("not_graded") and y < room:
                 y += 24
                 put(ui, "Not graded by the camera", x, y, 0.43, C_AMBER, 1)
                 for line in wrap(s["not_graded"], w, 0.42):
@@ -2218,6 +2226,36 @@ class Session:
                     put(ui, line, x, y, 0.42, C_MUTED, 1)
         if self.phase == "capture":
             self._draw_capture_meter(ui, x, UI_H - 150, w, label)
+
+    def _draw_side_card_scrolled(self, ui, x, y, w, step):
+        """Before an attempt the signal card can be longer than the panel (long how-to plus what is checked): draw it on
+        a taller sheet and show the part the mouse wheel has scrolled to, with a scrollbar when there is more."""
+        key = (step["label"], self.mode, self.level, self.phase, self.hint, x, y, C_PANEL)
+        cache = getattr(self, "_card_cache", None)
+        if cache is None or cache[0] != key:                    # the card is static: draw it once per signal/phase
+            sheet = np.empty((2 * UI_H, UI_W, 3), np.uint8)
+            sheet[:] = C_PANEL
+            self._draw_side_card(sheet, x, y, w, step, room=2 * UI_H - 120)
+            ink = np.where((sheet[:, SIDE_X + 1:] != np.array(C_PANEL, np.uint8)).any(axis=2).any(axis=1))[0]
+            self._card_cache = cache = (key, sheet, max(0, (int(ink.max()) + 14 if len(ink) else 0) - UI_H))
+        _key, sheet, max_off = cache
+        if getattr(self, "_scroll_step", None) != self.step_i:          # a new signal starts at the top
+            self._scroll_step, self.side_scroll = self.step_i, 0
+        off = self.side_scroll = min(max(0, getattr(self, "side_scroll", 0)), max_off)
+        top = y - 30                                    # the card's first line; anything above it (whistle line) stays
+        ui[top:UI_H, SIDE_X + 1:] = sheet[top + off:UI_H + off, SIDE_X + 1:]
+        if max_off:
+            track = UI_H - TOP_H - 8
+            th = max(30, track * (UI_H - TOP_H) // (UI_H - TOP_H + max_off))
+            ty = TOP_H + 4 + (track - th) * off // max_off
+            cv2.rectangle(ui, (UI_W - 6, ty), (UI_W - 2, ty + th), C_MUTED, -1)
+            if off < max_off:
+                panel(ui, SIDE_X + 1, UI_H - 22, UI_W - 8, UI_H, C_PANEL)
+                put(ui, "More below: scroll with the mouse wheel", x, UI_H - 7, 0.4, C_AMBER, 1)
+
+    def _on_mouse(self, event, _x, _y, flags, _param):
+        if event == cv2.EVENT_MOUSEWHEEL:
+            self.side_scroll = getattr(self, "side_scroll", 0) + (-48 if cv2.getMouseWheelDelta(flags) > 0 else 48)
 
     def _draw_side_pair_card(self, ui, x, y, w, step):
         if self.mode == "sim" and not self._reveal():
