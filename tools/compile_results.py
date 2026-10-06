@@ -146,8 +146,10 @@ def attempt_units(s):
     return units
 
 
-def find_steps(sessions, problems, code):
-    """Which session folder is which step of the procedure."""
+def find_steps(sessions, problems, code, which="first"):
+    """Which session folder is which step of the procedure. which="first": the first finished session of each step
+    (the rule fixed before testing); which="last": the last finished one (participants who repeated a step until
+    they were satisfied), reported as a second, comparison set."""
     normal = [s for s in sessions if s["intent"] == "normal"]
     steps = {}
     practice = [s for s in normal if s["mode"] == "practice"]
@@ -156,7 +158,7 @@ def find_steps(sessions, problems, code):
     else:
         problems.append(f"{code}: no Practice session (P4); P5 taken as the first 10-repetition Drill")
     after = steps["P4"]["name"] if "P4" in steps else ""
-    for s in normal:
+    for s in (normal if which == "first" else normal[::-1]):
         if s["mode"] != "drill" or s["name"] < after or s["reps"] != 10:
             continue
         n_steps = len({u["step"] for u in attempt_units(s) if not u["no_reading"]})
@@ -167,16 +169,16 @@ def find_steps(sessions, problems, code):
         break
     if "P5" not in steps:
         problems.append(f"{code}: no finished 10-repetition Drill (P5)")
-    p5 = steps["P5"]["name"] if "P5" in steps else after
+    p5 = steps["P5"]["name"] if "P5" in steps and which == "first" else after
     for key, mode in (("P8", "challenge"), ("P9", "combo"), ("P10", "sim")):
         cands = [s for s in normal if s["mode"] == mode and s["name"] > p5]
         done = [s for s in cands if not s["problem"]]
         if cands and not done:
             problems.append(f"{code}: every {mode} session stopped early ({', '.join(s['name'] for s in cands)})")
         if done:
-            steps[key] = done[0]
+            steps[key] = done[0] if which == "first" else done[-1]
             for s in cands:
-                if s is done[0]:
+                if s is done[0] or which == "last":
                     break
                 problems.append(f"{code}: {mode} session {s['name']} stopped early ({s['problem']}); the next one is used as {key}")
         elif not cands:
@@ -213,6 +215,12 @@ def main():
                     help="a trainer_sessions folder; repeat for every laptop's copy (default data/trainer_sessions)")
     ap.add_argument("--prefix", default="G-", help="participant codes start with this (default G-)")
     ap.add_argument("--out", default=os.path.join("data", "results"))
+    ap.add_argument("--repeats", choices=["first", "last"], default="first",
+                    help="which finished session counts when a step was repeated: first (the rule fixed before "
+                         "testing, default) or last (the attempt the participant was satisfied with)")
+    ap.add_argument("--pick", action="append", default=[], metavar="CODE:STEP=FOLDER",
+                    help="use this session folder for a step instead of the rule's choice, e.g. "
+                         "G-03:P5=20261006_101530_drill (when the first one should not count; say why in Notes)")
     args = ap.parse_args()
     roots = args.root or [os.path.join("data", "trainer_sessions")]
     problems = []
@@ -229,6 +237,13 @@ def main():
         for d in sorted(glob.glob(os.path.join(root, args.prefix + "*"))):
             if os.path.isdir(d):
                 folders[os.path.basename(d)].append(d)
+    picks = {}
+    for x in args.pick:
+        m = re.match(r"^([^:]+):(P\d+)=(.+)$", x.strip())
+        if not m:
+            sys.exit(f"--pick {x!r}: write it as CODE:STEP=FOLDER, e.g. G-03:P5=20261006_101530_drill")
+        picks[(m.group(1), m.group(2))] = m.group(3)
+    repeats = []
     sessions = {}
     for code, dirs in folders.items():
         if len(dirs) > 1:
@@ -258,7 +273,24 @@ def main():
     for code in codes:
         p = people.get(code, {})
         setup = col(p, "Setup") or "unknown"
-        steps = find_steps(sessions[code], problems, code)
+        steps = find_steps(sessions[code], problems, code, args.repeats)
+        for (pc, key), folder in picks.items():
+            if pc != code:
+                continue
+            chosen = next((s for s in sessions[code] if s["name"] == folder), None)
+            if chosen is None:
+                problems.append(f"{code}: --pick {key}={folder}: no such session folder")
+            else:
+                repeats.append(f"{code}: {key} set by hand to {folder} (the rule chose "
+                               f"{steps[key]['name'] if key in steps else 'nothing'})")
+                steps[key] = chosen
+        # repeats: more sessions of a step's mode than the script has; the first finished one counts (rule above)
+        script = {"practice": 1, "drill": 4, "challenge": 1, "combo": 1, "sim": 1}
+        have = Counter(s["mode"] for s in sessions[code] if s["intent"] == "normal")
+        for mode, n in script.items():
+            if have[mode] > n:
+                used = ", ".join(f"{k}={v['name']}" for k, v in steps.items() if v["mode"] == mode)
+                repeats.append(f"{code}: {have[mode]} {mode} sessions (script has {n}); counted: {used or 'none'}")
         check_settings(code, steps, problems)
         assigned = SHEET_SIGNAL.get(str(col(p, "Drill signal")).lower())
         person = {"code": code, "setup": setup, "location": col(p, "Location"), "researcher": col(p, "Researcher"),
@@ -366,7 +398,7 @@ def main():
     write("participants.csv", per_person)
     write("pair_attempts.csv", pair_rows)
 
-    lines = ["# Evaluation results (compiled)", "",
+    lines = [f"# Evaluation results (compiled; repeated steps: {args.repeats} finished session counts)", "",
              f"Participants: {len(codes)} ({', '.join(codes) or 'none'}). Setups: "
              + ", ".join(f"{k} {v}" for k, v in Counter(p['setup'] for p in per_person).items()) + ".",
              f"Sources: {', '.join(roots)} and {os.path.basename(args.sheet)}.", ""]
@@ -443,6 +475,7 @@ def main():
               f"{sum(p['crash_logs'] for p in per_person)} sessions.", ""]
     vol = [p["code"] for p in per_person if str(p["dataset_volunteer"]).lower() in ("yes", "y")]
     lines += [f"Dataset volunteers among participants: {len(vol)} ({', '.join(vol) or 'none'}).", ""]
+    lines += [f"## Repeated steps (the {args.repeats} finished session counts unless set with --pick)", ""] +              ([f"- {x}" for x in repeats] or ["- none"]) + [""]
     lines += ["## Problems to fix before using these numbers", ""] + ([f"- {x}" for x in problems] or ["- none"])
     with open(os.path.join(args.out, "results.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
