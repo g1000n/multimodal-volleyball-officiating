@@ -565,6 +565,20 @@ def test_sequence_team_to_serve_then_ball_out():
     assert missing[1].verdict == gg.VERDICT_INCORRECT and missing[1].points == 0
 
 
+def test_sequence_ignores_a_reason_glimpsed_before_team_to_serve():
+    # the model sees Ball Out for a moment while the arm swings up into Team to Serve (two windows), then the real
+    # Team to Serve and the real Ball Out: the glimpse must not count as "reason first" (decision_engine.py order)
+    frames, records, l2i = build_sequence([(g_tts("right"), "team_to_serve_right"), (g_ball_out(), "ball_out")])
+    for r in records[:2]:
+        r["label"] = "ball_out"
+        r["probs"] = r["probs"].copy()
+        r["probs"][l2i["ball_out"]] = 0.95
+    res = gg.grade_sequence(["team_to_serve_right", "ball_out"], frames, records, l2i, level="standard",
+                            aspect=ASPECT, step_seconds=0.3)
+    assert not any("order" in f.lower() for r in res for f in r.feedback), [r.feedback for r in res]
+    assert [r.verdict for r in res] == [gg.VERDICT_CORRECT] * 2, [(r.verdict, r.feedback) for r in res]
+
+
 def test_authorization_hold_is_scaled():
     assert gg.HOLD_SCALE["service_authorization_left"] < 1.0
     r = run(g_auth("left"), "service_authorization_left")

@@ -125,6 +125,8 @@ MT_WIN_BY_MARGIN = 2       # GAME_WIN_SCORE / GAME_WIN_BY_MARGIN -- deuce-style 
 EARLY_FINISH = True              # end a capture as soon as the signal was seen and the arms are back at the ready
 # position, instead of always waiting out CAPTURE_SECONDS -- otherwise the verdict can appear several seconds after the
 # trainee finished, which breaks the evaluation forms' 3-second feedback rule
+EARLY_FINISH_STREAK = 3          # model windows in a row before a signal can end a capture early: live_deployment.py's
+                                 # STREAK_NEEDED_TO_COMMIT (a 2-window glimpse of Ball In while getting ready ended it)
 LOW_SIGNALS = {"ball_in"}        # held with the arm pointing down: "arms back at the ready position" is true DURING
 # the signal, so only the model (signal no longer seen) can tell when it ended
 READY_FRAMES = 6                 # camera frames the arms must be back at the ready position (about 0.2-0.6 s)
@@ -278,6 +280,24 @@ def fit(text, max_w, scale=0.5, thick=1):
     while len(text) > 4 and tw(text + "...", scale, thick) > max_w:
         text = text[:-1]
     return text + "..."
+
+
+def wrap_fit(text, max_w, max_h, scale=0.62, min_scale=0.42):
+    """Wrap `text` to max_w at the largest font size (from `scale` down to `min_scale`) whose lines fit in max_h
+    pixels, so a long Match Simulation story is shown whole instead of losing its last lines.
+    Returns (lines, scale, line_height)."""
+    sc = scale
+    while True:
+        lh = int(round(sc * 38))
+        lines = wrap(text, max_w, sc)
+        if len(lines) * lh <= max_h or sc <= min_scale:
+            return lines, sc, lh
+        sc = round(sc - 0.04, 2)
+
+
+def pair_first_seen(recs, label):
+    """Index of the first model window that saw `label` (a pair's Team to Serve), or None."""
+    return next((i for i, r in enumerate(recs) if r["label"] == label), None)
 
 
 def label_lines(text, max_w, scale=0.45, thick=1, max_lines=2):
@@ -1491,14 +1511,25 @@ class Session:
         if step is None:
             return None
         target = step["labels"][-1] if step["kind"] == "pair" else None
-        hit = (lambda lab: lab == target) if target else (lambda lab: lab != gg.NOTHING_LABEL)
+        asked = target or step.get("label")
+        # standing still with the arms down is often read as Ball In: unless Ball In is the signal asked for, a Ball In
+        # reading never ends the capture (grading still sees every window, so a real wrong Ball In is still marked)
+        hit = ((lambda lab: lab == target) if target else
+               (lambda lab: lab != gg.NOTHING_LABEL and (lab == asked or lab not in LOW_SIGNALS)))
         recs = self.cap_records
-        idx = [i for i, r in enumerate(recs) if hit(r["label"])]
+        # a pair's reason only counts after its Team to Serve was seen (FIVB order, as decision_engine.py does live):
+        # a Ball In glimpsed while the arm swings up into Team to Serve must not end the capture early
+        after = (pair_first_seen(recs, step["labels"][0]) if target else -1)
+        if after is None:
+            return None
+        idx = [i for i, r in enumerate(recs) if i > after and hit(r["label"])]
         if not idx:
             return None
-        # the signal must have been held: two windows in a row. A single window of e.g. Ball In while the arm comes
-        # down from Team to Serve ended a Combo / Simulation capture before the real reason signal was shown.
-        if not any(b - a == 1 and recs[a]["label"] == recs[b]["label"] for a, b in zip(idx, idx[1:])):
+        # the signal must have been held: EARLY_FINISH_STREAK windows in a row (as the live system commits). A short
+        # glimpse of e.g. Ball In while the arm comes down from Team to Serve ended a capture before the real signal.
+        n_need = EARLY_FINISH_STREAK - 1
+        if not any(all(idx[j + m + 1] - idx[j + m] == 1 and recs[idx[j + m]]["label"] == recs[idx[j + m + 1]]["label"]
+                       for m in range(n_need)) for j in range(len(idx) - n_need)):
             return None
         first_t = recs[idx[0]]["t"]
         # the arms must have been up AFTER that signal was first recognised: the pause between the two signals of a
@@ -2021,18 +2052,22 @@ class Session:
         cv2.rectangle(ui, (0, by), (12, by + bh), color, -1)
         put(ui, c["title"], 28, by + 40, 1.0, color, 3)
         yy = by + 70
-        shown = 0
-        for k, line in enumerate(c["lines"]):
-            for wl in wrap(line, bw - 60, 0.58):
-                if shown >= 3:
-                    return
-                put(ui, wl, 28, yy, 0.58, C_TEXT if k < 2 else C_MUTED, 1)
-                yy += 24
-                shown += 1
+        room = bh - 70 - 24                    # down to the key line
+        sc = 0.58
+        while True:                            # every line shown: shrink the font instead of dropping lines
+            lh = int(round(sc * 41))
+            rows = [(k, wl) for k, line in enumerate(c["lines"]) for wl in wrap(line, bw - 60, sc)]
+            if len(rows) * lh <= room + 14 or sc <= 0.4:
+                break
+            sc = round(sc - 0.04, 2)
+        for k, wl in rows:
+            put(ui, wl, 28, yy, sc, C_TEXT if k < 2 else C_MUTED, 1)
+            yy += lh
 
     def _draw_bottom(self, ui, t):
         bx, by, bw, bh = BOTTOM_BOX
         panel(ui, bx, by, bx + bw, by + bh, C_PANEL2)
+        self._hide_last = False                # set by _fit_story when a long story needs the "Last:" line's space
         step = self.step
         y = by + 32
         sim = self.mode == "sim"
@@ -2063,9 +2098,7 @@ class Session:
             else:
                 msg = "Perform the signal when you see GO, hold it, then lower your arms."
             put(ui, msg, 20, y + 28, 0.58, C_MUTED, 1)
-            if step is not None and step.get("text"):
-                for i, line in enumerate(wrap(step["text"], bw - 40, 0.52)[:2]):
-                    put(ui, line, 20, y + 58 + i * 21, 0.52, C_TEXT, 1)
+            self._draw_story(ui, step, y + 58, by + bh - (58 if sim and self.commit_log else 36))
         elif self.phase == "capture":
             if whistle and two:
                 msg = "Whistle, team to serve (hold 2 s), then the reason."
@@ -2076,15 +2109,11 @@ class Session:
             else:
                 msg = "Perform the signal now. Hold it steady, then lower your arms."
             put(ui, msg, 20, y, 0.62, C_GREEN, 2)
-            if step is not None and step.get("text"):
-                for i, line in enumerate(wrap(step["text"], bw - 40, 0.52)[:2]):
-                    put(ui, line, 20, y + 32 + i * 21, 0.52, C_TEXT, 1)
+            self._draw_story(ui, step, y + 32, by + bh - (58 if sim and self.commit_log else 36))
         elif self.phase == "wait_whistle":
             src = "blow your whistle" if self.whistle.auto_active else "press W (no microphone detector)"
             put(ui, f"Waiting for the whistle: {src}.", 20, y, 0.65, C_AMBER, 2)
-            if step is not None and step.get("text"):
-                for i, line in enumerate(wrap(step["text"], bw - 40, 0.52)[:3]):
-                    put(ui, line, 20, y + 32 + i * 21, 0.52, C_TEXT, 1)
+            self._draw_story(ui, step, y + 32, by + bh - (58 if sim and self.commit_log else 36))
         elif self.phase == "result" and self.results:
             if sim and self.commit:
                 self._draw_commit(ui, by, bw, bh)
@@ -2097,7 +2126,7 @@ class Session:
                     msg += "  The next step starts automatically; every score is listed at the end."
                 for i, line in enumerate(wrap(msg, bw - 40, 0.55)[:3]):
                     put(ui, line, 20, y + i * 24, 0.55, C_TEXT, 1)
-        if sim and self.commit_log and self.phase in ("intro", "countdown", "capture"):
+        if sim and self.commit_log and self.phase in ("intro", "countdown", "capture") and not self._hide_last:
             put(ui, "Last: " + fit(self.commit_log[-1], bw - 70, 0.46), 20, by + bh - 34, 0.46, C_MUTED, 1)
         if self.continuous and self.auto_go:
             start_keys = "Continuous: the next step starts by itself"
@@ -2115,13 +2144,37 @@ class Session:
             keys = "W = manual whistle   Q end session"
         put(ui, keys, 20, by + bh - 14, 0.5, C_MUTED, 1)
 
+    def _fit_story(self, text, y_first, scale, reserve=0):
+        """Lines, size and line height for a step's story starting at baseline y_first: whole, never cut. It keeps the
+        Match Simulation "Last:" line if the story still fits at a readable size (0.5); otherwise that line is hidden
+        for this frame (self._hide_last) and the story uses its space. `reserve` = pixels kept free below the story."""
+        by, bh = BOTTOM_BOX[1], BOTTOM_BOX[3]
+        if self.mode == "sim" and self.commit_log:
+            fit_last = wrap_fit(text, BOTTOM_BOX[2] - 40, by + bh - 58 - reserve - y_first + 14, scale, 0.5)
+            if len(fit_last[0]) * fit_last[2] <= by + bh - 58 - reserve - y_first + 14:
+                return fit_last
+            self._hide_last = True
+        return wrap_fit(text, BOTTOM_BOX[2] - 40, by + bh - 36 - reserve - y_first + 14, scale, 0.38)
+
+    def _draw_story(self, ui, step, y_first, _y_limit=None):
+        """The step's story (Match Simulation) under an instruction line: all of it, shrunk only as far as needed."""
+        if step is None or not step.get("text"):
+            return
+        lines, sc, lh = self._fit_story(step["text"], y_first, 0.52)
+        for i, line in enumerate(lines):
+            put(ui, line, 20, y_first + i * lh, sc, C_TEXT, 1)
+
     def _draw_intro_bottom(self, ui, by, bw, y, step):
         sim = self.mode == "sim"
-        sc, lh = (0.68, 26) if sim else (0.56, 23)
-        lines = wrap(step["text"], bw - 40, sc)[:3] if step.get("text") else []
+        # the whole story, shrunk only as far as needed. In the simulation the story itself says what to do, so the
+        # extra instruction line below it is left out there; elsewhere it keeps its room
+        extra = 0 if sim else 22 + (24 if self.auto else 0)
+        lines, sc, lh = (self._fit_story(step["text"], y, 0.68 if sim else 0.56, extra) if step.get("text")
+                         else ([], 0.56, 23))
+        bottom = by + BOTTOM_BOX[3] - (58 if sim and self.commit_log and not self._hide_last else 36)
         for i, line in enumerate(lines):
             put(ui, line, 20, y + i * lh, sc, C_TEXT, 1)
-        cur = y + lh * len(lines) + (4 if lines else 0)
+        cur = y + lh * len(lines) + (4 if lines else 0) - (lh if lines else 0) + (23 if lines else 0)
         if step["kind"] == "whistle":
             msg = "Step: blow the whistle." if not lines else "Then: blow the whistle."
         elif step["kind"] == "pair":
@@ -2137,9 +2190,9 @@ class Session:
             msg = "Read the card on the right, then press SPACE when you are ready."
         if step.get("whistle") and not sim:
             msg += "   (blow the whistle first)"
-        if cur + 18 <= by + BOTTOM_BOX[3] - 36:
+        if (not sim or not lines) and cur + 18 <= bottom:
             put(ui, msg, 20, cur + 18, 0.6, C_AMBER, 1)
-        if self.auto and cur + 42 <= by + BOTTOM_BOX[3] - 36:
+        if self.auto and cur + 42 <= bottom:
             prompt = "Get ready..." if self.auto_go else "Press SPACE to start. The steps then run automatically."
             put(ui, prompt, 20, cur + 42, 0.52, C_MUTED, 1)
 
@@ -2313,8 +2366,10 @@ class Session:
     def _draw_pair_meter(self, ui, x, y, w, step):
         self._draw_whistle_row(ui, x, y - 32)
         labels = [r["label"] for r in self.cap_records]
+        first = pair_first_seen(self.cap_records, step["labels"][0])
         for k, lab in enumerate(step["labels"]):
-            seen = lab in labels
+            # the reason is ticked only once it shows up after Team to Serve (an earlier glimpse is not the call)
+            seen = first is not None if k == 0 else (first is not None and lab in labels[first + 1:])
             draw_icon(ui, "pass" if seen else "unverified", x + 8, y + 8 + k * 30, 8)
             put(ui, fit(f"{k + 1}. " + gg.short_label(lab), w - 34, 0.5), x + 26, y + 14 + k * 30, 0.5,
                 C_TEXT if seen else C_MUTED, 1)

@@ -1170,7 +1170,17 @@ def grade_sequence(targets, capture_frames, window_records, label_to_idx: Dict[s
                               check_ready=(i == n - 1)) for i, t in enumerate(targets)]
 
     labels = [r["label"] for r in recs]
-    first = [next((k for k, lab in enumerate(labels) if lab == t), None) for t in targets]
+    # FIVB order, as decision_engine.py applies it live: a signal only counts once the one before it was seen. A reason
+    # the model glimpses BEFORE Team to Serve (e.g. Ball In while the arm swings up into Team to Serve) is a passing
+    # frame, not the trainee's call, so each target is looked for only after the previous target first appeared. The
+    # order is wrong only when a target appears solely before the previous one.
+    first = []
+    for i, t in enumerate(targets):
+        after = first[i - 1] if i and first[i - 1] is not None else -1
+        k = next((k for k, lab in enumerate(labels) if lab == t and k > after), None)
+        if k is None:
+            k = next((k for k, lab in enumerate(labels) if lab == t), None)   # only before: really out of order
+        first.append(k)
     order_ok = True
     cuts = []
     for i in range(n - 1):

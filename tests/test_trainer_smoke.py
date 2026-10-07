@@ -594,6 +594,28 @@ def test_match_test_flush_on_early_quit():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_early_finish_ignores_idle_ball_in_and_needs_a_streak():
+    """Standing still is often read as Ball In: it must not end a capture unless Ball In is the signal asked for; a
+    signal must be seen EARLY_FINISH_STREAK windows in a row (live_deployment.py's STREAK_NEEDED_TO_COMMIT); a pair's
+    reason only counts after its Team to Serve."""
+    s = trainer.Session.__new__(trainer.Session)
+    s._arms_up_t = None
+    s._cap_times = [i * 0.2 for i in range(20)]
+    n = gg.NOTHING_LABEL
+
+    def ends(step, labels):
+        s.cap_records = [{"label": lab, "t": i * 0.2} for i, lab in enumerate(labels)]
+        return s._signal_end(step, "pass") is not None
+
+    sa = {"kind": "gesture", "label": "service_authorization_right"}
+    assert not ends(sa, ["ball_in"] * 3 + [n] * 3), "idle Ball In ended a Service Authorization capture"
+    assert not ends(sa, ["ball_out"] * 2 + [n] * 2), "a 2-window glimpse ended the capture"
+    assert ends({"kind": "gesture", "label": "ball_in"}, ["ball_in"] * 3 + [n] * 2)
+    assert not ends({"kind": "pair", "labels": ["team_to_serve_right", "ball_in"]},
+                    ["ball_in"] * 3 + ["team_to_serve_right"] * 2 + [n] * 2), "reason before Team to Serve counted"
+    print("finish     OK   idle Ball In ignored, streak of", trainer.EARLY_FINISH_STREAK, "needed, Team to Serve first")
+
+
 def main():
     test_camera_fallback()
     test_devices()
@@ -614,6 +636,7 @@ def main():
         test_sim_whistle_gate()
         test_pause_mid_attempt_and_feedback_latency()
         test_match_test_ignores_whistles_from_earlier_sessions()
+        test_early_finish_ignores_idle_ball_in_and_needs_a_streak()
 
         # practice
         sess, summary = run_mode("practice", tmp, save_dir)

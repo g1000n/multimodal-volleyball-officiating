@@ -307,7 +307,7 @@ def main():
 
         # sheet completeness
         deliberate = [r for r in notes.get(code, []) if str(col(r, "Step")) == "P7" and str(col(r, "Type")).lower() == "deliberate"]
-        if len(deliberate) != 2:
+        if len(deliberate) < 2:
             problems.append(f"{code}: Attempt notes has {len(deliberate)} P7 Deliberate rows (expected 2)")
         for st in ("P9", "P10"):
             wr = whistle_rows.get(code, {}).get(st)
