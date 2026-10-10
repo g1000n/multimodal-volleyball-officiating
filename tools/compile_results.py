@@ -130,7 +130,7 @@ def attempt_units(s):
     has_step = rows and "step_no" in rows[0]
     for i, r in enumerate(rows):
         units.append({"step": num(r.get("step_no")) if has_step else i + 1, "target": r["target"],
-                      "detected": r.get("detected", ""), "verdict": r["verdict"],
+                      "detected": r.get("detected", ""), "verdict": r.get("verdict_standard") or r["verdict"],
                       "latency": float(r["feedback_latency_s"]) if r.get("feedback_latency_s") else None,
                       "no_reading": False, "t": r.get("ph_time", "")})
     for e in s["log"]:
@@ -172,7 +172,8 @@ def find_steps(sessions, problems, code, which="first"):
     p5 = steps["P5"]["name"] if "P5" in steps and which == "first" else after
     for key, mode in (("P8", "challenge"), ("P9", "combo"), ("P10", "sim")):
         cands = [s for s in normal if s["mode"] == mode and s["name"] > p5]
-        done = [s for s in cands if not s["problem"]]
+        # finished = ended normally AND graded at least one attempt (a Challenge quit at once is not the step)
+        done = [s for s in cands if not s["problem"] and any(r.get("kind") == "gesture" for r in s["rows"])]
         if cands and not done:
             problems.append(f"{code}: every {mode} session stopped early ({', '.join(s['name'] for s in cands)})")
         if done:
@@ -364,6 +365,10 @@ def main():
         person["fb_n"], person["fb_within3"] = len(lat), sum(1 for x in lat if x <= 3.0)
         person["fb_max"] = max(lat) if lat else ""
 
+        det = [steps[k]["settings"].get("whistle_detector", "") for k in ("P9", "P10") if k in steps]
+        person["detector_auto"] = bool(det) and all(d.startswith("auto") for d in det)
+        if det and not person["detector_auto"]:
+            problems.append(f"{code}: the whistle detector was not running in P9/P10 ({det[0]}); left out of the whistle detection rate")
         # P9 / P10: each signal of the pair, and the whistle per attempt
         for key in ("P9", "P10"):
             s = steps.get(key)
@@ -427,7 +432,7 @@ def main():
         rec_table(f"Recognition, {key} only", [u for u in units_out if u["step"] == key])
 
     v = Counter(u["verdict"] for u in units_out if u["step"] == "P5")
-    lines += ["## P5 verdicts at Standard", "", ", ".join(f"{k} {n}" for k, n in v.most_common()) or "-", ""]
+    lines += ["## P5 verdicts at Standard (each attempt's Standard verdict, whatever level the session ran at)", "", ", ".join(f"{k} {n}" for k, n in v.most_common()) or "-", ""]
 
     cons = [p for p in per_person if p["consistent"] != ""]
     fb_n, fb_ok = sum(p["fb_n"] for p in per_person), sum(p["fb_within3"] for p in per_person)
@@ -447,12 +452,17 @@ def main():
                      f"{sum(1 for r in w if r['detected'] == 'ok')}/{len(w)} |")
     lines.append("")
 
-    wl = [r for c in codes for r in whistle_rows.get(c, {}).values()]
+    auto = [p["code"] for p in per_person if p.get("detector_auto")]
+    wl = [r for c in auto for r in whistle_rows.get(c, {}).values()]
     def wsum(rows, name):
         return sum(num(col(r, name)) or 0 for r in rows)
-    lines += ["## Whistle detection (Whistles tab)", "", "| Part | Blown | Flashes | Flashes with no whistle | Detected | Detection rate |",
+    left_out = [p["code"] for p in per_person if not p.get("detector_auto")]
+    lines += ["## Whistle detection (Whistles tab)", "",
+              f"Only participants whose Combo and Simulation ran with the microphone detector: {', '.join(auto) or 'none'}"
+              + (f" (left out, detector not running: {', '.join(left_out)})." if left_out else "."), "",
+              "| Part | Blown | Flashes | Flashes with no whistle | Detected | Detection rate |",
               "|---|---|---|---|---|---|"]
-    for label, rows in (("All participants", wl), ("P9", [r for r in wl if str(col(r, "Step")) == "P9"]),
+    for label, rows in (("Detector running", wl), ("P9", [r for r in wl if str(col(r, "Step")) == "P9"]),
                         ("P10", [r for r in wl if str(col(r, "Step")) == "P10"])):
         b, f, fa = wsum(rows, "Whistles blown"), wsum(rows, "WHISTLE! flashes"), wsum(rows, "Flashes with no whistle")
         lines.append(f"| {label} | {b} | {f} | {fa} | {f - fa} | {pct(f - fa, b)} |")
