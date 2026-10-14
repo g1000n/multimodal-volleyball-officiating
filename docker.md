@@ -9,11 +9,46 @@ is inside the image: `.dockerignore` only lets in the code, the models, `assets/
 
 | Host | Automated tests | Training tool window | Camera and microphone |
 |---|---|---|---|
-| **Windows / macOS** (Docker Desktop) | Yes | No | No: Docker Desktop cannot pass a webcam or microphone into a Linux container |
+| **Windows / macOS** (Docker Desktop) | Yes | Yes on Windows through WSLg | Not directly: Docker Desktop cannot pass a webcam or microphone into a Linux container. **Yes through the host bridge** (next section) |
 | **Linux** | Yes | Yes (X11) | Yes (`/dev/video0`, `/dev/snd`) |
 
-To use the camera and microphone on Windows, run the tool natively instead (see `README.md`: venv,
-`pip install -r requirements.txt`, `py main.py`).
+On Windows the camera and microphone reach the container through `tools/av_bridge.py` (below). You can also run the
+tool natively (see `README.md`: venv, `pip install -r requirements.txt`, `py main.py`).
+
+## Windows / macOS: camera and microphone through the host bridge
+
+Docker Desktop runs containers in a small Linux VM that cannot see USB devices. `tools/av_bridge.py` runs on the
+**host** (your normal venv), reads the camera and the microphone, and serves them on two local ports; the container
+reads them from there. Camo works, because the host already sees it as a camera and a microphone.
+
+1. **On the host**, in the project folder (venv active), find your devices and start the bridge:
+
+   ```
+   py tools/av_bridge.py --list
+   py tools/av_bridge.py --camera 0 --mic 1
+   ```
+
+   Pick the microphone's **DirectSound** entry (for example `Microphone (Camo) [Windows DirectSound]`); the WASAPI
+   and WDM-KS entries often fail to open, as in `docs/HANDOFF.md`. Allow the Windows Firewall prompt for private
+   networks. Leave the window open.
+2. **In another terminal**, start the training tool in the container:
+
+   ```
+   docker compose --profile bridge run --rm trainer-bridge
+   ```
+
+   The `trainer-bridge` service sets `VB_CAMERA_URL=http://host.docker.internal:8765/video` and
+   `VB_MIC_URL=tcp://host.docker.internal:8766`. In **Camera and mic** you will see one network camera and "Host
+   microphone (av_bridge)"; the whistle test works as usual.
+3. Stop the bridge with Ctrl+C when you are done. While it runs, anyone who can reach ports 8765 and 8766 on your
+   computer sees the camera and hears the microphone, so use a trusted network (or `--bind 127.0.0.1` if you do not
+   use Docker).
+
+Only the **training tool** (`main.py`) uses the bridge. The original live system (`main.py live`,
+`live_deployment.py`) still opens the camera directly. `python tests/test_av_bridge.py` checks the bridge without any
+camera. With the published image, use the same variables:
+`docker run --rm -it -e VB_CAMERA_URL=http://host.docker.internal:8765/video -e VB_MIC_URL=tcp://host.docker.internal:8766 <display options> g1000n/multimodal-volleyball-officiating:<tag> python main.py`.
+The published `1.0` image does not contain this support; it needs a rebuild (`1.1`).
 
 ## Option A: use the published image (fastest)
 

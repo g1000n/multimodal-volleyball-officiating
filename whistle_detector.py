@@ -346,7 +346,8 @@ class WhistleDetector:
         silence_counter = 0
         last_event_end = 0.0
 
-        with sd.InputStream(device=self.device, channels=1, samplerate=SR, blocksize=step_samples, callback=callback):
+        import devices                    # imported here: network microphone support (Docker), see devices.py
+        with devices.open_input_stream(sd, self.device, SR, step_samples, callback):
             self._opened.set()
             while self._running:
                 try:

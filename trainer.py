@@ -394,6 +394,12 @@ def fit_cv_window(name, w, h):
 
 
 def show_letterboxed(window, image):
+    if os.name != "nt":
+        # The Qt window used on Linux (and in Docker) reports the size of the last picture shown, not of the window,
+        # so the letterboxing below would shrink the picture frame by frame. Qt scales the picture itself and keeps
+        # its aspect ratio, so hand it over as it is.
+        cv2.imshow(window, image)
+        return
     ih, iw = image.shape[:2]
     try:
         _, _, ww, wh = cv2.getWindowImageRect(window)
