@@ -35,6 +35,11 @@ RUN pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu \
 RUN apt-get update && apt-get install -y --no-install-recommends xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
+# extract_keypoints.py does `import winsound`, a Windows-only module. This stand-in lets that import succeed in Linux
+# so the application code can stay exactly as it is on Windows. Only the finish beep of the offline extraction
+# script calls it, and here that beep does nothing. (Kept before COPY so code changes do not invalidate it.)
+RUN printf 'def Beep(frequency, duration):\n    pass\n' > /usr/local/lib/python3.11/site-packages/winsound.py
+
 # Application code and the trained models (models/*.pt and *.pkl are in git).
 COPY . .
 
