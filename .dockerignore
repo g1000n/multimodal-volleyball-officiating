@@ -1,0 +1,12 @@
+*
+!requirements.txt
+!*.py
+!models
+!assets
+!tests
+!tools
+!diagnostics
+!scripts
+!docs
+**/__pycache__
+**/*.pyc

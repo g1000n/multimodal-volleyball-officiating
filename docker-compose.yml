@@ -1,0 +1,49 @@
+# Usage (from the repository root):
+#   docker compose build
+#   docker compose run --rm tests          # works on any OS, no camera needed
+#   xhost +local:docker                    # Linux only, once per login
+#   docker compose --profile gui run --rm trainer    # training tool (Linux host with camera + mic)
+#
+# See DOCKER.md for the full instructions and the Windows / WSL notes.
+
+services:
+  # Headless check that the environment is correct: the project's own automated tests.
+  tests:
+    build: .
+    image: volleyball-officiating:latest
+    command: >
+      sh -c "python tests/test_trainer_smoke.py &&
+             python tests/test_gesture_grader.py"
+
+  # The training tool (window on the host's screen, host camera and microphone).
+  # Behind a profile so `docker compose run tests` never needs a camera or X server.
+  trainer:
+    profiles: ["gui"]
+    build: .
+    image: volleyball-officiating:latest
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./data:/app/data            # sessions, consent records, settings stay on the host
+    devices:
+      - /dev/video0:/dev/video0     # camera  (check yours with: ls /dev/video*)
+      - /dev/snd:/dev/snd           # microphone / sound card
+    command: python main.py
+
+  # The original live officiating system (same image, different command).
+  live:
+    profiles: ["gui"]
+    build: .
+    image: volleyball-officiating:latest
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./data:/app/data
+    devices:
+      - /dev/video0:/dev/video0
+      - /dev/snd:/dev/snd
+    command: python main.py live
