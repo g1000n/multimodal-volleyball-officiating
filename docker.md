@@ -245,6 +245,7 @@ The file will be large (likely a couple of GB, because of PyTorch, MediaPipe and
 | Whistle test never hears a whistle | The container is not seeing the right microphone. Check `ls /dev/snd`; on a PulseAudio/PipeWire desktop you may also need to mount the Pulse socket (`-v /run/user/1000/pulse:/run/user/1000/pulse`). `W` still works as a manual whistle. |
 | `permission denied` on `/dev/video0` | Add your user to the `video` group on the host (`sudo usermod -aG video $USER`) and log in again. |
 | `is not a known BitGenerator module` | The wrong numpy got installed; `requirements.txt` pins `numpy==2.2.6`. Rebuild with `--no-cache`. |
+| Tests stop with `qt.qpa.xcb: could not connect to display` | A test opens a window and the container has no screen. The `Dockerfile` must install `xvfb xauth` and the `tests` command in `docker-compose.yml` must start with `xvfb-run -a`. |
 | `Read-only file system` or `Bus error (core dumped)` during the build | Docker's disk filled up. Free about 20 GB, run `docker system prune -af`, then Docker Desktop, bug icon, **Clean / Purge data**, then rebuild. |
 | `load build context` shows hundreds of MB or GB | `.dockerignore` is missing or misnamed (`dockerignore` without the dot, or `.dockerignore.txt`). It must be named exactly `.dockerignore`. |
 | `--progress is a global compose flag` | Put it before the command: `docker compose --progress plain build`. |

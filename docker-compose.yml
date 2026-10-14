@@ -11,9 +11,30 @@ services:
   tests:
     build: .
     image: volleyball-officiating:latest
-    command: >
-      sh -c "python tests/test_trainer_smoke.py &&
-             python tests/test_gesture_grader.py"
+    # xvfb-run gives the tests a virtual screen (Match Testing opens an OpenCV window).
+    # Xvfb is started directly (xvfb-run hung inside Docker Desktop).
+    command:
+      - sh
+      - -c
+      - >-
+        Xvfb :99 -screen 0 1280x720x24 -nolisten tcp &
+        sleep 3 &&
+        DISPLAY=:99 python tests/test_trainer_smoke.py &&
+        DISPLAY=:99 python tests/test_gesture_grader.py
+
+  # Long-running container so `docker ps` shows the system as installed and running.
+  #   docker compose up -d app
+  #   docker ps
+  #   docker exec volleyball-officiating python tests/test_gesture_grader.py
+  # (the smoke test needs the virtual screen, so for it use: docker compose run --rm tests)
+  app:
+    build: .
+    image: volleyball-officiating:latest
+    container_name: volleyball-officiating
+    restart: unless-stopped
+    command: sleep infinity
+    volumes:
+      - ./data:/app/data
 
   # The training tool (window on the host's screen, host camera and microphone).
   # Behind a profile so `docker compose run tests` never needs a camera or X server.

@@ -30,6 +30,11 @@ COPY requirements.txt .
 RUN pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu \
  && pip install -r requirements.txt
 
+# Virtual screen for the automated tests: Match Testing opens an OpenCV window, and a container has no display.
+# xauth is required by xvfb-run. Kept as its own small layer AFTER pip so the big layers above stay cached.
+RUN apt-get update && apt-get install -y --no-install-recommends xvfb xauth \
+    && rm -rf /var/lib/apt/lists/*
+
 # Application code and the trained models (models/*.pt and *.pkl are in git).
 COPY . .
 
