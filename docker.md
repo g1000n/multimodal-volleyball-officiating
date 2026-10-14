@@ -3,7 +3,7 @@
 Instructions for packaging the Multimodal Officiating Training Tool as a Docker image, so anyone (including the
 dean) can run it without installing Python, MediaPipe or PyTorch by hand.
 
-Repository: https://github.com/g1000n/multimodal-volleyball-officiating (branch `main`)
+Repository: https://github.com/g1000n/multimodal-volleyball-officiating (Docker files are on branch `docker`)
 
 ---
 
@@ -27,24 +27,20 @@ What this means for the dean's requirement:
 
 ---
 
-## 1. One-time code fix (required)
+## 1. No code change is needed (the winsound stand-in)
 
 `live_deployment.py` imports `extract_keypoints.py`, which starts with `import winsound`. `winsound` exists only on
-Windows, so the app would crash on startup inside a Linux container with
-`ModuleNotFoundError: No module named 'winsound'`.
+Windows, so on its own it would crash in a Linux container with `ModuleNotFoundError: No module named 'winsound'`.
 
-The fix makes that import optional (on Windows nothing changes; on Linux the finish beep is skipped). It is in
-`extract_keypoints_winsound.patch`.
+**The `Dockerfile` already solves this** by creating a tiny stand-in `winsound` module inside the image (its `Beep`
+does nothing). The application code stays exactly as it is on Windows, and the only visible difference is that the
+finish beep of the offline extraction script is silent in Docker. Do not edit `extract_keypoints.py`.
 
-From the repository root:
+Check it works (after the container is running, section 4):
 
 ```bash
-git apply extract_keypoints_winsound.patch
-python -c "import ast; ast.parse(open('extract_keypoints.py').read()); print('ok')"
+docker exec volleyball-officiating python -W ignore -c "import extract_keypoints; print('imports OK')"
 ```
-
-This is a code change, so per `docs/HANDOFF.md` §14 run the tests before committing (section 4 below does this inside
-Docker; you can also run the Windows venv tests as usual).
 
 ---
 
@@ -58,15 +54,20 @@ docker-compose.yml
 .dockerignore
 ```
 
-Optionally also copy this file to `docs/DOCKER.md` and link it from `README.md`.
+Optionally also add this file (`docker.md`) and `Docker testing.md`, and link them from `README.md`.
 
-Commit and push to `main`:
+Commit and push to the `docker` branch (merge to `main` only after the checks pass):
 
 ```bash
-git add Dockerfile docker-compose.yml .dockerignore extract_keypoints.py docs/DOCKER.md
-git commit -m "Add Docker support (Dockerfile, compose file, winsound import guard)"
-git push origin main
+git add Dockerfile docker-compose.yml .dockerignore docker.md "Docker testing.md"
+git commit -m "Add Docker support"
+git push origin docker
 ```
+
+**Important: build from a clean checkout.** The `Dockerfile` copies whatever is on disk (`COPY . .`), not what is in
+git. A working folder with uncommitted edits or untracked files (for example old model folders or evaluation
+records that contain participant codes) would put them in the image. For any image you share or demonstrate, build
+from a fresh clone of the branch (see section 8, Option A), never from your working folder.
 
 What the files do:
 
@@ -97,7 +98,7 @@ You need about **20 GB of free disk space** on the drive Docker uses (C: on Wind
 disk turns read-only and builds fail with `Read-only file system` or `Bus error`. On Windows, open Docker Desktop and
 wait until it says the engine is running before using any `docker` command.
 
-`DOCKER_TESTING.md` is a step-by-step checklist for verifying the build on a machine with enough space.
+`Docker testing.md` is a step-by-step checklist for verifying the build on a machine with enough space.
 
 ---
 
@@ -119,7 +120,26 @@ docker compose run --rm tests
 ```
 
 Expected output (from `README.md`): 35 `OK` lines and `Smoke test passed.`, then all grader tests `PASS` and
-`All good.` If you see that, the container environment is correct. This is the command to show the dean.
+`All good.` If you see that, the container environment is correct. This is the command to show the dean. It can stay
+silent for a few minutes; let it finish.
+
+Keep a container running so it shows in `docker ps`, and run checks inside it:
+
+```bash
+docker compose up -d app
+docker ps
+docker exec volleyball-officiating python tests/test_gesture_grader.py
+```
+
+**Try the decision engine without a camera.** The project's interactive tester needs no camera, model or audio. Type
+events and watch what the real `decision_engine.py` does:
+
+```bash
+docker exec -it volleyball-officiating python tests/interactive_decision_engine_test.py
+```
+
+Commands: `w` (whistle), `team_to_serve_left`, `ball_out`, `score left +1`, `status`, `help`, `quit`. Here `w` stands
+in for a whistle; no real sound is involved.
 
 ---
 
@@ -191,11 +211,14 @@ custom WSL kernel and using `usbipd-win`, which is not worth it for this project
 **Option A: the dean builds it from GitHub (simplest, smallest)**
 
 ```bash
-git clone https://github.com/g1000n/multimodal-volleyball-officiating
+git clone -b docker https://github.com/g1000n/multimodal-volleyball-officiating
 cd multimodal-volleyball-officiating
-docker compose build
+docker compose up -d --build app
+docker ps
 docker compose run --rm tests
 ```
+
+(The Docker files are on branch `docker`. Once it is merged, the `-b docker` is not needed.)
 
 **Option B: send a ready-made image file**
 
@@ -236,16 +259,16 @@ The file will be large (likely a couple of GB, because of PyTorch, MediaPipe and
 
 | Symptom | Likely cause and fix |
 |---|---|
-| `ModuleNotFoundError: No module named 'winsound'` | The patch in section 1 was not applied (or not committed before building). |
+| `ModuleNotFoundError: No module named 'winsound'` | The stand-in line is missing from the `Dockerfile` that was built (section 1). Use the current `Dockerfile` and run `docker compose build`. |
 | `Could not start the recognition backend` window | Camera not passed in. Check `ls /dev/video*` and the `devices:` lines in `docker-compose.yml`. |
 | `no matching manifest` / `torch==2.12.1+cpu` not found during build | The CPU wheel for that exact version is not on the PyTorch index. Remove the first `pip install torch ... --index-url` line from the `Dockerfile` so torch comes from PyPI (larger image, same behaviour). |
 | `cannot connect to X server` / `Can't open display` | Run `xhost +local:docker` first, and check `echo $DISPLAY` is not empty in the terminal you launch from. |
 | Window appears but is blank or crashes with a Qt xcb error | A system library is missing. Run `docker compose run --rm tests bash`, then `python -c "import cv2"` and read the error; add the named `libxcb-*` package to the `apt-get install` list in the `Dockerfile`. |
 | `ImportError: libtk8.6.so` or `No module named _tkinter` | The Tk libraries are missing from the image; confirm `libtk8.6 libtcl8.6` are in the `Dockerfile`. |
-| Whistle test never hears a whistle | The container is not seeing the right microphone. Check `ls /dev/snd`; on a PulseAudio/PipeWire desktop you may also need to mount the Pulse socket (`-v /run/user/1000/pulse:/run/user/1000/pulse`). `W` still works as a manual whistle. |
+| Whistle test never hears a whistle | The compose file passes only `/dev/snd` (ALSA). On a PulseAudio/PipeWire Linux desktop that may hear nothing; you may also need to mount the Pulse socket (`-v /run/user/1000/pulse:/run/user/1000/pulse` plus `PULSE_SERVER=unix:/run/user/1000/pulse/native`). `W` still works as a manual whistle. Not tested. |
 | `permission denied` on `/dev/video0` | Add your user to the `video` group on the host (`sudo usermod -aG video $USER`) and log in again. |
 | `is not a known BitGenerator module` | The wrong numpy got installed; `requirements.txt` pins `numpy==2.2.6`. Rebuild with `--no-cache`. |
-| Tests stop with `qt.qpa.xcb: could not connect to display` | A test opens a window and the container has no screen. The `Dockerfile` must install `xvfb xauth` and the `tests` command in `docker-compose.yml` must start with `xvfb-run -a`. |
+| Tests stop with `qt.qpa.xcb: could not connect to display` | A test opens a window and the container has no screen. The `Dockerfile` must install `xvfb xauth`, and the `tests` command in `docker-compose.yml` must start `Xvfb :99` (it does). |
 | `Read-only file system` or `Bus error (core dumped)` during the build | Docker's disk filled up. Free about 20 GB, run `docker system prune -af`, then Docker Desktop, bug icon, **Clean / Purge data**, then rebuild. |
 | `load build context` shows hundreds of MB or GB | `.dockerignore` is missing or misnamed (`dockerignore` without the dot, or `.dockerignore.txt`). It must be named exactly `.dockerignore`. |
 | `--progress is a global compose flag` | Put it before the command: `docker compose --progress plain build`. |

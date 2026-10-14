@@ -1,7 +1,7 @@
 # Testing the Docker setup
 
-A checklist for verifying that the Docker setup (`Dockerfile`, `docker-compose.yml`, `.dockerignore`, and the
-`extract_keypoints.py` winsound fix) really builds and passes the project's tests. It is meant for a computer that has
+A checklist for verifying that the Docker setup (`Dockerfile`, `docker-compose.yml`, `.dockerignore`; the `Dockerfile`
+includes a small winsound stand-in) really builds and passes the project's tests. It is meant for a computer that has
 the disk space the original laptop did not, such as a teammate's laptop, a Linux machine, or GitHub's own servers
 (Part 7).
 
@@ -15,15 +15,15 @@ Repository: https://github.com/g1000n/multimodal-volleyball-officiating
 |---|---|
 | Every pinned package in `requirements.txt` has a Linux wheel for Python 3.11 | Checked |
 | `docker-compose.yml` is valid | Checked |
-| `extract_keypoints_winsound.patch` applies cleanly and the patched file parses | Checked |
 | On the original laptop the build got through the `apt` step and nearly all `pip` downloads | Seen working |
 | Full image build to the end | **Done** (built successfully once Docker had enough disk space) |
-| `docker compose run --rm tests` passing inside the container | **Partly done**: the first four checks passed inside the container. The next one (Match Testing) opens a window and needs a virtual screen, so `xvfb` was added to the `Dockerfile` and `docker-compose.yml`. Not yet re-run to the end. |
+| `docker compose run --rm tests` passing inside the container | **Done on one Windows laptop**: 35 `OK` lines, `Smoke test passed.`, all grader tests `PASS`, `All good.` Re-run it on the machine you are testing. |
+| `import extract_keypoints` works in the container (winsound stand-in) | **To confirm** with the extra check in Part 5 |
 | Training tool window with camera and microphone (Linux host only) | **Not yet done** |
 
 The goal of this document is to finish the remaining rows and to leave evidence (Part 9). The `Dockerfile` must contain
-the `xvfb xauth` install line and the `tests` service in `docker-compose.yml` must start with `xvfb-run -a`; without
-them the tests abort with a Qt "could not connect to display" error.
+the `xvfb xauth` install line and the `tests` service in `docker-compose.yml` starts `Xvfb :99`; without a virtual
+screen the tests abort with a Qt "could not connect to display" error.
 
 ---
 
@@ -52,13 +52,15 @@ Choose one place to run this:
 If the Docker files are already pushed:
 
 ```powershell
-git clone https://github.com/g1000n/multimodal-volleyball-officiating
+git clone -b docker https://github.com/g1000n/multimodal-volleyball-officiating
 cd multimodal-volleyball-officiating
 ```
 
-If they are on a branch (for example `docker-support`), add `-b docker-support` to the clone command.
+The Docker files are on branch `docker` (the default branch `main` does not have them until it is merged). Always
+test from a **fresh clone** like this, not from a working folder: the image copies whatever is on disk, so
+uncommitted or untracked files (old model folders, evaluation records with participant codes) would be baked in.
 
-Then confirm the three things that went wrong the first time:
+Then confirm the things that went wrong the first time:
 
 **a. The Docker files exist, and `.dockerignore` starts with a dot.**
 
@@ -75,14 +77,14 @@ Expected: `.dockerignore` (a few hundred bytes), `docker-compose.yml`, `Dockerfi
 Get-Content .dockerignore
 ```
 
-**c. The winsound fix is in `extract_keypoints.py`:**
+**c. The winsound stand-in is in the `Dockerfile`** (no change to `extract_keypoints.py` is needed):
 
 ```powershell
-Select-String "winsound = None" extract_keypoints.py
+Select-String "winsound" Dockerfile
 ```
 
-This should print one matching line. If it prints nothing, apply the patch: `git apply extract_keypoints_winsound.patch`.
-Without it the app crashes in the container with `No module named 'winsound'`.
+This should print the line that creates `winsound.py`. Without it the live system crashes in the container with
+`No module named 'winsound'`.
 
 ---
 
@@ -119,7 +121,7 @@ What a healthy build looks like:
 | Step | What you should see |
 |---|---|
 | `load build context` | Finishes in seconds, **under about 30 MB**. If it shows hundreds of MB or GB, `.dockerignore` is wrong (Part 2). Press Ctrl+C. |
-| `apt-get install` (step 2/7) | A couple of minutes, ending in `DONE`. |
+| `apt-get install` (step 2/8) | A couple of minutes, ending in `DONE`. |
 | `pip install torch ... whl/cpu` | Downloads a few hundred MB. |
 | `pip install -r requirements.txt` | The longest step (MediaPipe, OpenCV, SciPy, scikit-learn, JAX). Quiet stretches are normal. |
 | `COPY . .` and the final steps | A few seconds. |
@@ -152,9 +154,13 @@ This is the main proof that the container environment is correct.
 Run each one; the expected result is in the comment.
 
 ```powershell
-# the winsound fix really works: the real recognition code imports on Linux
-docker compose run --rm tests python -c "import extract_keypoints, whistle_detector; print('imports OK')"
+# the winsound stand-in really works: the real recognition code imports on Linux
+docker compose run --rm tests python -W ignore -c "import extract_keypoints, whistle_detector; print('imports OK')"
 # expected: imports OK
+
+# the interactive decision-engine tester (needs no camera); type: w, status, quit
+docker compose up -d app
+docker exec -it volleyball-officiating python tests/interactive_decision_engine_test.py
 
 # the trainer starts and reports no camera (a container has none)
 docker compose run --rm tests python trainer.py --list-cameras
@@ -195,7 +201,7 @@ name: docker-build-and-test
 
 on:
   push:
-    branches: [main, docker-support]
+    branches: [main, docker]
   pull_request:
   workflow_dispatch:
 
@@ -211,7 +217,7 @@ jobs:
       - name: Run the project tests inside the container
         run: docker compose run --rm tests
 
-      - name: Check the real code imports (winsound fix)
+      - name: Check the real code imports (winsound stand-in)
         run: docker compose run --rm tests python -c "import extract_keypoints, whistle_detector; print('imports OK')"
 ```
 
@@ -233,8 +239,8 @@ open the failed step and read the log. This workflow has not been run yet.
 | `--progress is a global compose flag` | Wrong order. Use `docker compose --progress plain build`. |
 | `apt-get update` shows `Ign:` lines and fails | The container cannot reach the internet. Turn off any VPN. In Docker Desktop, Settings, Docker Engine, add `"dns": ["8.8.8.8", "1.1.1.1"]`, Apply & restart. |
 | `torch==2.12.1+cpu` not found | The CPU wheel for that exact version is not on the PyTorch index. Delete the first `pip install torch ... --index-url ...` line from the `Dockerfile` so torch comes from PyPI (bigger image, same behaviour). |
-| `No module named 'winsound'` | The winsound fix is not in `extract_keypoints.py`. Apply `extract_keypoints_winsound.patch`, rebuild. |
-| Tests stop with `qt.qpa.xcb: could not connect to display` and `Aborted (core dumped)` | A test (Match Testing) opens a window and the container has no screen. The `Dockerfile` must install `xvfb xauth`, and the `tests` command in `docker-compose.yml` must start with `xvfb-run -a`. Rebuild. |
+| `No module named 'winsound'` | The stand-in line is missing from the `Dockerfile` that was built. Use the current `Dockerfile` and rebuild. |
+| Tests stop with `qt.qpa.xcb: could not connect to display` and `Aborted (core dumped)` | A test (Match Testing) opens a window and the container has no screen. The `Dockerfile` must install `xvfb xauth`, and the `tests` command in `docker-compose.yml` must start `Xvfb :99`. Rebuild. |
 | `is not a known BitGenerator module` | Wrong numpy. `requirements.txt` pins `numpy==2.2.6`. Rebuild with `docker compose build --no-cache`. |
 
 ---
@@ -249,7 +255,7 @@ Docker version (docker --version):
 Free disk space before the build:
 
 [ ] .dockerignore starts with a dot and is the allowlist version
-[ ] winsound fix present in extract_keypoints.py
+[ ] built from a fresh clone of branch docker; winsound stand-in works (imports OK)
 [ ] docker run --rm hello-world worked
 [ ] docker compose build finished with no ERROR   (time taken: ___ min)
 [ ] Image size (docker images volleyball-officiating): ___ GB
@@ -266,11 +272,11 @@ Problems or errors (paste the first ERROR line and the lines before it):
 ## 10. After it passes
 
 1. Merge to `main` if the work was on a branch.
-2. Add a short "Docker" section to `README.md` pointing to `docs/DOCKER.md`.
+2. Add a short "Docker" section to `README.md` pointing to `docs/docker.md`.
 3. Give the dean the repository link and the three commands:
 
    ```bash
-   git clone https://github.com/g1000n/multimodal-volleyball-officiating
+   git clone -b docker https://github.com/g1000n/multimodal-volleyball-officiating
    cd multimodal-volleyball-officiating
-   docker compose build && docker compose run --rm tests
+   docker compose up -d --build app && docker ps && docker compose run --rm tests
    ```
