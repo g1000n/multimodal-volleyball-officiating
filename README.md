@@ -17,12 +17,13 @@ decision with its evidence, and the evaluation.
 | Way | Best for | What works |
 |---|---|---|
 | **1. Release download (Windows)**, recommended | Using the training tool | Everything: camera, microphone, all six modes |
-| **2. Docker image** | Installing with one command on any computer, checking that it runs | Linux: the full tool with camera and microphone (untested). Windows and macOS: the program and its tests, but no camera or microphone (a Docker Desktop limit) |
+| **2. Docker image** | Installing with one command on any computer, checking that it runs | Windows: the full tool, with the camera and microphone passed in by the small `av_bridge.exe` relay (Docker Desktop cannot pass them itself). Linux: the full tool with camera and microphone (untested) |
 | **3. From source (git clone)** | Developers | Everything, as in option 1 |
 
 | Download | Link |
 |---|---|
-| Release v1.1 (latest; also starts without a camera and shows "No camera detected") | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.1 |
+| Release v1.2 (latest; adds `av_bridge` for the camera and microphone in Docker on Windows, the native tool is unchanged) | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.2 |
+| Release v1.1 (starts without a camera and shows "No camera detected") | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.1 |
 | Release v1.0 (the version used in the October 2026 evaluation) | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.0 |
 | Docker image | https://hub.docker.com/r/g1000n/multimodal-volleyball-officiating |
 | Source code | https://github.com/g1000n/multimodal-volleyball-officiating |
@@ -34,7 +35,7 @@ installing), a webcam (or an iPhone with Camo Studio), a microphone for the whis
 for the first install.
 
 1. Open the release page above and download **Source code (zip)**. Right-click the zip, choose **Extract All**.
-2. Open the extracted folder (`multimodal-volleyball-officiating-1.1`) in File Explorer, click the address bar, type
+2. Open the extracted folder (`multimodal-volleyball-officiating-1.2`) in File Explorer, click the address bar, type
    `powershell` and press Enter.
 3. Create the environment, turn it on, and install the libraries (5 to 15 minutes, about 1 GB):
 
@@ -71,37 +72,55 @@ Docker packages the tool with Python 3.11, all libraries and both trained models
 Install **Docker Desktop** (Windows: docs.docker.com/desktop/setup/install/windows-install, choose x86_64; it uses
 WSL 2) and wait until it says **Engine running**.
 
-**On Windows or macOS** (no camera or microphone inside Docker):
+**On Windows or macOS**, in PowerShell, from any empty folder (no clone, Python or Git needed):
 
 ```
-docker pull g1000n/multimodal-volleyball-officiating:1.1
-docker run --rm g1000n/multimodal-volleyball-officiating:1.1 sh -c "Xvfb :99 -screen 0 1280x720x24 -nolisten tcp & sleep 3 && DISPLAY=:99 python tests/test_trainer_smoke.py && DISPLAY=:99 python tests/test_gesture_grader.py"
+docker pull g1000n/multimodal-volleyball-officiating:1.2
+docker run --rm g1000n/multimodal-volleyball-officiating:1.2 sh -c "Xvfb :99 -screen 0 1280x720x24 -nolisten tcp & sleep 3 && DISPLAY=:99 python tests/test_trainer_smoke.py && DISPLAY=:99 python tests/test_gesture_grader.py"
 ```
 
 The second line runs the project's automated tests in the container (every training mode and every grading rule,
-with a simulated camera) and ends with `Smoke test passed.` and `All good.` To keep a container running and look
-inside it:
+with a simulated camera and a stand-in classifier, so they test the logic, not the trained models) and ends with
+`Smoke test passed.` and `All good.` To keep a container running and look inside it:
 
 ```
-docker run -d --name volleyball-officiating g1000n/multimodal-volleyball-officiating:1.1 sleep infinity
+docker run -d --name volleyball-officiating g1000n/multimodal-volleyball-officiating:1.2 sleep infinity
 docker ps
 docker exec volleyball-officiating python -W ignore -c "import extract_keypoints, trainer; print('imports OK')"
 docker rm -f volleyball-officiating
 ```
 
-On Windows 11 the program's window can also open from the container (it shows *No camera detected* and the menu):
+**The full tool with the camera and microphone (Windows 11).** Docker Desktop cannot pass a webcam or microphone into
+a container, so a small relay program, `av_bridge.exe`, runs on Windows and streams them to the container. The image
+carries it. In **window 1**, copy it out and start it, and leave the window open:
 
 ```
-docker run --rm -it -e DISPLAY=:0 -e WAYLAND_DISPLAY=wayland-0 -e XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir -e PULSE_SERVER=/mnt/wslg/PulseServer -v /run/desktop/mnt/host/wslg/.X11-unix:/tmp/.X11-unix -v /run/desktop/mnt/host/wslg:/mnt/wslg g1000n/multimodal-volleyball-officiating:1.1 python main.py
+docker run --rm -v "${PWD}:/out" g1000n/multimodal-volleyball-officiating:1.2 cp bridge/av_bridge.exe /out/
+.\av_bridge.exe
 ```
 
-For training with the camera on Windows, use option 1.
+If Windows Firewall asks, allow **Private networks** only. If SmartScreen warns about an unknown publisher, choose
+*More info*, then *Run anyway*. `.\av_bridge.exe --bind 127.0.0.1` accepts connections from this computer only
+(Docker Desktop usually still connects; if the app then reports that the bridge cannot be reached, start it without
+the option). In **window 2**, start the tool:
+
+```
+docker run --rm -it -e DISPLAY=:0 -e WAYLAND_DISPLAY=wayland-0 -e XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir -e PULSE_SERVER=/mnt/wslg/PulseServer -e VB_CAMERA_URL=http://host.docker.internal:8765/video -e VB_MIC_URL=tcp://host.docker.internal:8766 -v /run/desktop/mnt/host/wslg/.X11-unix:/tmp/.X11-unix -v /run/desktop/mnt/host/wslg:/mnt/wslg g1000n/multimodal-volleyball-officiating:1.2 python main.py
+```
+
+Under **Camera and mic**, the host's cameras and microphones are listed; pick the microphone's **DirectSound** entry.
+Stop with Ctrl+C in window 1 when done: while the bridge runs, anyone who can reach ports 8765 and 8766 sees the
+camera and hears the microphone. Without the two `VB_` options (or without the bridge) the window still opens, says
+*No camera detected* and the menu works. The bridge is also available as `av_bridge.exe` on the v1.2 release page,
+or from source: `pip install -r requirements-bridge.txt`, then `py tools/av_bridge.py`. Running in Docker is
+slower than natively (CPU only inside a virtual machine; the relay adds about 0.1 s); the evaluation results above
+were measured with the native tool.
 
 **On Linux** (the full tool with camera and microphone; supported but not yet tested by the team):
 
 ```
 xhost +local:docker
-docker run --rm -it -e DISPLAY=$DISPLAY -e QT_X11_NO_MITSHM=1 -v /tmp/.X11-unix:/tmp/.X11-unix -v "$PWD/vb-data:/app/data" --device /dev/video0 --device /dev/snd g1000n/multimodal-volleyball-officiating:1.1 python main.py
+docker run --rm -it -e DISPLAY=$DISPLAY -e QT_X11_NO_MITSHM=1 -v /tmp/.X11-unix:/tmp/.X11-unix -v "$PWD/vb-data:/app/data" --device /dev/video0 --device /dev/snd g1000n/multimodal-volleyball-officiating:1.2 python main.py
 ```
 
 Check the camera name first with `ls /dev/video*`. The camera is passed in directly. The microphone may not open on
@@ -135,6 +154,8 @@ python main.py
 | The whistle test hears nothing | Under **Camera and mic**, pick the microphone's **[Windows DirectSound]** entry; or use the **W** key |
 | Docker: `error during connect` | Open Docker Desktop and wait for **Engine running** |
 | Docker: `name ... already in use` | `docker rm -f volleyball-officiating`, then run again |
+| Docker: *The camera bridge could not be reached* | Start `av_bridge.exe` in another window first, allow it through the firewall, or start it without `--bind 127.0.0.1` |
+| Docker: a camera cannot be opened by the bridge | Close other programs using it (Zoom, Camo's own app), then restart the bridge |
 
 ## The training tool
 
@@ -259,11 +280,12 @@ Fixes made in the training tool are not automatically in the live system, and th
 ├── replay_recorded_footage.py
 ├── model.py, train.py, extract_keypoints.py, build_manifest.py, dataset_split.py   # the gesture model
 ├── assets/signals/         # signal pictures for Learn the signals and the drill card
-├── tools/                  # evaluation and maintenance scripts (see above)
+├── tools/                  # evaluation and maintenance scripts (see above); av_bridge.py = camera/mic relay for Docker
 ├── tests/                  # test_trainer_smoke.py, test_gesture_grader.py, decision-engine tests
 ├── docs/                   # HANDOFF.md (start here), HardwareSetup.md, whistle pipeline notes
 ├── models/                 # final_model.pt (gestures), whistle_svm_model.pkl (whistle)
 ├── Dockerfile, docker-compose.yml, .dockerignore, docker.md   # the Docker image and how to use it
+├── requirements-bridge.txt # the three packages av_bridge needs when run from source
 └── data/                   # trainer_sessions/, keypoints/, whistle_logs/ (raw video not in git)
 ```
 
@@ -274,6 +296,7 @@ Run before every commit, with the project venv:
 ```bash
 .venv\Scripts\python.exe tests\test_trainer_smoke.py      # expect 35 "OK" lines, "Smoke test passed."
 .venv\Scripts\python.exe tests\test_gesture_grader.py     # expect all PASS, "All good."
+.venv\Scripts\python.exe tests\test_av_bridge.py          # expect 21 PASS, "All good." (no camera needed)
 ```
 
 Keep `TEST_MODE = False` in `trainer_config.py` when committing.

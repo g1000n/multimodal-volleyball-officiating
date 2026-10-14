@@ -66,16 +66,16 @@ reads them from there. Camo works, because the host already sees it as a camera 
 Only the **training tool** (`main.py`) uses the bridge. The original live system (`main.py live`,
 `live_deployment.py`) still opens the camera directly. `python tests/test_av_bridge.py` checks the bridge without any
 camera. With the published image, use the same variables:
-`docker run --rm -it -e VB_CAMERA_URL=http://host.docker.internal:8765/video -e VB_MIC_URL=tcp://host.docker.internal:8766 <display options> g1000n/multimodal-volleyball-officiating:<tag> python main.py`.
-The published `1.0` and `1.1` images do not contain this support; it ships from `1.2` (build from this branch or
-`main` until then). Feedback times quoted in the paper were measured natively, not through the bridge, which adds
+`docker run --rm -it -e VB_CAMERA_URL=http://host.docker.internal:8765/video -e VB_MIC_URL=tcp://host.docker.internal:8766 <display options> g1000n/multimodal-volleyball-officiating:1.2 python main.py`
+(the full command is in `README.md`, Option 2). The published `1.0` and `1.1` images do not contain this support;
+it ships from `1.2`. Feedback times quoted in the paper were measured natively, not through the bridge, which adds
 roughly 0.1 s.
 
 ## Option A: use the published image (fastest)
 
 ```
-docker pull g1000n/multimodal-volleyball-officiating:1.1
-docker run --rm g1000n/multimodal-volleyball-officiating:1.1 sh -c "Xvfb :99 -screen 0 1280x720x24 -nolisten tcp & sleep 3 && DISPLAY=:99 python tests/test_trainer_smoke.py && DISPLAY=:99 python tests/test_gesture_grader.py"
+docker pull g1000n/multimodal-volleyball-officiating:1.2
+docker run --rm g1000n/multimodal-volleyball-officiating:1.2 sh -c "Xvfb :99 -screen 0 1280x720x24 -nolisten tcp & sleep 3 && DISPLAY=:99 python tests/test_trainer_smoke.py && DISPLAY=:99 python tests/test_gesture_grader.py"
 ```
 
 Expected: 35 `OK` lines, `Smoke test passed.`, the grader `PASS` lines, then `All good.`
