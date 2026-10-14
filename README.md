@@ -12,11 +12,21 @@ final defense it became a **training tool** built on the same models. Both are i
 tool is the main program. **`docs/HANDOFF.md` is the full, current description** of the system, every design
 decision with its evidence, and the evaluation.
 
-## Quick start
+## Download
 
-Windows, Python **3.11** (the project venv uses 3.11.9):
+| What | Link |
+|---|---|
+| Source code (this repository) | https://github.com/g1000n/multimodal-volleyball-officiating |
+| Release v1.0 (the version used in the final evaluation, as a zip) | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.0 |
+| Docker image | https://hub.docker.com/r/g1000n/multimodal-volleyball-officiating |
+
+## Quick start (Windows, with camera and microphone)
+
+Python **3.11** (the project venv uses 3.11.9):
 
 ```bash
+git clone https://github.com/g1000n/multimodal-volleyball-officiating
+cd multimodal-volleyball-officiating
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
@@ -29,7 +39,19 @@ then choose the camera and microphone under **Camera and mic** (the whistle test
 The pinned versions in `requirements.txt` matter: the whistle model needs **numpy 2.2.6**. With an older numpy
 the whistle detector stops with "is not a known BitGenerator module".
 
-For the iPhone (Camo) camera and microphone setup, see `docs/HardwareSetup.md`.
+For the iPhone (Camo) camera and microphone setup, see `docs/HardwareSetup.md`. The evaluation used an iPhone 13
+through Camo Studio at 2 to 2.5 m, camera at chest height (1.2 to 1.4 m), head to hips in frame.
+
+## Docker (any computer, no Python install)
+
+```bash
+docker pull g1000n/multimodal-volleyball-officiating:1.0
+```
+
+or build it from this repository with `docker compose build` and run the automated tests with
+`docker compose run --rm tests` (expect 35 `OK` lines, `Smoke test passed.`, and `All good.`). The image contains the
+code and the trained models, no dataset and no participant data. On Windows and macOS, Docker cannot use the camera
+or microphone, so use the Quick start above for the live tool. Full instructions: `docker.md`.
 
 ## The training tool
 
@@ -63,8 +85,14 @@ is CORRECT, ALMOST or INCORRECT; a NO READING means the trainee could not be see
 
 **Require the whistle** (menu option) adds the whistle to Drill, Combo and Challenge, and makes Match simulation and
 Match testing count a point or a serve authorisation only with a whistle: those two modes use the live system's
-`decision_engine.py` (a whistle up to 10 s before the signal, or up to 6 s after it). The whistle is graded as heard
-or not heard. W is a manual whistle when no microphone is available.
+`decision_engine.py` (a whistle up to 10 s before the signal, or up to 6 s after it). In Drill, Combo and Challenge
+the whistle step listens during the capture (1.5 s longer) and up to 1.5 s after the signal, and is graded as heard
+(10 points) or not heard (0); it never changes the gesture's verdict. W is a manual whistle when no microphone is
+available.
+
+The training tool's whistle threshold is **0.55** (`trainer_config.py`); the live system keeps **0.70**. On
+2026-10-04, replaying the detector's logs of 51 clean whistles from a phone microphone at 1 to 2 m, 0.70 confirmed
+8 of 51 and 0.55 confirmed 45 of 51 (most whistles scored 0.55 to 0.68). The whistle model itself is unchanged.
 
 In a pair, the reason only counts after its Team to Serve (the FIVB order, as in the live system), and a capture
 ends early only after a signal was seen in 3 model windows in a row.
@@ -152,6 +180,7 @@ Fixes made in the training tool are not automatically in the live system, and th
 ├── tests/                  # test_trainer_smoke.py, test_gesture_grader.py, decision-engine tests
 ├── docs/                   # HANDOFF.md (start here), HardwareSetup.md, whistle pipeline notes
 ├── models/                 # final_model.pt (gestures), whistle_svm_model.pkl (whistle)
+├── Dockerfile, docker-compose.yml, .dockerignore, docker.md   # the Docker image and how to use it
 └── data/                   # trainer_sessions/, keypoints/, whistle_logs/ (raw video not in git)
 ```
 
@@ -198,6 +227,30 @@ Some training data for `nothing`, `ball_out`, `double_contact` and `team_to_serv
 
 Eight gesture classes: `ball_in`, `ball_out`, `double_contact`, `end_of_set`, `service_authorization_left`,
 `service_authorization_right`, `team_to_serve_left`, `team_to_serve_right`. `nothing` is used in training but is not
-an output class. Held-out (subject-holdout) test accuracy has ranged 86–99% depending on the exact manifest; accuracy
-on out-of-domain reference clips (`tests/test_reference_clips.py`) is lower, a documented generalisation gap. Ball In
-is the weakest class. See `docs/HANDOFF.md` for the current figures and known limitations.
+an output class.
+
+| Model | Test set | Result |
+|---|---|---|
+| Gesture (CNN-LSTM), `models/final_model.pt` = checkpoint `2026-08-11_235000` | 617 held-out clips (subject-holdout split) | **92.54%** accuracy; weakest: Ball In recall 0.57 (37 of 100 read as Team to Serve left) |
+| Whistle (SVM + Random Forest + HistGradientBoosting, 92 acoustic features) | 435 held-out samples, threshold 0.30 (offline) | **98.16%** accuracy (non-whistle 117/120, whistle 310/315) |
+
+`training_logs/train_2026-08-11_235000.log` holds the gesture model's test output, and `reproduce_table5_eval.py`
+reprints it from the saved model. Accuracy on out-of-domain reference clips (`tests/test_reference_clips.py`) is
+lower, a documented generalisation gap. See `docs/HANDOFF.md` for the known limitations.
+
+## Evaluation results (training tool, October 2026)
+
+Eleven general participants (codes G-01 to G-04, G-11, G-12, G-13 to G-17) each did a guided session at Standard
+difficulty on an iPhone 13 through Camo Studio:
+
+| Measure | Result |
+|---|---|
+| Gesture recognition, Drill + Challenge | 178/198 = **89.9%** |
+| Combo / Match simulation signal recognition | 81.8% / 75.5% |
+| Whistle detection, Combo + Match simulation | 95/110 = **86.4%**, 0 false alarms |
+| Verdict within 3 s of the arms coming down | 358/360 = 99.4% (Drill: 102/102) |
+| Crashes or freezes | 0 |
+| ISO/IEC 25010:2023 questionnaire | participants 4.64, experts 4.52 (both Strongly Agree) |
+
+The results are compiled with `tools/compile_results.py` from the session logs; participant data is not in this
+repository.

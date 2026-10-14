@@ -4,14 +4,14 @@
 #   xhost +local:docker                    # Linux only, once per login
 #   docker compose --profile gui run --rm trainer    # training tool (Linux host with camera + mic)
 #
-# See DOCKER.md for the full instructions and the Windows / WSL notes.
+# See docker.md for the full instructions and the Windows / WSL notes.
 
 services:
   # Headless check that the environment is correct: the project's own automated tests.
   tests:
     build: .
     image: volleyball-officiating:latest
-    # xvfb-run gives the tests a virtual screen (Match Testing opens an OpenCV window).
+    # The tests get a virtual screen (Match Testing opens an OpenCV window).
     # Xvfb is started directly (xvfb-run hung inside Docker Desktop).
     command:
       - sh
