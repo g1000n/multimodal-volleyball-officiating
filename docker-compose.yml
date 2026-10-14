@@ -20,7 +20,8 @@ services:
         Xvfb :99 -screen 0 1280x720x24 -nolisten tcp &
         sleep 3 &&
         DISPLAY=:99 python tests/test_trainer_smoke.py &&
-        DISPLAY=:99 python tests/test_gesture_grader.py
+        DISPLAY=:99 python tests/test_gesture_grader.py &&
+        DISPLAY=:99 python tests/test_av_bridge.py
 
   # Long-running container so `docker ps` shows the system as installed and running.
   #   docker compose up -d app
@@ -68,3 +69,27 @@ services:
       - /dev/video0:/dev/video0
       - /dev/snd:/dev/snd
     command: python main.py live
+
+  # Windows / macOS (Docker Desktop): the training tool with the HOST's camera and microphone, through the bridge.
+  # Docker Desktop cannot pass a webcam or microphone into a container, so tools/av_bridge.py runs on the host and
+  # serves them over the network (see docker.md). The window opens through WSLg (Windows 11 / recent Windows 10).
+  #   1. on the host:   py tools/av_bridge.py
+  #   2. then:          docker compose --profile bridge run --rm trainer-bridge
+  trainer-bridge:
+    profiles: ["bridge"]
+    build: .
+    image: volleyball-officiating:latest
+    environment:
+      - VB_CAMERA_URL=http://host.docker.internal:8765/video
+      - VB_MIC_URL=tcp://host.docker.internal:8766
+      - DISPLAY=:0
+      - WAYLAND_DISPLAY=wayland-0
+      - XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir
+      - QT_X11_NO_MITSHM=1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - /run/desktop/mnt/host/wslg/.X11-unix:/tmp/.X11-unix
+      - /run/desktop/mnt/host/wslg:/mnt/wslg
+      - ./data:/app/data
+    command: python main.py

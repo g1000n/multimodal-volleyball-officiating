@@ -9,11 +9,67 @@ is inside the image: `.dockerignore` only lets in the code, the models, `assets/
 
 | Host | Automated tests | Training tool window | Camera and microphone |
 |---|---|---|---|
-| **Windows / macOS** (Docker Desktop) | Yes | No | No: Docker Desktop cannot pass a webcam or microphone into a Linux container |
+| **Windows / macOS** (Docker Desktop) | Yes | Yes on Windows through WSLg | Not directly: Docker Desktop cannot pass a webcam or microphone into a Linux container. **Yes through the host bridge** (next section) |
 | **Linux** | Yes | Yes (X11) | Yes (`/dev/video0`, `/dev/snd`) |
 
-To use the camera and microphone on Windows, run the tool natively instead (see `README.md`: venv,
-`pip install -r requirements.txt`, `py main.py`).
+On Windows the camera and microphone reach the container through `tools/av_bridge.py` (below). You can also run the
+tool natively (see `README.md`: venv, `pip install -r requirements.txt`, `py main.py`).
+
+## Windows / macOS: camera and microphone through the host bridge
+
+Docker Desktop runs containers in a small Linux VM that cannot see USB devices. `tools/av_bridge.py` runs on the
+**host** (your normal venv), reads the camera and the microphone, and serves them on two local ports; the container
+reads them from there. Camo works, because the host already sees it as a camera and a microphone.
+
+0. **On the host, once: get the bridge.** Two ways; the first needs no Python.
+
+   **No Python (Windows):** the image carries a ready-made `av_bridge.exe`. Copy it out into the current folder:
+
+   ```
+   docker run --rm -v "${PWD}:/out" g1000n/multimodal-volleyball-officiating:1.2 cp bridge/av_bridge.exe /out/
+   ```
+
+   Windows may warn about an unknown publisher (More info, then Run anyway), and some antivirus programs flag
+   programs built with PyInstaller. If so, use the Python route.
+
+   **With Python 3.11:** the bridge needs three packages (the container does the recognition; the bridge is only a
+   device relay): `pip install -r requirements-bridge.txt`. If you already use the project venv, you have them.
+1. **On the host**, start the bridge (`.\av_bridge.exe`, or in the project folder with the venv active):
+
+   ```
+   py tools/av_bridge.py
+   ```
+
+   It lists this computer's cameras and microphones once at startup and serves all of them. You do **not** have to
+   choose here: the app's **Camera and mic** screen lists every camera and microphone of the host and switches
+   between them. `--camera N` and `--mic N` only set the defaults (`py tools/av_bridge.py --list` shows the
+   numbers). In the app pick the microphone's **DirectSound** entry (for example `Microphone (Camo) [Windows
+   DirectSound]`); the WASAPI and WDM-KS entries often fail to open, as in `docs/HANDOFF.md`. Allow the Windows
+   Firewall prompt for private networks. Leave the window open. A camera that another program is using (Zoom,
+   Camo's own app) cannot be opened; close that program first.
+2. **In another terminal**, start the training tool in the container:
+
+   ```
+   docker compose --profile bridge run --rm trainer-bridge
+   ```
+
+   The `trainer-bridge` service sets `VB_CAMERA_URL=http://host.docker.internal:8765/video` and
+   `VB_MIC_URL=tcp://host.docker.internal:8766`. In **Camera and mic** you will see the host's own cameras and
+   microphones; choosing one switches the bridge to it, and the whistle test works as usual.
+3. Stop the bridge with Ctrl+C when you are done. While it runs, anyone who can reach ports 8765 and 8766 on your
+   computer sees the camera and hears the microphone, so use a trusted network. Safer: start the bridge with
+   `--bind 127.0.0.1` and check that the container still connects (Docker Desktop usually forwards
+   `host.docker.internal` to the host's loopback); if it does not, drop the flag. If the bridge stops during a
+   session, the camera follows the usual "camera lost" handling and the whistle detector logs
+   "the microphone bridge stopped" (the `W` key still works as a whistle).
+
+Only the **training tool** (`main.py`) uses the bridge. The original live system (`main.py live`,
+`live_deployment.py`) still opens the camera directly. `python tests/test_av_bridge.py` checks the bridge without any
+camera. With the published image, use the same variables:
+`docker run --rm -it -e VB_CAMERA_URL=http://host.docker.internal:8765/video -e VB_MIC_URL=tcp://host.docker.internal:8766 <display options> g1000n/multimodal-volleyball-officiating:<tag> python main.py`.
+The published `1.0` and `1.1` images do not contain this support; it ships from `1.2` (build from this branch or
+`main` until then). Feedback times quoted in the paper were measured natively, not through the bridge, which adds
+roughly 0.1 s.
 
 ## Option A: use the published image (fastest)
 

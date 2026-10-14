@@ -54,3 +54,8 @@ data/ui_settings.json
 data/all_sessions.csv
 data/all_attempts.csv
 data/evaluation_summary.csv
+# Windows bridge exe (built with PyInstaller, shipped inside the Docker image, attached to the GitHub Release)
+bridge/av_bridge.exe
+.venv-bridge/
+dist/
+build/
