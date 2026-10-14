@@ -17,6 +17,7 @@ decision with its evidence, and the evaluation.
 | What | Link |
 |---|---|
 | Source code (this repository) | https://github.com/g1000n/multimodal-volleyball-officiating |
+| Release v1.1 (latest: also starts without a camera, showing "No camera detected") | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.1 |
 | Release v1.0 (the version used in the final evaluation, as a zip) | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.0 |
 | Docker image | https://hub.docker.com/r/g1000n/multimodal-volleyball-officiating |
 
@@ -45,13 +46,13 @@ through Camo Studio at 2 to 2.5 m, camera at chest height (1.2 to 1.4 m), head t
 ## Docker (any computer, no Python install)
 
 ```bash
-docker pull g1000n/multimodal-volleyball-officiating:1.0
+docker pull g1000n/multimodal-volleyball-officiating:1.1
 ```
 
 or build it from this repository with `docker compose build` and run the automated tests with
 `docker compose run --rm tests` (expect 35 `OK` lines, `Smoke test passed.`, and `All good.`). The image contains the
 code and the trained models, no dataset and no participant data. On Windows and macOS, Docker cannot use the camera
-or microphone, so use the Quick start above for the live tool. Full instructions: `docker.md`.
+or microphone, so use the Quick start above for the live tool; inside Docker the tool opens, says "No camera detected" and still shows the menu, Learn the signals and the progress screens. Full instructions: `docker.md`.
 
 ## The training tool
 
@@ -214,14 +215,15 @@ The training tool did not retrain the model: it uses the same `models/final_mode
 
 ## Data and attribution
 
-`data/raw_clips/` (original video) and `data/maxlsb_source/` are not in git. `models/*.pt`, `models/*.pkl` and
-`data/keypoints/` are, so the system runs and retrains without the raw video. `data/dataset_manifest.csv` is rebuilt
+The trained models (`models/*.pt`, `models/*.pkl`) are in git, so the system runs without any dataset. The dataset
+itself is not: `data/raw_clips/` (original video), `data/maxlsb_source/` and `data/keypoints/` (the extracted
+keypoints, about 280 MB) are kept by the team, and retraining needs them. `data/dataset_manifest.csv` is rebuilt
 by `build_manifest.py`. Participants' session data (`data/trainer_sessions/`) stays on the laptops and the team's
 private storage; it is not committed.
 
 Some training data for `nothing`, `ball_out`, `double_contact` and `team_to_serve_left/right` was supplemented from
 [MaxLSB/volley-judge](https://github.com/MaxLSB/volley-judge) (MIT licensed), converted via
-`convert_maxlsb_nothing_data.py`; the converted keypoints are already in `data/keypoints/`.
+`convert_maxlsb_nothing_data.py` into `data/keypoints/`.
 
 ## Model status
 
@@ -235,7 +237,7 @@ an output class.
 | Whistle (SVM + Random Forest + HistGradientBoosting, 92 acoustic features) | 435 held-out samples, threshold 0.30 (offline) | **98.16%** accuracy (non-whistle 117/120, whistle 310/315) |
 
 `training_logs/train_2026-08-11_235000.log` holds the gesture model's test output, and `reproduce_table5_eval.py`
-reprints it from the saved model. Accuracy on out-of-domain reference clips (`tests/test_reference_clips.py`) is
+reprints it from the saved model (it needs the team's `data/keypoints/` and manifest). Accuracy on out-of-domain reference clips (`tests/test_reference_clips.py`) is
 lower, a documented generalisation gap. See `docs/HANDOFF.md` for the known limitations.
 
 ## Evaluation results (training tool, October 2026)

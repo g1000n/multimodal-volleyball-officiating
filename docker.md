@@ -18,8 +18,8 @@ To use the camera and microphone on Windows, run the tool natively instead (see 
 ## Option A: use the published image (fastest)
 
 ```
-docker pull g1000n/multimodal-volleyball-officiating:1.0
-docker run --rm g1000n/multimodal-volleyball-officiating:1.0 sh -c "Xvfb :99 -screen 0 1280x720x24 -nolisten tcp & sleep 3 && DISPLAY=:99 python tests/test_trainer_smoke.py && DISPLAY=:99 python tests/test_gesture_grader.py"
+docker pull g1000n/multimodal-volleyball-officiating:1.1
+docker run --rm g1000n/multimodal-volleyball-officiating:1.1 sh -c "Xvfb :99 -screen 0 1280x720x24 -nolisten tcp & sleep 3 && DISPLAY=:99 python tests/test_trainer_smoke.py && DISPLAY=:99 python tests/test_gesture_grader.py"
 ```
 
 Expected: 35 `OK` lines, `Smoke test passed.`, the grader `PASS` lines, then `All good.`
