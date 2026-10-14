@@ -147,7 +147,7 @@ These are useful for a limitations or lessons-learned section.
 
 | Item | Status |
 |---|---|
-| The winsound stand-in works (`imports OK` check, then tests pass again after rebuilding) | Tests pass after rebuilding from a fresh clone (15 Oct 2026); the `imports OK` check is still to run |
+| The winsound stand-in works (`imports OK` check, then tests pass again after rebuilding) | Done (15 Oct 2026): tests pass after rebuilding from a fresh clone, `docker ps` lists `volleyball-officiating`, and the check printed `imports OK` |
 | Docker files merged to `main` | Done (15 Oct 2026) |
 | A clean install on another computer (the dean's setup) | Done on a second laptop: fresh clone, `docker compose build`, then `docker compose run --rm tests` passed (35 `OK`, `All good.`), 15 Oct 2026 |
 | GitHub Actions check (optional, described in `DOCKER_TESTING.md`) | Not created or run |
