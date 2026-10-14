@@ -139,6 +139,10 @@ MT_TTS_CANCEL_RECORDS = 2  # same-side Service Authorization windows needed to c
 CAMERA_RETRY_SLEEP = 0.3         # camera stopped mid-session: wait this long between reconnect attempts
 CAMERA_RETRY_EVERY = 3           # reopen the camera every this many failed reads
 CAMERA_LOST_SECONDS = 8.0        # give up after this long, save everything and go back to the menu
+NO_CAMERA_TEXT = ("No camera was found, so the training modes cannot start. You can still use Learn the signals, "
+                  "Progress and sessions, and the settings.\n\nTo train, plug in a camera (or start Camo), then "
+                  "choose it under Camera and mic.\n\n(Inside Docker on Windows or macOS no camera is available; "
+                  "run the tool natively for training.)")
 CSV_COLS = ["ph_time", "kind", "target", "detected", "level", "intent", "note", "verdict", "score", "points", "best_prob", "margin",
             "hold_s", "confused_with", "failed_checks", "check_values", "feedback", "feedback_latency_s",
             # the SAME captured movement, graded at every level, so a report can show all three side by side
@@ -429,10 +433,16 @@ class Backend:
         self.real_labels = [self.idx_to_label[i] for i in sorted(self.idx_to_label)]
         self.close = close
         self.cam_index = 0
+        self.camera_error = ""
+
+    @property
+    def has_camera(self):
+        return self.cap is not None
 
     def release_camera(self):
         try:
-            self.cap.release()
+            if self.cap is not None:
+                self.cap.release()
         except Exception:
             pass
 
@@ -461,7 +471,13 @@ def build_backend(camera_index=None):
     import mediapipe as mp
 
     model, idx_to_real_label, _ = ld.load_model()
-    cap, cam = devices.open_camera(pick_camera_index(camera_index, ld.CAMERA_INDEX))
+    # no camera (none plugged in, or inside Docker on Windows/macOS): start anyway so the menu, Learn the signals and
+    # the progress screens work; a training mode asks for the camera again when it starts (see main)
+    try:
+        cap, cam = devices.open_camera(pick_camera_index(camera_index, ld.CAMERA_INDEX))
+        camera_error = ""
+    except RuntimeError as exc:
+        cap, cam, camera_error = None, None, str(exc)
 
     pose_model = mp.solutions.pose.Pose(static_image_mode=False, model_complexity=0,
                                         min_detection_confidence=0.5, min_tracking_confidence=0.5)
@@ -478,6 +494,7 @@ def build_backend(camera_index=None):
 
     backend = Backend(cap, extract, classify, idx_to_real_label)
     backend.cam_index = cam
+    backend.camera_error = camera_error
 
     def close():
         backend.release_camera()
@@ -2897,6 +2914,8 @@ def main(argv=None):
                 return
             import device_setup
             device_setup.run_device_setup()
+    if not backend.has_camera:
+        trainer_ui.show_message("No camera detected", NO_CAMERA_TEXT)
     whistle = WhistleHub()
     whistle.device, mic_warning = devices.resolve_saved_mic(trainer_ui.read_settings())
     if mic_warning:
@@ -2924,6 +2943,14 @@ def main(argv=None):
                 continue
             if choice["action"] in ("quit", "deleted"):
                 break
+            if not backend.has_camera:                # started without a camera: try once more before the session
+                try:
+                    backend.reopen_camera(pick_camera_index(args.camera,
+                                                            trainer_ui.read_settings().get("camera_index") or 0))
+                except Exception as exc:
+                    print(f"No camera for the session: {exc}")
+                    trainer_ui.show_message("No camera detected", NO_CAMERA_TEXT)
+                    continue
             set_cv_theme(trainer_ui.current_theme())
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
             fit_cv_window(WINDOW_NAME, 1280, 720)

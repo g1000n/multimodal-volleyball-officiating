@@ -12,46 +12,129 @@ final defense it became a **training tool** built on the same models. Both are i
 tool is the main program. **`docs/HANDOFF.md` is the full, current description** of the system, every design
 decision with its evidence, and the evaluation.
 
-## Download
+## Download and use
 
-| What | Link |
+| Way | Best for | What works |
+|---|---|---|
+| **1. Release download (Windows)**, recommended | Using the training tool | Everything: camera, microphone, all six modes |
+| **2. Docker image** | Installing with one command on any computer, checking that it runs | Linux: the full tool with camera and microphone (untested). Windows and macOS: the program and its tests, but no camera or microphone (a Docker Desktop limit) |
+| **3. From source (git clone)** | Developers | Everything, as in option 1 |
+
+| Download | Link |
 |---|---|
-| Source code (this repository) | https://github.com/g1000n/multimodal-volleyball-officiating |
-| Release v1.0 (the version used in the final evaluation, as a zip) | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.0 |
+| Release v1.1 (latest; also starts without a camera and shows "No camera detected") | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.1 |
+| Release v1.0 (the version used in the October 2026 evaluation) | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.0 |
 | Docker image | https://hub.docker.com/r/g1000n/multimodal-volleyball-officiating |
+| Source code | https://github.com/g1000n/multimodal-volleyball-officiating |
 
-## Quick start (Windows, with camera and microphone)
+### Option 1: install from the release (Windows)
 
-Python **3.11** (the project venv uses 3.11.9):
+**You need:** Windows 10 or 11 (64-bit), **Python 3.11** from python.org (tick *Add python.exe to PATH* while
+installing), a webcam (or an iPhone with Camo Studio), a microphone for the whistle, about 3 GB free, and internet
+for the first install.
 
-```bash
+1. Open the release page above and download **Source code (zip)**. Right-click the zip, choose **Extract All**.
+2. Open the extracted folder (`multimodal-volleyball-officiating-1.1`) in File Explorer, click the address bar, type
+   `powershell` and press Enter.
+3. Create the environment, turn it on, and install the libraries (5 to 15 minutes, about 1 GB):
+
+   ```
+   py -3.11 -m venv .venv
+   .venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
+
+   The prompt now starts with `(.venv)`. If PowerShell says *running scripts is disabled*, run
+   `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, answer `Y`, and activate again.
+4. Start the tool:
+
+   ```
+   python main.py
+   ```
+
+5. **First start:** type your name or a code, read the recording notice, tick the box and click
+   **I agree, continue**. In **Camera and microphone check**, pick your camera (the picture appears) and microphone
+   (the level bar moves when you clap), run the **whistle test** (it must report a whistle), and click
+   **Save and continue**.
+6. **Train:** pick a mode on the menu (start with **Learn the signals**, then **Practice** or **Drill**). Stand 2 to
+   2.5 m from the camera, camera at chest height, head to hips in view. After each attempt you get a verdict
+   (Correct, Almost or Incorrect), a score and tips.
+
+**Next time** you only need steps 2, the `activate` line, and `python main.py`. Sessions are saved in
+`data\trainer_sessions\` inside the folder; **Progress and sessions** on the menu shows them. With no camera
+connected the tool still opens, says *No camera detected*, and the menu, Learn the signals and Progress still work.
+No microphone: the whistle can be given with the **W** key.
+
+### Option 2: Docker
+
+Docker packages the tool with Python 3.11, all libraries and both trained models, so it installs with one command.
+Install **Docker Desktop** (Windows: docs.docker.com/desktop/setup/install/windows-install, choose x86_64; it uses
+WSL 2) and wait until it says **Engine running**.
+
+**On Windows or macOS** (no camera or microphone inside Docker):
+
+```
+docker pull g1000n/multimodal-volleyball-officiating:1.1
+docker run --rm g1000n/multimodal-volleyball-officiating:1.1 sh -c "Xvfb :99 -screen 0 1280x720x24 -nolisten tcp & sleep 3 && DISPLAY=:99 python tests/test_trainer_smoke.py && DISPLAY=:99 python tests/test_gesture_grader.py"
+```
+
+The second line runs the project's automated tests in the container (every training mode and every grading rule,
+with a simulated camera) and ends with `Smoke test passed.` and `All good.` To keep a container running and look
+inside it:
+
+```
+docker run -d --name volleyball-officiating g1000n/multimodal-volleyball-officiating:1.1 sleep infinity
+docker ps
+docker exec volleyball-officiating python -W ignore -c "import extract_keypoints, trainer; print('imports OK')"
+docker rm -f volleyball-officiating
+```
+
+On Windows 11 the program's window can also open from the container (it shows *No camera detected* and the menu):
+
+```
+docker run --rm -it -e DISPLAY=:0 -e WAYLAND_DISPLAY=wayland-0 -e XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir -e PULSE_SERVER=/mnt/wslg/PulseServer -v /run/desktop/mnt/host/wslg/.X11-unix:/tmp/.X11-unix -v /run/desktop/mnt/host/wslg:/mnt/wslg g1000n/multimodal-volleyball-officiating:1.1 python main.py
+```
+
+For training with the camera on Windows, use option 1.
+
+**On Linux** (the full tool with camera and microphone; supported but not yet tested by the team):
+
+```
+xhost +local:docker
+docker run --rm -it -e DISPLAY=$DISPLAY -e QT_X11_NO_MITSHM=1 -v /tmp/.X11-unix:/tmp/.X11-unix -v "$PWD/vb-data:/app/data" --device /dev/video0 --device /dev/snd g1000n/multimodal-volleyball-officiating:1.1 python main.py
+```
+
+Check the camera name first with `ls /dev/video*`. The camera is passed in directly. The microphone may not open on
+desktops whose sound server (PipeWire or PulseAudio) holds the sound card; the tool then still works with the **W**
+key as the whistle. On Linux, use Docker rather than a plain Python install: `extract_keypoints.py` imports the
+Windows-only `winsound` module, and the image includes a stand-in for it. Full Docker notes: `docker.md`.
+
+### Option 3: from source
+
+```
 git clone https://github.com/g1000n/multimodal-volleyball-officiating
 cd multimodal-volleyball-officiating
-python -m venv .venv
+py -3.11 -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 python main.py
 ```
 
-`python main.py` opens the training tool. On first start it shows the welcome screen and the recording notice;
-then choose the camera and microphone under **Camera and mic** (the whistle test must report a whistle).
+### Good to know
 
-The pinned versions in `requirements.txt` matter: the whistle model needs **numpy 2.2.6**. With an older numpy
-the whistle detector stops with "is not a known BitGenerator module".
+- The pinned versions in `requirements.txt` matter: the whistle model needs **numpy 2.2.6**. With an older numpy the
+  whistle detector stops with "is not a known BitGenerator module".
+- iPhone through Camo Studio: see `docs/HardwareSetup.md`. The evaluation used an iPhone 13 at 2 to 2.5 m, camera at
+  chest height (1.2 to 1.4 m), head to hips in frame.
+- The image and the releases contain the code and the trained models only: no dataset and no participant data.
 
-For the iPhone (Camo) camera and microphone setup, see `docs/HardwareSetup.md`. The evaluation used an iPhone 13
-through Camo Studio at 2 to 2.5 m, camera at chest height (1.2 to 1.4 m), head to hips in frame.
-
-## Docker (any computer, no Python install)
-
-```bash
-docker pull g1000n/multimodal-volleyball-officiating:1.0
-```
-
-or build it from this repository with `docker compose build` and run the automated tests with
-`docker compose run --rm tests` (expect 35 `OK` lines, `Smoke test passed.`, and `All good.`). The image contains the
-code and the trained models, no dataset and no participant data. On Windows and macOS, Docker cannot use the camera
-or microphone, so use the Quick start above for the live tool. Full instructions: `docker.md`.
+| Problem | Fix |
+|---|---|
+| `py -3.11` not found | Install Python 3.11 from python.org, tick *Add python.exe to PATH* |
+| *No camera detected* | Plug in the camera or start Camo, close other programs that use it, then pick it under **Camera and mic** |
+| The whistle test hears nothing | Under **Camera and mic**, pick the microphone's **[Windows DirectSound]** entry; or use the **W** key |
+| Docker: `error during connect` | Open Docker Desktop and wait for **Engine running** |
+| Docker: `name ... already in use` | `docker rm -f volleyball-officiating`, then run again |
 
 ## The training tool
 
@@ -214,14 +297,15 @@ The training tool did not retrain the model: it uses the same `models/final_mode
 
 ## Data and attribution
 
-`data/raw_clips/` (original video) and `data/maxlsb_source/` are not in git. `models/*.pt`, `models/*.pkl` and
-`data/keypoints/` are, so the system runs and retrains without the raw video. `data/dataset_manifest.csv` is rebuilt
+The trained models (`models/*.pt`, `models/*.pkl`) are in git, so the system runs without any dataset. The dataset
+itself is not: `data/raw_clips/` (original video), `data/maxlsb_source/` and `data/keypoints/` (the extracted
+keypoints, about 280 MB) are kept by the team, and retraining needs them. `data/dataset_manifest.csv` is rebuilt
 by `build_manifest.py`. Participants' session data (`data/trainer_sessions/`) stays on the laptops and the team's
 private storage; it is not committed.
 
 Some training data for `nothing`, `ball_out`, `double_contact` and `team_to_serve_left/right` was supplemented from
 [MaxLSB/volley-judge](https://github.com/MaxLSB/volley-judge) (MIT licensed), converted via
-`convert_maxlsb_nothing_data.py`; the converted keypoints are already in `data/keypoints/`.
+`convert_maxlsb_nothing_data.py` into `data/keypoints/`.
 
 ## Model status
 
@@ -235,7 +319,7 @@ an output class.
 | Whistle (SVM + Random Forest + HistGradientBoosting, 92 acoustic features) | 435 held-out samples, threshold 0.30 (offline) | **98.16%** accuracy (non-whistle 117/120, whistle 310/315) |
 
 `training_logs/train_2026-08-11_235000.log` holds the gesture model's test output, and `reproduce_table5_eval.py`
-reprints it from the saved model. Accuracy on out-of-domain reference clips (`tests/test_reference_clips.py`) is
+reprints it from the saved model (it needs the team's `data/keypoints/` and manifest). Accuracy on out-of-domain reference clips (`tests/test_reference_clips.py`) is
 lower, a documented generalisation gap. See `docs/HANDOFF.md` for the known limitations.
 
 ## Evaluation results (training tool, October 2026)
