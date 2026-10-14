@@ -142,7 +142,18 @@ CAMERA_LOST_SECONDS = 8.0        # give up after this long, save everything and 
 NO_CAMERA_TEXT = ("No camera was found, so the training modes cannot start. You can still use Learn the signals, "
                   "Progress and sessions, and the settings.\n\nTo train, plug in a camera (or start Camo), then "
                   "choose it under Camera and mic.\n\n(Inside Docker on Windows or macOS no camera is available; "
-                  "run the tool natively for training.)")
+                  "run the tool natively for training, or start tools/av_bridge.py on the host.)")
+NO_BRIDGE_TEXT = ("The camera bridge could not be reached, so the training modes cannot start. You can still use "
+                  "Learn the signals, Progress and sessions, and the settings.\n\nOn the host computer start "
+                  "tools/av_bridge.py (py tools/av_bridge.py --list shows the cameras and microphones), allow it "
+                  "through the firewall, then try again.")
+
+
+def no_camera_text():
+    """The bridge hint is shown only inside the Docker bridge setup, so native users are not told to start one."""
+    return NO_BRIDGE_TEXT if devices.camera_url() else NO_CAMERA_TEXT
+
+
 CSV_COLS = ["ph_time", "kind", "target", "detected", "level", "intent", "note", "verdict", "score", "points", "best_prob", "margin",
             "hold_s", "confused_with", "failed_checks", "check_values", "feedback", "feedback_latency_s",
             # the SAME captured movement, graded at every level, so a report can show all three side by side
@@ -2915,7 +2926,7 @@ def main(argv=None):
             import device_setup
             device_setup.run_device_setup()
     if not backend.has_camera:
-        trainer_ui.show_message("No camera detected", NO_CAMERA_TEXT)
+        trainer_ui.show_message("No camera detected", no_camera_text())
     whistle = WhistleHub()
     whistle.device, mic_warning = devices.resolve_saved_mic(trainer_ui.read_settings())
     if mic_warning:
@@ -2949,7 +2960,7 @@ def main(argv=None):
                                                             trainer_ui.read_settings().get("camera_index") or 0))
                 except Exception as exc:
                     print(f"No camera for the session: {exc}")
-                    trainer_ui.show_message("No camera detected", NO_CAMERA_TEXT)
+                    trainer_ui.show_message("No camera detected", no_camera_text())
                     continue
             set_cv_theme(trainer_ui.current_theme())
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)

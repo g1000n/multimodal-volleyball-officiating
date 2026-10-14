@@ -10,3 +10,5 @@
 !docs
 **/__pycache__
 **/*.pyc
+!bridge
+!requirements-bridge.txt

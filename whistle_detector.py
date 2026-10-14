@@ -347,12 +347,14 @@ class WhistleDetector:
         last_event_end = 0.0
 
         import devices                    # imported here: network microphone support (Docker), see devices.py
-        with devices.open_input_stream(sd, self.device, SR, step_samples, callback):
+        with devices.open_input_stream(sd, self.device, SR, step_samples, callback) as stream:
             self._opened.set()
             while self._running:
                 try:
                     raw = self._audio_queue.get(timeout=0.5)
                 except queue.Empty:
+                    if getattr(stream, "lost", False):       # network microphone: the bridge went away
+                        raise RuntimeError("the microphone bridge stopped (is tools/av_bridge.py still running?)")
                     continue
 
                 n = len(raw)
