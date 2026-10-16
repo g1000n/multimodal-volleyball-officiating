@@ -12,6 +12,31 @@ final defense it became a **training tool** built on the same models. Both are i
 tool is the main program. **`docs/HANDOFF.md` is the full, current description** of the system, every design
 decision with its evidence, and the evaluation.
 
+**Your data stays on your computer.** The tool saves its sessions only on the computer it runs on. Nothing is
+uploaded to a server, a database or the cloud. See [Privacy](#privacy-your-data-stays-on-your-computer).
+
+## Contents
+
+- [Download and use](#download-and-use)
+  - [What you need](#what-you-need)
+  - [Option 1: install from the release (Windows)](#option-1-install-from-the-release-windows)
+  - [Option 2: Docker](#option-2-docker)
+  - [Option 3: from source](#option-3-from-source)
+  - [Updating to a new version](#updating-to-a-new-version)
+  - [Good to know and troubleshooting](#good-to-know)
+- [The training tool](#the-training-tool): [modes](#six-modes), [grading](#grading), [whistle](#whistle),
+  [keys](#keys), [what every session saves](#what-every-session-saves),
+  [finding your logs and recordings](#finding-your-logs-and-recordings)
+- [Evaluation tools](#evaluation-tools)
+- [The live officiating system](#the-live-officiating-system)
+- [Project structure](#project-structure)
+- [Tests](#tests)
+- [Training the gesture model](#training-the-gesture-model)
+- [Privacy: your data stays on your computer](#privacy-your-data-stays-on-your-computer)
+- [Data and attribution](#data-and-attribution)
+- [Model status](#model-status)
+- [Evaluation results](#evaluation-results-training-tool-october-2026)
+
 ## Download and use
 
 | Way | Best for | What works |
@@ -24,9 +49,19 @@ decision with its evidence, and the evaluation.
 |---|---|
 | Release v1.2 (latest; adds `av_bridge` for the camera and microphone in Docker on Windows, the native tool is unchanged) | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.2 |
 | Release v1.1 (starts without a camera and shows "No camera detected") | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.1 |
-| Release v1.0 (the version used in the October 2026 evaluation) | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.0 |
+| Release v1.0 (the tool as it stood at the end of the October 2026 evaluation period; grading of Combo and Match simulation pairs was refined once, on 7 October, during the evaluation) | https://github.com/g1000n/multimodal-volleyball-officiating/releases/tag/v1.0 |
 | Docker image | https://hub.docker.com/r/g1000n/multimodal-volleyball-officiating |
 | Source code | https://github.com/g1000n/multimodal-volleyball-officiating |
+
+### What you need
+
+| | Release download (Option 1) | Docker (Option 2) |
+|---|---|---|
+| Operating system | Windows 10 or 11 (64-bit) | Windows 11 (the app window uses WSLg), or Linux |
+| Software | Python 3.11 | Docker Desktop with the WSL 2 backend (Windows) |
+| Camera and microphone | Webcam or iPhone with Camo Studio; a microphone for the whistle | Same, passed in by `av_bridge.exe` (Windows) |
+| Disk space | About 3 GB | About 4 GB for the image |
+| Speed | Normal | Slower: CPU only inside a virtual machine |
 
 ### Option 1: install from the release (Windows)
 
@@ -105,8 +140,12 @@ If Windows Firewall asks, allow **Private networks** only. If SmartScreen warns 
 the option). In **window 2**, start the tool:
 
 ```
-docker run --rm -it -e DISPLAY=:0 -e WAYLAND_DISPLAY=wayland-0 -e XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir -e PULSE_SERVER=/mnt/wslg/PulseServer -e VB_CAMERA_URL=http://host.docker.internal:8765/video -e VB_MIC_URL=tcp://host.docker.internal:8766 -v /run/desktop/mnt/host/wslg/.X11-unix:/tmp/.X11-unix -v /run/desktop/mnt/host/wslg:/mnt/wslg g1000n/multimodal-volleyball-officiating:1.2 python main.py
+docker run --rm -it -e DISPLAY=:0 -e WAYLAND_DISPLAY=wayland-0 -e XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir -e PULSE_SERVER=/mnt/wslg/PulseServer -e VB_CAMERA_URL=http://host.docker.internal:8765/video -e VB_MIC_URL=tcp://host.docker.internal:8766 -v /run/desktop/mnt/host/wslg/.X11-unix:/tmp/.X11-unix -v /run/desktop/mnt/host/wslg:/mnt/wslg -v "${PWD}\data:/app/data" g1000n/multimodal-volleyball-officiating:1.2 python main.py
 ```
+
+The last `-v` option keeps your sessions: they are saved in a `data` folder next to `av_bridge.exe` (the folder you
+start the command from). Without it, the container's own `data` folder is removed when you close the app and the
+sessions are lost.
 
 Under **Camera and mic**, the host's cameras and microphones are listed; pick the microphone's **DirectSound** entry.
 Stop with Ctrl+C in window 1 when done: while the bridge runs, anyone who can reach ports 8765 and 8766 sees the
@@ -115,6 +154,23 @@ camera and hears the microphone. Without the two `VB_` options (or without the b
 or from source: `pip install -r requirements-bridge.txt`, then `py tools/av_bridge.py`. Running in Docker is
 slower than natively (CPU only inside a virtual machine; the relay adds about 0.1 s); the evaluation results above
 were measured with the native tool.
+
+**Stopping and cleaning up.** In this order:
+
+1. Close the app window (the container stops and removes itself, because of `--rm`).
+2. Press Ctrl+C in window 1 to stop `av_bridge.exe`.
+3. To remove the image and install it again, for example to check a clean install:
+
+   ```
+   docker rm -f volleyball-officiating
+   docker rmi g1000n/multimodal-volleyball-officiating:1.2
+   docker images
+   docker pull g1000n/multimodal-volleyball-officiating:1.2
+   ```
+
+   `docker rm -f` removes a leftover container first (*No such container* is fine); `docker rmi` refuses to remove an
+   image that a container, even a stopped one, still uses. `docker images` shows whether the image is installed and
+   `docker ps` shows the containers that are running. `av_bridge.exe` stays in your folder.
 
 **On Linux** (the full tool with camera and microphone; supported but not yet tested by the team):
 
@@ -138,6 +194,14 @@ py -3.11 -m venv .venv
 pip install -r requirements.txt
 python main.py
 ```
+
+### Updating to a new version
+
+| You installed | To update |
+|---|---|
+| A release download | Download the newer release's **Source code (zip)** and extract it. To keep your sessions, copy your old `data\trainer_sessions` folder into the new `data` folder |
+| From source (git clone) | In the project folder: `git pull --ff-only` (*Already up to date.* means nothing is new) |
+| The Docker image | `docker pull g1000n/multimodal-volleyball-officiating:<new tag>`. Pulling does not change an image you already have, so use the new tag in your `docker run` command |
 
 ### Good to know
 
@@ -232,6 +296,55 @@ ends early only after a signal was seen in 3 model windows in a row.
 **Progress and sessions** on the menu shows the history, reports and videos; **Delete my data** removes a trainee's
 data.
 
+### Finding your logs and recordings
+
+**From the app (easiest).** On the main menu choose **Progress and sessions**, select a session in the list, then:
+
+| Button | What it opens |
+|---|---|
+| **Open report** | `report.html` in your browser: every attempt, verdict, score and tip |
+| **Play video** | `session.mp4`, the recording of your training screen, in your video player |
+| **Open folder** | The session's folder in File Explorer, with all the files above |
+| **Delete this session** | Removes that one session for good |
+
+**From File Explorer.** Open the project folder (for a release download, the extracted
+`multimodal-volleyball-officiating-<version>` folder) and go to:
+
+```
+data\trainer_sessions\<your name or code>\<date>_<time>_<mode>\
+```
+
+- `<your name or code>` is what you typed on the consent screen. Use a code such as `G-01` rather than your real
+  name, because it becomes the folder name.
+- The folder name is the start time (Philippine time) and the mode: `20261006_160401_drill`, and `..._practice`,
+  `..._combo`, `..._challenge`, `..._sim` (Match simulation), `..._match_test`. Repeating a mode creates a new
+  folder; nothing is overwritten.
+- To jump straight there from PowerShell, in the project folder: `explorer data\trainer_sessions`.
+
+**How to open the files**
+
+| File | Open with |
+|---|---|
+| `report.html` | Any web browser (double-click) |
+| `session.mp4` | Any video player |
+| `attempts.csv`, `session_log.csv`, `whistle_events.csv` | Excel or Notepad. In Excel use *Data → From Text/CSV* if the columns run together |
+| `summary.json` | Notepad or any text editor |
+| `attempts\*.npz` | Not meant to be opened by hand; `tools\regrade_attempts.py` reads them |
+| `error.log` | Notepad. It exists only if a session ended with an error |
+
+**Other places the tool writes** (all inside the project's `data` folder):
+
+| Path | Contents |
+|---|---|
+| `data\whistle_logs\whistle_session_<number>.csv` | The whistle detector's own log, one file per run of the detector: every half-second window with its probability and whether a whistle was confirmed |
+| `data\consent_records.csv` and `data\trainer_sessions\<id>\consent.json` | Who agreed to what, and when |
+| `data\ui_settings.json` | The chosen camera, microphone and theme |
+
+**In Docker**, sessions are saved in the `data` folder you mounted with `-v "${PWD}\data:/app/data"` (see
+[Option 2](#option-2-docker)), so they appear in `data\trainer_sessions\` next to `av_bridge.exe`.
+
+**Sharing.** `py tools/collect_data.py --name <researcher>` packs one laptop's session data into a single zip.
+
 ## Evaluation tools
 
 | Command | Purpose |
@@ -317,6 +430,23 @@ python train.py                        # trains the model, saves models/final_mo
 run `convert_maxlsb_nothing_data.py` again right after `build_manifest.py`**, before `dataset_split.py`.
 
 The training tool did not retrain the model: it uses the same `models/final_model.pt` as the live system.
+
+## Privacy: your data stays on your computer
+
+- **Nothing is uploaded.** The tool has no account, server, database or cloud service. Every session (attempts,
+  logs, the screen recording, the movement files) is written to the `data` folder of the computer that ran it, and
+  the recognition models run on that computer too.
+- **Consent first.** The tool cannot start before the recording notice is accepted; the agreement is logged with
+  the time and the text version in `data\consent_records.csv`.
+- **You can delete it.** **Delete this session** (in **Progress and sessions**) removes one session;
+  **Delete my data** on the menu removes everything for a trainee.
+- **Use a code, not your name.** The code or name you type becomes the folder name.
+- **Sharing is manual.** Data leaves the computer only if someone copies it, for example with
+  `tools\collect_data.py` for the research team.
+- **Docker camera relay.** While `av_bridge.exe` runs, the camera and microphone are available over the local
+  network to anyone who can reach ports 8765 and 8766. Start it with `--bind 127.0.0.1` where possible, allow
+  Windows Firewall for **Private networks** only, and stop it with Ctrl+C when you are done. It does not send
+  anything to the internet.
 
 ## Data and attribution
 
